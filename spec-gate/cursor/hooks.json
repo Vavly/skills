@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "hooks": {
+    "beforeShellExecution": [
+      {
+        "type": "command",
+        "command": "./.claude/hooks/cursor-guard.sh",
+        "timeout": 15,
+        "failClosed": true
+      }
+    ],
+    "preToolUse": [
+      {
+        "type": "command",
+        "command": "./.claude/hooks/cursor-guard.sh",
+        "timeout": 15,
+        "failClosed": true
+      }
+    ],
+    "stop": [
+      {
+        "type": "command",
+        "command": "./.claude/hooks/cursor-stop.sh",
+        "timeout": 30,
+        "loop_limit": 5
+      }
+    ]
+  }
+}

@@ -326,6 +326,68 @@ setup_repo; phase start v; phase 5
 printf 'exit 0\n' > .claude/spec-gate-test-cmd      # would refuse if it ran
 tw "retreat 5 -> 4 is not gated by the tripwire" 4 "Execute"
 
+group "Cursor adapters"
+# Cursor has its own hook system with its own payload shapes. These drive the
+# adapters with synthetic Cursor payloads; they cannot verify Cursor's real
+# field names, only that the translation is faithful to the documented schema.
+cur_shell() {
+  python3 -c 'import json,sys; print(json.dumps({"hook_event_name":"beforeShellExecution","command":sys.argv[1],"cwd":sys.argv[2],"workspace_roots":[sys.argv[2]]}))' "$1" "$PWD"
+}
+cur_tool() {
+  python3 -c 'import json,sys; print(json.dumps({"hook_event_name":"preToolUse","tool_name":sys.argv[3],"tool_input":json.loads(sys.argv[1]),"cwd":sys.argv[2],"workspace_roots":[sys.argv[2]]}))' "$1" "$PWD" "${2:-Write}"
+}
+cperm() {
+  printf '%s' "$1" | .claude/hooks/cursor-guard.sh 2>/dev/null | python3 -c '
+import json, sys
+try: print(json.load(sys.stdin).get("permission","?"))
+except Exception: print("BADJSON")' 2>/dev/null
+}
+expect_c() { local got; got=$(cperm "$3"); [ "$got" = "$2" ] && ok "$1" || bad "$1 — expected $2, got $got"; }
+
+setup_repo
+phase off
+expect_c "dormant: shell allowed"            allow "$(cur_shell 'echo hi > src/y.ts')"
+expect_c "dormant: write allowed"            allow "$(cur_tool '{"file_path":"src/x.ts"}')"
+
+phase start v; phase 3
+expect_c "phase 3: production write denied"  deny  "$(cur_tool '{"file_path":"src/x.ts"}')"
+expect_c "phase 3: test write allowed"       allow "$(cur_tool '{"file_path":"src/x.test.ts"}')"
+expect_c "alternate path key honoured"       deny  "$(cur_tool '{"target_file":"src/x.ts"}')"
+expect_c "unknown tool shape allowed"        allow "$(cur_tool '{"pattern":"foo"}')"
+expect_c "phase 3: shell write denied"       deny  "$(cur_shell 'echo hi > src/y.ts')"
+expect_c "phase 3: read-only shell allowed"  allow "$(cur_shell 'cat src/x.ts')"
+expect_c "self-advance denied"               deny  "$(cur_shell '.claude/hooks/phase.sh 4')"
+expect_c "shell seen via preToolUse defers"  allow "$(cur_tool '{"command":".claude/hooks/phase.sh 4"}')"
+
+phase 2
+expect_c "2 -> 3 asks, on the event that can" ask  "$(cur_shell '.claude/hooks/phase.sh 3')"
+
+cstop() {
+  python3 -c 'import json,sys; print(json.dumps({"hook_event_name":"stop","status":sys.argv[1],"loop_count":int(sys.argv[2]),"cwd":sys.argv[3],"workspace_roots":[sys.argv[3]]}))' "${1:-completed}" "${2:-0}" "$PWD" \
+    | .claude/hooks/cursor-stop.sh 2>/dev/null
+}
+has_followup() { printf '%s' "$1" | grep -q 'followup_message' && echo yes || echo no; }
+
+setup_repo
+phase off
+[ "$(has_followup "$(cstop completed 0)")" = no ] && ok "clean tree: no follow-up" || bad "clean tree produced a follow-up"
+echo 'change' >> src/x.ts
+[ "$(has_followup "$(cstop completed 0)")" = yes ] && ok "dirty tree: injects the review instruction" || bad "dirty tree produced no follow-up"
+rm -f .git/claude-review-gate
+[ "$(has_followup "$(cstop completed 2)")" = no ] && ok "loop_count guards against spinning" || bad "loop_count did not guard"
+rm -f .git/claude-review-gate
+[ "$(has_followup "$(cstop aborted 0)")" = no ] && ok "aborted turn is not judged" || bad "aborted turn produced a follow-up"
+
+setup_repo
+phase start v; phase 3
+printf 'sneaky\n' > src/evil.ts
+out=$(cstop completed 0)
+if printf '%s' "$out" | grep -q 'PHASE GATE'; then
+  ok "phase scan reaches Cursor as a follow-up"
+else
+  bad "phase violation did not reach Cursor: $(printf '%s' "$out" | head -c 120)"
+fi
+
 ################################################################################
 printf '\n%s%d passed, %d failed%s\n' "$B" "$PASS" "$FAIL" "$N"
 [ "$FAIL" -eq 0 ] || exit 1

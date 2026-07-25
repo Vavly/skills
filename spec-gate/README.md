@@ -36,11 +36,16 @@ spec-gate/
 │   ├── review-gate.sh               → .claude/hooks/   Stop hook
 │   ├── phase-guard.sh               → .claude/hooks/   PreToolUse hook
 │   ├── phase-policy.sh              → .claude/hooks/   shared policy, sourced
-│   └── phase.sh                     → .claude/hooks/   phase state CLI
+│   ├── phase.sh                     → .claude/hooks/   phase state CLI
+│   ├── cursor-guard.sh              → .claude/hooks/   Cursor adapter
+│   └── cursor-stop.sh               → .claude/hooks/   Cursor adapter
 ├── agents/adversary.md              → .claude/agents/
-└── skills/
-    ├── spec-driven/SKILL.md         → .claude/skills/  the workflow
-    └── spec-phase/SKILL.md          → .claude/skills/  user-only phase control
+├── skills/
+│   ├── spec-driven/SKILL.md         → .claude/skills/  the workflow
+│   └── spec-phase/SKILL.md          → .claude/skills/  user-only phase control
+└── cursor/                          for Cursor instead of / alongside Claude Code
+    ├── hooks.json                   → .cursor/hooks.json
+    └── agents/adversary.md          → .cursor/agents/adversary.md
 ```
 
 `phase-policy.sh` is sourced by both hooks rather than executed. It holds the
@@ -94,6 +99,61 @@ wholesale silently drops what was there.
 Hooks are re-read from settings by a file watcher, so no session restart is
 needed. Confirm registration with `/hooks` — all three should appear under
 `PreToolUse`, `Stop`, and `SubagentStop`.
+
+## Running under Cursor
+
+Cursor has its own hook system (1.7+) and does not read `.claude/`, so a
+Claude Code install enforces **nothing** there. It is not that the gate is weaker
+in Cursor — without `.cursor/hooks.json` there is no gate at all, the phase file
+is just a file the agent can rewrite, and every "enforced" claim below silently
+becomes an instruction.
+
+```bash
+mkdir -p .cursor/agents
+cp "$SPEC_GATE"/cursor/hooks.json .cursor/hooks.json          # MERGE if one exists
+cp "$SPEC_GATE"/cursor/agents/adversary.md .cursor/agents/
+```
+
+The hook scripts stay in `.claude/hooks/`, which `.cursor/hooks.json` points at
+by relative path. That looks odd in a Cursor-only repo, and it is deliberate: one
+copy of the policy, referenced by both hosts. Two copies would drift.
+
+| spec-gate layer | Claude Code | Cursor |
+| --- | --- | --- |
+| phase-advance gate | `PreToolUse` deny/ask | `beforeShellExecution` — same `allow`/`deny`/`ask` |
+| production-write block | `PreToolUse` on Edit/Write | `preToolUse` — deny only, no `ask` |
+| phase scan + review gate | `Stop`, exit 2 | `stop` → `followup_message` |
+| review log | `SubagentStop` | not ported — payload field names unverified |
+
+`cursor-guard.sh` and `cursor-stop.sh` are adapters: they translate Cursor's
+payload into the Claude Code shape, run the same `phase-guard.sh` and
+`review-gate.sh`, and translate the answer back. Both need `python3`.
+
+Two places where Cursor is the better host:
+
+- **`failClosed: true`** on a hook definition makes a script error block the
+  action. That is the behaviour this project hand-rolled after finding five
+  fail-open bugs; Cursor makes it a flag. Note the blast radius: on `preToolUse`
+  it means a broken guard blocks *every* tool call, which is correct and also
+  worth knowing before you debug something else.
+- **`stop` injects the next turn** rather than refusing to end one. Claude Code's
+  exit 2 can only block and hope the agent reads stderr — a model that ignores it
+  ends the turn on its second attempt. Cursor hands the agent the instruction as
+  a follow-up message, capped by `loop_limit` (default 5).
+
+And one place it is worse: `preToolUse` has no `ask`, so the 2→3 approval only
+works because `phase.sh 3` is a shell command and reaches
+`beforeShellExecution`. The adapter downgrades a stray `ask` to `deny` rather
+than letting it evaporate.
+
+**`readonly: false` on the Cursor adversary is deliberate.** Cursor can enforce
+read-only on a subagent, which Claude Code cannot — there it is only an
+instruction. Enforcement sounds strictly better and is not: the most valuable
+review this reviewer has produced worked by copying the module to a scratch
+directory and mutation-testing it, deleting one guard at a time to confirm
+exactly one test went red. That needs writes. `readonly: true` would have
+prevented the review that justified the exercise. The constraint that matters —
+do not modify the files under review — is stated in the brief.
 
 ## Use
 
