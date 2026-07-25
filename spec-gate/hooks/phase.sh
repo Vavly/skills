@@ -130,10 +130,38 @@ red_tripwire() {
   return 0
 }
 
+# Files the review gate would consider owed review — i.e. excluding the paths it
+# ignores. Reported by `status` and `off` because the surprising part of this
+# system is that turning the phase gate OFF makes review fire *more* often, not
+# less: with no phase file the Stop gate runs every turn.
+review_pending_paths() {
+  (
+    cd "$PROJECT_DIR" 2>/dev/null || exit 0
+    git rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 0
+    { git diff HEAD --name-only
+      git ls-files --others --exclude-standard
+    } 2>/dev/null | sort -u | while IFS= read -r p; do
+      [ -z "$p" ] && continue
+      is_review_excluded "$p" || printf '%s\n' "$p"
+    done
+  )
+}
+
+report_review_state() {
+  pending=$(review_pending_paths)
+  if [ -z "$pending" ]; then
+    echo "  review gate: quiet — nothing is owed review"
+  else
+    echo "  review gate: ARMED — owed review every turn until these are committed:"
+    printf '%s\n' "$pending" | sed 's/^/      /'
+  fi
+}
+
 case "${1:-status}" in
   status)
     if [ ! -f "$STATE" ]; then
       echo "spec-driven: inactive"
+      report_review_state
       exit 0
     fi
     P=$(sed -n 's/^phase=//p' "$STATE" | head -1)
@@ -181,7 +209,10 @@ case "${1:-status}" in
 
   off)
     rm -f "$STATE" "$BASELINE"
-    echo "spec-driven: gate off"
+    echo "spec-driven: phase gate off"
+    echo "  This ends the phase workflow. It does not stop review — with no phase"
+    echo "  file the Stop gate returns to its default and runs EVERY turn."
+    report_review_state
     ;;
 
   *)

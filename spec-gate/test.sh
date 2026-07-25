@@ -249,6 +249,38 @@ expect_gate "pre-existing dirt is not blamed on the phase" 0
 echo 'changed during phase 3' >> src/x.ts
 expect_gate "further change to the same file is caught" 2
 
+group "Spec docs do not arm the review gate"
+# Observed in real use: after the code shipped, one uncommitted spec doc kept the
+# gate armed indefinitely, and committing byte-identical work re-armed it because
+# `git diff HEAD` empties as HEAD moves.
+setup_repo
+phase off
+expect_gate "clean tree is quiet" 0
+printf 'the spec\n' > docs/specs/task.md
+expect_gate "a spec doc alone does not arm the gate" 0
+printf 'the spec, corrected\n' > docs/specs/task.md
+expect_gate "editing a spec doc costs no review cycle" 0
+echo 'code change' >> src/x.ts
+expect_gate "code alongside a spec doc still arms it" 2
+git add -A >/dev/null 2>&1; git commit -qm work
+expect_gate "after committing, the leftover spec stays quiet" 0
+
+setup_repo
+phase off
+printf '\n' > .claude/spec-gate-review-exclude     # empty = nothing extra excluded
+expect_gate "writing a config file does not arm the gate" 0
+printf 'the spec\n' > docs/specs/task.md
+expect_gate "an empty exclude file restores gating on specs" 2
+
+setup_repo
+phase off
+printf 'src/generated\n' > .claude/spec-gate-review-exclude
+mkdir -p src/generated
+printf 'machine written\n' > src/generated/out.ts
+expect_gate "a custom exclude path is honoured" 0
+echo 'hand written' >> src/x.ts
+expect_gate "non-excluded code still arms it" 2
+
 group "RED tripwire on 3 -> 4"
 cur_phase() { sed -n 's/^phase=//p' .claude/.spec-phase 2>/dev/null | head -1; }
 tw() { # <label> <expect-phase> <expect-substring> [--force]

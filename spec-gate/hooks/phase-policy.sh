@@ -53,6 +53,48 @@ in_project() {
   esac
 }
 
+# --- What the review gate ignores --------------------------------------------
+# Paths excluded from the *review* fingerprint only. Spec documents are approved
+# by the user at the 2->3 gate and contain no runtime behaviour, so an
+# adversarial code review has nothing to say about them.
+#
+# Leaving them in had two costs, both observed in real use: a one-line doc
+# correction cost a full review cycle, which argues for leaving docs imprecise;
+# and a spec doc left uncommitted after the code shipped kept the gate armed
+# indefinitely, re-firing every time the fingerprint moved.
+#
+# Override the *default* by listing pathspecs, one per line, in
+# .claude/spec-gate-review-exclude. An empty file means "exclude nothing extra".
+#
+# spec-gate's own config files are excluded unconditionally, and a user list adds
+# to them rather than replacing them. They are configuration for the gate, not
+# work the gate should judge — and left uncommitted they arm it, so writing a
+# config file would otherwise demand a review of having written a config file.
+review_exclude_list() {
+  printf '%s\n' \
+    '.claude/spec-gate-test-cmd' \
+    '.claude/spec-gate-review-exclude'
+
+  f="${PROJECT_DIR%/}/.claude/spec-gate-review-exclude"
+  if [ -r "$f" ]; then
+    while IFS= read -r l; do
+      case "$l" in ''|\#*) continue ;; esac
+      printf '%s\n' "$l"
+    done < "$f"
+  else
+    printf 'docs/specs\n'
+  fi
+}
+
+is_review_excluded() {
+  p="$1"
+  while IFS= read -r e; do
+    [ -z "$e" ] && continue
+    case "$p" in "$e"|"$e"/*) return 0 ;; esac
+  done <<< "$(review_exclude_list)"
+  return 1
+}
+
 # --- Working-tree snapshot ---------------------------------------------------
 # One "<content-hash> <path>" line per dirty or untracked file. Must be run from
 # the project root, inside a work tree.

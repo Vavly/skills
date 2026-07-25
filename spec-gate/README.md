@@ -287,6 +287,45 @@ flowchart TD
     V --> DONE
 ```
 
+### What the review gate ignores
+
+The fingerprint excludes some paths outright, so they cannot move it. By default:
+`docs/specs/`, plus spec-gate's own two config files unconditionally.
+
+This is not tidiness. Two failures showed up the first time the gate ran against
+a real repo, both from the fingerprint being content-blind:
+
+- **A leftover doc kept the gate armed after the code had shipped.** The PR
+  merged, the tree held one uncommitted spec document, and because a dirty tree
+  means review is owed, the gate demanded adversarial review of a markdown file —
+  re-firing every time the fingerprint moved.
+- **Committing finished work re-armed it.** `git diff HEAD` empties out as HEAD
+  moves, so the fingerprint changes even when the content is byte-identical to
+  what was just reviewed. Committing triggered a fresh review of nothing, at
+  roughly 100k tokens.
+
+Both push in the same direction: toward leaving docs imprecise and commits
+unmade, to avoid paying for a review cycle. That is the *"friction teaches you to
+bypass the gate"* failure arriving from an unexpected angle, so the fix belongs
+in the gate rather than in the habits of whoever uses it.
+
+Specs are the right thing to exclude because they already passed a human gate at
+2→3, they carry no runtime behaviour, and nothing in the adversary's brief —
+concurrency, error paths, injection — has anything to say about prose.
+
+Add to the list, one pathspec per line, in `.claude/spec-gate-review-exclude`:
+
+```
+docs/specs
+src/generated
+```
+
+An empty file means nothing extra is excluded, which restores gating on specs.
+The two config files stay excluded regardless: they configure the gate rather
+than being work it should judge, and writing one would otherwise demand a review
+of having written it. Note that `.claude/` itself is *not* excluded — commit it
+at install, as above, so hook changes stay visible and reviewable.
+
 The loop guard is `stop_hook_active`: exactly one forced pass per user turn, so
 neither the scan nor the gate can spin. Fixes made in response to findings change
 the diff fingerprint and get reviewed on the *following* turn rather than
@@ -479,6 +518,14 @@ confidence it hasn't earned.
 - **Every phase change re-snapshots the baseline.** If you deliberately want the
   scan to stop flagging a file you have decided to keep, re-entering the phase
   (`phase.sh 3` again) accepts the current tree as the new baseline.
+- **`phase.sh off` ends the workflow, it does not stop review** — and it makes
+  review fire *more* often, not less. With no phase file the Stop gate returns to
+  its default of every turn, where the workflow had been suppressing it through
+  phases 1–4. This surprises everyone once; `off` and `status` now both print what
+  is still owed review so it surprises you visibly rather than silently.
+- **The way to quiet the review gate is a clean tree**, not a switch. Commit the
+  work, or add the path to `spec-gate-review-exclude` if it is something the gate
+  should never have been judging.
 
 ## Caveats
 

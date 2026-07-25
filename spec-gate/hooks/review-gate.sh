@@ -124,9 +124,33 @@ case "$PHASE" in 1|2|3|4) exit 0 ;; esac
 # tree_snapshot contributes content hashes for untracked files. Without it the
 # fingerprint moved only when a *tracked* file changed, so fixes to new files —
 # usually the actual work — were never re-reviewed.
-CHANGES=$( { git diff HEAD
-             git status --porcelain
-             command -v tree_snapshot >/dev/null 2>&1 && tree_snapshot
+#
+# Excluded paths are kept out of the fingerprint entirely rather than filtered
+# afterwards, so they cannot move it. Otherwise a spec doc left uncommitted after
+# the code shipped keeps the gate armed forever, and committing finished work
+# re-arms it: `git diff HEAD` empties as HEAD moves, changing the fingerprint
+# even though the content is byte-identical.
+EXC=()
+while IFS= read -r e; do
+  [ -n "$e" ] && EXC+=(":(exclude)$e")
+done <<< "$(review_exclude_list 2>/dev/null || true)"
+if [ "${#EXC[@]}" -gt 0 ]; then
+  PSPEC=(-- . "${EXC[@]}")
+else
+  PSPEC=(--)
+fi
+
+review_snapshot() {
+  command -v tree_snapshot >/dev/null 2>&1 || return 0
+  tree_snapshot | while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    is_review_excluded "${line#* }" || printf '%s\n' "$line"
+  done
+}
+
+CHANGES=$( { git diff HEAD "${PSPEC[@]}"
+             git status --porcelain "${PSPEC[@]}"
+             review_snapshot
            } 2>/dev/null )
 [ -z "$CHANGES" ] && exit 0   # clean tree, nothing to judge
 
