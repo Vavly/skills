@@ -249,6 +249,51 @@ expect_gate "pre-existing dirt is not blamed on the phase" 0
 echo 'changed during phase 3' >> src/x.ts
 expect_gate "further change to the same file is caught" 2
 
+group "RED tripwire on 3 -> 4"
+cur_phase() { sed -n 's/^phase=//p' .claude/.spec-phase 2>/dev/null | head -1; }
+tw() { # <label> <expect-phase> <expect-substring> [--force]
+  local out; out=$(.claude/hooks/phase.sh 4 ${4:-} 2>&1)
+  if [ "$(cur_phase)" = "$2" ] && printf '%s' "$out" | grep -qi "$3"; then
+    ok "$1"
+  else
+    bad "$1 — phase=$(cur_phase) (want $2); output: $(printf '%s' "$out" | head -2 | tr '\n' ' ')"
+  fi
+}
+
+setup_repo; phase start v; phase 3
+printf 'a new test\n' > src/feature.test.ts
+tw "unconfigured: advances, but says so" 4 "no RED tripwire configured"
+
+setup_repo; phase start v; phase 3
+printf 'exit 1\n' > .claude/spec-gate-test-cmd      # tests fail = RED
+printf 'a new test\n' > src/feature.test.ts
+tw "tests fail: RED verified, advance allowed" 4 "RED verified"
+
+setup_repo; phase start v; phase 3
+printf 'exit 0\n' > .claude/spec-gate-test-cmd      # tests pass = vacuous
+printf 'a new test\n' > src/feature.test.ts
+tw "tests pass: REFUSED, still Phase 3" 3 "REFUSED"
+tw "--force overrides the refusal" 4 "skipping the RED tripwire" --force
+
+setup_repo; phase start v; phase 3
+printf 'exit 1\n' > .claude/spec-gate-test-cmd
+printf 'prod only\n' > src/untested.ts              # no test file touched
+tw "no tests written: REFUSED" 3 "no test files changed"
+
+setup_repo; phase start v; phase 3
+printf 'echo "GOT:[$SPEC_GATE_TEST_FILES]"; exit 1\n' > .claude/spec-gate-test-cmd
+printf 'a new test\n' > src/feature.test.ts
+out=$(.claude/hooks/phase.sh 4 2>&1)
+if printf '%s' "$out" | grep -q 'GOT:\[.*src/feature.test.ts.*\]'; then
+  ok "the changed test files are passed to the command"
+else
+  bad "SPEC_GATE_TEST_FILES not populated: $(printf '%s' "$out" | grep GOT: | head -1)"
+fi
+
+setup_repo; phase start v; phase 5
+printf 'exit 0\n' > .claude/spec-gate-test-cmd      # would refuse if it ran
+tw "retreat 5 -> 4 is not gated by the tripwire" 4 "Execute"
+
 ################################################################################
 printf '\n%s%d passed, %d failed%s\n' "$B" "$PASS" "$FAIL" "$N"
 [ "$FAIL" -eq 0 ] || exit 1

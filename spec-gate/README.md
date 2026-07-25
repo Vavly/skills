@@ -30,6 +30,8 @@ spec-gate/
 ├── README.md                        docs — not installed
 ├── test.sh                          regression suite — not installed
 ├── settings.json                    → .claude/settings.json  (MERGE, see below)
+│                                    (.claude/spec-gate-test-cmd is written per
+│                                     repo at install; see RED tripwire)
 ├── hooks/
 │   ├── review-gate.sh               → .claude/hooks/   Stop hook
 │   ├── phase-guard.sh               → .claude/hooks/   PreToolUse hook
@@ -71,6 +73,9 @@ SPEC_GATE=~/Documents/projects/AI/Skills/spec-gate   # this directory
 mkdir -p .claude docs/specs
 cp -R "$SPEC_GATE"/hooks "$SPEC_GATE"/agents "$SPEC_GATE"/skills .claude/
 # settings.json is a MERGE, not a copy — see below.
+
+# Optional but recommended: teach the RED tripwire how to run this repo's tests.
+printf 'yarn jest $SPEC_GATE_TEST_FILES\n' > .claude/spec-gate-test-cmd
 
 printf '.claude/.spec-phase\n.claude/.spec-baseline\n.claude/review-log.jsonl\n' >> .gitignore
 git add .claude .gitignore && git commit -m "add review gate + spec-driven workflow"
@@ -147,6 +152,48 @@ feature.
 
 One terminal trip per task, at the moment that most needs deliberateness.
 Everything else stays a slash command.
+
+### The RED tripwire
+
+Requiring a terminal makes the RED claim deliberate. It does not make it true.
+So `phase.sh 4` checks the cheap half mechanically: it runs the tests Phase 3
+changed, and **refuses to advance if they pass.** A test that passes before the
+implementation exists is testing nothing, and advancing would carry that mistake
+into Execute.
+
+This converts *"trust me, they're red"* into *"verified not-green"*. That is
+narrower than "failing for the right reason", which stays human — but it catches
+the vacuous-test failure mode outright, which is the one that actually happens.
+
+Configure it by putting a command in `.claude/spec-gate-test-cmd`. It runs from
+the project root with `$SPEC_GATE_TEST_FILES` set to the test files this phase
+changed, derived from the same phase-entry snapshot the Stop scan uses:
+
+```bash
+# .claude/spec-gate-test-cmd — examples
+yarn jest $SPEC_GATE_TEST_FILES
+pytest $SPEC_GATE_TEST_FILES
+go test ./...
+```
+
+Because this runs in your terminal rather than in a hook, it has **no timeout to
+respect** and can take as long as the tests take. Scoped to the files one phase
+touched, that is usually well under a second. Its output is also exactly the
+failure output Phase 3 asks you to look at, so the check and the evidence are the
+same artifact.
+
+Three refusals, all recoverable:
+
+| Situation | Result |
+| --- | --- |
+| tests fail | advance allowed, "RED verified" |
+| tests pass | **refused** — they are testing nothing |
+| no test files changed during Phase 3 | **refused** — Phase 3 exists to produce them |
+| no `spec-gate-test-cmd` configured | advance allowed, with a visible notice |
+
+Override any refusal with `phase.sh 4 --force`, which says plainly that it is
+running on your assertion instead. The model cannot use it: the guard denies
+`phase.sh 4` in any spelling, `--force` included.
 
 The full policy, enforced in `phase-guard.sh` and covered by `test.sh`:
 
@@ -261,6 +308,10 @@ covered by a case in `test.sh`:
   either restrict it or increase scrutiny.
 - **A turn cannot end on an unreviewed diff**, including one that exists only in
   untracked files, and including a *fix* to an untracked file.
+- **Phase 3 cannot be left on passing tests.** `phase.sh 4` runs the tests the
+  phase changed and refuses to advance if they pass. Not a full verification of
+  "failing for the right reason" — but the vacuous-test case is mechanical now,
+  not attested.
 - **Both hooks fail closed on bad state.** A corrupt phase file denies writes
   with a recovery instruction, rather than silently disabling the gate. Same for
   a missing JSON parser, or a missing `phase-policy.sh`. (`review-gate.sh` fails
@@ -379,8 +430,10 @@ confidence it hasn't earned.
 - **Second reviewer.** Largest available quality gain: a second read-only
   subagent with a *different* brief, run in parallel — one on correctness, one on
   security or effects on callers. Copy `adversary.md`, narrow the prompt.
-- **Test tripwire** in `review-gate.sh` before the block, so a red suite is
-  caught deterministically rather than by a model that may not bother:
+- **Green-suite tripwire** in `review-gate.sh` before the block, so a broken
+  suite is caught deterministically rather than by a model that may not bother.
+  This is the mirror of the RED tripwire above: that one refuses to *leave*
+  Phase 3 while tests pass, this one refuses to end a turn while they fail.
   ```bash
   if ! <your test command> >/dev/null 2>&1; then
     echo "REVIEW GATE: test suite failing. Fix before ending the turn." >&2

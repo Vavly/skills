@@ -15,6 +15,7 @@ PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
 STATE_DIR="$PROJECT_DIR/.claude"
 STATE="$STATE_DIR/.spec-phase"
 BASELINE="$STATE_DIR/.spec-baseline"
+TEST_CMD_FILE="$STATE_DIR/spec-gate-test-cmd"
 
 # tree_snapshot comes from phase-policy.sh, shared with review-gate.sh so the
 # baseline and the scan that reads it are computed the same way. Without it this
@@ -54,6 +55,81 @@ snapshot_baseline() {
   )
 }
 
+# --- RED tripwire -------------------------------------------------------------
+# Phase 3 -> 4 is the one transition that rests on a claim no hook can check:
+# "I saw the new tests fail for the reason I expect." Requiring a terminal makes
+# the claim deliberate; it does not make it true.
+#
+# So check the cheap half mechanically. Run the tests Phase 3 changed: if they
+# PASS with no implementation written, they are testing nothing, and advancing
+# would carry that mistake into Execute. This converts "trust me, they are red"
+# into "verified not-green" — narrower than "failing for the right reason", which
+# stays human, but it catches the vacuous-test failure mode outright.
+#
+# This runs in the user's own terminal, so it has no hook timeout to respect and
+# can take as long as the tests take. Its output is also exactly the failure
+# output Phase 3 asks to see.
+
+# Test files changed since the phase began, from the same snapshot the Stop scan
+# uses. One line per file, space separated.
+changed_test_files() {
+  (
+    cd "$PROJECT_DIR" 2>/dev/null || exit 0
+    git rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 0
+    base=$(cat "$BASELINE" 2>/dev/null)
+    tree_snapshot | while IFS= read -r line; do
+      [ -z "$line" ] && continue
+      case $'\n'"$base"$'\n' in
+        *$'\n'"$line"$'\n'*) continue ;;   # unchanged since phase entry
+      esac
+      p=${line#* }
+      is_test_path "$p" && printf '%s ' "$p"
+    done
+  )
+}
+
+# 0 = go ahead, 1 = refuse
+red_tripwire() {
+  cur=$(sed -n 's/^phase=//p' "$STATE" | head -1)
+  [ "$cur" = "3" ] || return 0          # only 3 -> 4 asserts RED
+
+  if [ ! -r "$TEST_CMD_FILE" ]; then
+    echo "spec-driven: no RED tripwire configured, advancing on your assertion alone."
+    echo "  To verify it automatically, put a command in $TEST_CMD_FILE"
+    echo "  It runs with \$SPEC_GATE_TEST_FILES set to the tests this phase changed."
+    return 0
+  fi
+
+  files=$(changed_test_files)
+  if [ -z "$files" ]; then
+    echo "spec-driven: REFUSED — no test files changed during Phase 3."
+    echo "  Phase 3 exists to produce failing tests. Write them first."
+    echo "  Override with: phase.sh 4 --force"
+    return 1
+  fi
+
+  echo "spec-driven: verifying the new tests fail before unlocking production code"
+  echo "  tests: $files"
+  echo
+  (
+    cd "$PROJECT_DIR" 2>/dev/null || exit 0
+    SPEC_GATE_TEST_FILES="$files" sh -c "$(cat "$TEST_CMD_FILE")"
+  )
+  rc=$?
+  echo
+  if [ $rc -eq 0 ]; then
+    echo "spec-driven: REFUSED — those tests PASSED."
+    echo "  A test that passes before the implementation exists is testing nothing."
+    echo "  Fix the tests so they fail for the reason you expect, then advance again."
+    echo "  Override with: phase.sh 4 --force"
+    return 1
+  fi
+  echo "spec-driven: tests failed as required — RED verified (exit $rc)."
+  echo "  Note: this proves not-green, not that they failed for the right reason."
+  echo "  That part is still yours to have checked in the output above."
+  return 0
+}
+
 case "${1:-status}" in
   status)
     if [ ! -f "$STATE" ]; then
@@ -89,6 +165,14 @@ case "${1:-status}" in
 
   1|2|3|4|5)
     [ -f "$STATE" ] || { echo "spec-driven: not started. Run: phase.sh start <task>"; exit 1; }
+    if [ "$1" = 4 ]; then
+      case "${2:-}" in
+        --force)
+          echo "spec-driven: --force — skipping the RED tripwire on your assertion." ;;
+        *)
+          red_tripwire || exit 1 ;;
+      esac
+    fi
     T=$(sed -n 's/^task=//p' "$STATE" | head -1)
     printf 'phase=%s\ntask=%s\n' "$1" "$T" > "$STATE"
     snapshot_baseline
@@ -102,6 +186,7 @@ case "${1:-status}" in
 
   *)
     echo "usage: phase.sh [status | start <task> | 1..5 | off]"
+    echo "       phase.sh 4 --force   skip the RED tripwire"
     exit 1
     ;;
 esac
