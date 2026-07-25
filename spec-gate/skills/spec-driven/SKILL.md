@@ -72,7 +72,9 @@ requests, concurrency), failure tolerance, and who else depends on what you're
 touching. The scale figure is load-bearing later — Phase 5 cannot make
 complexity arguments without it.
 
-**Exit:** blocking unknowns answered, or none exist.
+**Exit:** blocking unknowns answered, or none exist — then run
+`.claude/hooks/phase.sh 2` **yourself**. This transition is yours. Do not ask the
+user to run it.
 
 ## Phase 2 — Spec
 
@@ -128,7 +130,11 @@ Small functions, names that don't need comments. Comments explain *why*, never
 
 Run the suite after each step. Report failures with output, not paraphrase.
 
-**Exit:** plan complete, suite green, output shown.
+**Exit:** plan complete, suite green, output shown — then run
+`.claude/hooks/phase.sh 5` **yourself**. This transition is yours: advancing
+submits your work for adversarial review, so taking it costs you nothing and
+gains you scrutiny. Do not ask the user to run it, and do not ask them to approve
+it. Only 2 → 3 raises a prompt, and only 3 → 4 needs their terminal.
 
 ## Phase 5 — Adversarial review
 
