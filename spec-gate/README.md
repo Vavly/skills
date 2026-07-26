@@ -830,3 +830,177 @@ confidence it hasn't earned.
   unverified inside a live session.** The scripts are tested — `./test.sh`, 150
   cases — but the integration with Claude Code is not. Take one real but small
   task through end to end before trusting it.
+
+## Proposed: multi-slice execution
+
+**None of this is built.** It is written down because the design turns on one
+invariant that is easy to break by accident, and because most of the mechanism it
+needs is already present for other reasons. Nothing in this section is enforced
+today.
+
+### The problem
+
+A long plan produces one Execute phase and therefore one diff, and adversarial
+review quality falls off sharply with diff size. `adversary` reads a forty-file
+change the way anyone does — it finds something, and stops looking. Tuning
+already offers per-turn review as a knob, but per-turn is the wrong grain: it
+cuts where the model happened to stop, not where the work has a seam.
+
+### Slices
+
+Phase 4 becomes repeatable. The state file gains a position:
+
+```
+phase=3
+task=banner-placement
+slice=2/5
+```
+
+`slice` is always present and never below `1`. A task nobody sliced is `1/1` and
+behaves exactly as today. That is not cosmetic — an optional field means every
+read site becomes "if it exists", which is two paths through a gate, and
+`phase_name()` already carries the scar from the last time state was read without
+a total case.
+
+The loop is `3 → 4 → 5 → 3`, once per slice: tests written and verified RED,
+production code unlocked, diff reviewed, next slice. Both user approval prompts
+fire per lap, on fresh evidence each time, which is the entire point — five small
+approvals on five readable diffs rather than one on a diff nobody can hold in
+their head.
+
+### Why 5 → 3 is denied today, and what makes it safe
+
+`phase-guard.sh` denies *every* move off Phase 5 except `off`, and the comment
+says why: phases 1–4 suppress the Stop gate, so leaving 5 escapes the review
+currently owed. A retreat would launder an unreviewed diff into the next slice's
+baseline, where nothing would look at it again.
+
+The condition that makes the move safe is already computed. `review_pending_paths`
+reports exactly what the gate considers owed, so:
+
+> **`5 → 3` is permitted only while nothing is owed review.**
+
+Which puts the slice boundary on a commit, because committing is how the gate
+goes quiet. That is where it belongs anyway.
+
+### Where the boundaries are written
+
+Two homes, for two different readers:
+
+- **The spec declares the seams.** The 2→3 approval changes meaning when a task
+  is sliced — the user is accepting N review cycles, N commits, and a repo that
+  sits half-built in between. They should agree to that shape at approval time,
+  not discover it at slice 2.
+- **The plan carries the per-slice steps**, because that is what `spec-adversary`
+  attacks in Phase 3. "Slice 2 needs the types slice 3 introduces" can only be
+  found against a concrete ordering, and it is worth far more on paper than after
+  slice 2 is written.
+
+### The checklist
+
+The spec carries a slice checklist, and **the model updates it as each slice
+completes** — at the `5 → 3` boundary, alongside the commit:
+
+```markdown
+## Slices
+
+- [x] 1 — Extract the banner position into a layout prop      (a1b2c3d)
+- [x] 2 — Move the existing call sites onto it                (e4f5g6h)
+- [ ] 3 — Delete the old absolute-positioning path
+- [ ] 4 — Backfill the cases the spec listed as out of scope
+```
+
+Two records rather than one, deliberately. The state file is authoritative for
+*position* and survives compaction because it is never in context at all; the
+checklist is authoritative for *content* and is what a human reads to see where
+the task got to. Spec documents are writable in every phase and excluded from the
+review fingerprint, so keeping it current costs nothing and arms nothing.
+
+### Growing the slice count
+
+`phase.sh slices <n>`, as its own command rather than folded into a transition —
+the estimate turns out wrong in the middle of Execute, and deferring the
+declaration to the next boundary leaves the state file knowingly false in between.
+
+- **Any change to the total raises a prompt**, growth and shrink alike. Shrinking
+  is descoping work the user approved at 2→3; it is not the safer direction, and
+  one rule beats two.
+- **`n` below the current slice is denied outright.** Being on slice 3 of 2 is
+  incoherent state, and a gate should not offer to enter it.
+- **The prompt tells the model to update the spec in the same breath.** The count
+  lives in the state file and the seams live in the spec; growth moves one and
+  not the other, and after a compaction the model trusts whichever it reads
+  first. This stays a prompt — an mtime check is defeated by touching the file
+  and buys a failure mode for no guarantee.
+
+**Who judges whether the growth is legitimate:** the model asserts, the user
+ratifies — the same split as the RED check, where the model runs the tests and
+the user judges the output. The distinction that matters is *more work than
+estimated* versus *the design was wrong*, and the model is the party holding the
+evidence: it hit the wall, it read the spec, it knows which one it is. Asking the
+user to pick would be asking for a technical judgment with nothing on screen to
+base it on, which is how a prompt decays into the reflex click the 3→4 comment
+already worries about.
+
+So the model expresses the judgment by **which command it runs**, and nothing has
+to ask. `slices` *is* the assertion that this is an amendment; a design that
+turned out wrong routes to the 4→2 contradiction path and a re-approved spec
+instead. The prompt's only job is to surface the claim so it can be rejected —
+that Claude is asserting more work rather than a broken design, and that
+declining and asking for a retreat is the move if you disagree.
+
+### Completion is checked on the way out, not at Phase 5
+
+`adversary` should stay ignorant of the other slices. Telling it "this is slice 2
+of 5" invites it to excuse a gap as *coming later*, which is the last thing you
+want from a reviewer whose whole value is refusing to grant that.
+
+So "are all slices done?" belongs on `off` — already a user prompt from phases
+4–5, needing only a louder message: *slice 2 of 5, three remain unimplemented,
+ending now leaves the task half-built.* It stays a prompt. Abandoning a task
+halfway is legitimate and the gate should not trap you in it.
+
+### The idle problem this also has to solve
+
+Slices make Phase 4 repeatable, which makes it far more likely the model simply
+stops between laps. The cause is structural rather than a model quirk:
+`review-gate.sh` ends with `case "$PHASE" in 1|2|3|4) exit 0`, so four phases in
+five have nothing pushing the turn forward. The only counterpressure in the
+system is the review gate at Phase 5.
+
+"Continue unless waiting on the user" cannot be implemented as stated, because
+waiting is not observable — the model does not announce that it is blocked, it
+just ends the turn, and from the hook's side that is identical to being finished.
+The rule has to be inverted: enumerate the states where stopping is *provably*
+wrong, and block those.
+
+| Phase | Stopping is provably wrong when | Checkable |
+| --- | --- | --- |
+| 2 | `docs/specs/` was written and `review-log.jsonl` has no newer `spec-adversary` entry | yes |
+| 3 | `changed_test_files` is non-empty and the RED receipt is `none` | yes |
+| 4 | the slice is unfinished | **no** — a hook cannot know what finished means |
+
+Phase 2's row contradicts the Caveat above it, and the contradiction is real but
+narrower than it looks. Gating the *2→3 transition* on a subagent receipt would
+hard-block the workflow the day that payload shape changes, which is why it is
+not done. A *Stop-hook nudge* fails the other way: a bad log check ends a turn
+early instead of bricking the workflow. Failing open is cheap here, so the spec
+review can be enforced after all — just not at the transition.
+
+Phase 1 stays suppressed. Clarify legitimately ends by asking you questions.
+
+### Known risks in this design
+
+- **The Stop nudge compels a prompt, not compliance**, exactly as the review gate
+  does — one block per turn, and a model that ignores stderr ends the turn on its
+  second attempt. Cursor's `stop` injects a real follow-up with a `loop_limit`
+  and is genuinely stronger here.
+- **N slices cost N adversarial reviews.** That is the trade being bought rather
+  than a side effect: smaller diffs are the largest single lever on review
+  quality. But it is a real bill, and a three-step plan should not be sliced at
+  all. The trigger is "Phase 4 will produce a diff too large to review in one
+  pass", not "this task feels complicated".
+- **Every slice boundary is a place to stop and never come back.** The `off`
+  prompt says what remains, and nothing stronger is possible — a half-finished
+  sliced task looks exactly like a finished small one to every mechanism here
+  except the checklist.
