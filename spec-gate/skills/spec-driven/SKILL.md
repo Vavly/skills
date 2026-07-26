@@ -93,6 +93,41 @@ phase.
 - Assumptions from Phase 1.
 - Out of scope — what you are deliberately not doing.
 
+### Slicing a long task
+
+If Execute would produce a diff too large to review in one pass, the task lands
+in slices — each one separately tested, approved and reviewed. Judge this on
+diff size, not on how complicated the task feels: a three-step plan is not
+sliced, and slicing costs one adversarial review per slice.
+
+When it applies, the spec declares the seams, because the user's `2 → 3`
+approval means something different for a sliced task — they are accepting N
+review cycles, N commits, and a repo that sits half-built in between. Give the
+spec a checklist and set the count:
+
+```markdown
+## Slices
+
+- [ ] 1 — Extract the banner position into a layout prop
+- [ ] 2 — Move the existing call sites onto it
+- [ ] 3 — Delete the old absolute-positioning path
+```
+
+```
+.claude/hooks/phase.sh slices 3
+```
+
+Setting it here is silent — the count is part of the spec they are about to
+approve. Changing it later raises a prompt, because by then they have approved
+it. **Keep the checklist and the count in step**: the count lives in the state
+file and the seams live in the spec, and after a compaction whichever is read
+first is believed.
+
+If the estimate turns out low mid-task, `phase.sh slices <n>` again. Running it
+asserts *more work than expected*. If instead the design turned out wrong, that
+is not a slice change — it is the contradiction rule in [Standing
+commitments](#standing-commitments), so stop and ask to return to Phase 2.
+
 ### Have it reviewed before you ask
 
 **You do not review your own spec.** When it is written, delegate to the
@@ -285,6 +320,24 @@ Close with an evidence log: what the reviewer found, what you changed, what you
 declined and why. **"Reviewer found nothing, no changes made" is a complete and
 unremarkable entry.** Do not pad it. A log that always shows improvements is
 a log that trains the reader to skim.
+
+### If the task is sliced, this is a boundary, not the end
+
+At `slice n of total` with slices remaining, Phase 5 is where one increment ends
+and the next begins. Commit the reviewed work, tick the slice off the checklist
+in the spec, then run `.claude/hooks/phase.sh 3` to open the next one.
+
+**The commit is not optional and the guard enforces it.** `5 → 3` is refused
+while anything is owed review, because starting the next slice folds this one's
+diff into the new baseline, where the review gate stops seeing it forever. If
+the transition is denied, the message names what is outstanding — commit that,
+do not look for another way forward.
+
+Then Phase 3 again: the next slice's plan steps, its failing tests, its own RED
+check, its own `3 → 4` approval. The user re-approves every lap, on that lap's
+evidence.
+
+Only when the last slice is reviewed does the close-out below apply.
 
 ### Closing out
 

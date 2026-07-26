@@ -106,6 +106,64 @@ is_review_excluded() {
   return 1
 }
 
+# Files the review gate would consider owed review — i.e. excluding the paths it
+# ignores. Lives here rather than in phase.sh because both layers now read it:
+# phase.sh reports it from `status` and `off`, and phase-guard.sh gates 5 -> 3 on
+# it being empty. Two implementations of "what is owed" would let the guard
+# permit a slice boundary the Stop gate still considers unreviewed.
+review_pending_paths() {
+  (
+    cd "$PROJECT_DIR" 2>/dev/null || exit 0
+    git rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 0
+    { git diff HEAD --name-only
+      git ls-files --others --exclude-standard
+    } 2>/dev/null | sort -u | while IFS= read -r p; do
+      [ -z "$p" ] && continue
+      is_review_excluded "$p" || printf '%s\n' "$p"
+    done
+  )
+}
+
+# --- Slice position ----------------------------------------------------------
+# A task lands in one or more slices, each separately reviewed. Position lives on
+# disk beside the phase, for the reason the phase does: compaction eats context,
+# and a model would slide from slice 1 to slice 4 without noticing.
+#
+# Absent reads as 1/1 — that is both a state file written before slices existed
+# and the single-slice shape every task starts in, and neither is an error.
+# Malformed is different and fails closed: .spec-phase is denied to the model in
+# every phase, so a bad value is not a user's choice, it is something that should
+# not have been able to write the file at all.
+slice_raw() {
+  sed -n 's/^slice=//p' "${PROJECT_DIR%/}/.claude/.spec-phase" 2>/dev/null | head -1
+}
+
+# ok | absent | corrupt
+slice_status() {
+  raw=$(slice_raw)
+  [ -z "$raw" ] && { printf 'absent\n'; return 0; }
+  case "$raw" in */*) ;; *) printf 'corrupt\n'; return 0 ;; esac
+  cur=${raw%%/*}; tot=${raw#*/}
+  case "$tot" in */*) printf 'corrupt\n'; return 0 ;; esac   # more than one slash
+  case "$cur" in ''|*[!0-9]*) printf 'corrupt\n'; return 0 ;; esac
+  case "$tot" in ''|*[!0-9]*) printf 'corrupt\n'; return 0 ;; esac
+  { [ "$cur" -ge 1 ] && [ "$tot" -ge 1 ] && [ "$cur" -le "$tot" ]; } \
+    || { printf 'corrupt\n'; return 0; }
+  printf 'ok\n'
+}
+
+# Both report 1 for anything that is not `ok`, so a caller that does not care
+# about slices reads a single-slice task and is right. A caller that must refuse
+# on corruption asks slice_status directly — same split as red_receipt_status.
+slice_current() {
+  case "$(slice_status)" in ok) raw=$(slice_raw); printf '%s\n' "${raw%%/*}" ;;
+                            *)  printf '1\n' ;; esac
+}
+slice_total() {
+  case "$(slice_status)" in ok) raw=$(slice_raw); printf '%s\n' "${raw#*/}" ;;
+                            *)  printf '1\n' ;; esac
+}
+
 # --- Working-tree snapshot ---------------------------------------------------
 # One "<content-hash> <path>" line per dirty or untracked file. Must be run from
 # the project root, inside a work tree.

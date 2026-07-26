@@ -343,6 +343,147 @@ c=$(cd "$SRC/cursor/agents" && ls *.md | sort)
 [ "$a" = "$c" ] && ok "the Claude Code and Cursor agent sets match" \
   || bad "agents differ — .claude: $(echo $a) / .cursor: $(echo $c)"
 
+group "Slice position"
+setup_repo
+phase start sliced
+# A task nobody sliced must be indistinguishable from the old single-pass
+# workflow, output included — otherwise everyone pays for a feature they did not
+# ask for.
+grep -q '^slice=1/1$' .claude/.spec-phase \
+  && ok "start writes slice=1/1" || bad "start did not write a slice field"
+
+# Capture before matching, never `phase.sh status | grep -q`. Under `pipefail`
+# grep -q exits on the matching line, SIGPIPEs phase.sh mid-output, and the
+# pipeline reports 141 — so a *successful* match reads as failure whenever the
+# match is not on the last line. Silent, and it inverts the assertion.
+st() { .claude/hooks/phase.sh status 2>/dev/null; }
+
+# Matched on the reported shape, not the bare word: the task is called 'sliced'
+# and `(task: sliced)` contains it.
+printf '%s' "$(st)" | grep -qiE 'slice [0-9]+ of' \
+  && bad "status mentions slices for a 1/1 task" || ok "1/1 says nothing about slices"
+
+.claude/hooks/phase.sh slices 4 >/dev/null 2>&1
+grep -q '^slice=1/4$' .claude/.spec-phase \
+  && ok "slices 4 sets the total, keeps the position" || bad "slices 4 did not set 1/4"
+printf '%s' "$(st)" | grep -q 'slice 1 of 4' \
+  && ok "status reports slice 1 of 4" || bad "status does not report the slice"
+
+# The task name survived a write that had nothing to do with it — the reason the
+# state file is written from one place.
+grep -q '^task=sliced$' .claude/.spec-phase \
+  && ok "slices preserves the task name" || bad "slices dropped the task name"
+
+for bad_n in 0 -1 abc ''; do
+  if .claude/hooks/phase.sh slices "$bad_n" >/dev/null 2>&1; then
+    bad "slices accepted '$bad_n'"
+  else
+    ok "slices rejects '$bad_n'"
+  fi
+done
+
+# Absent reads as 1/1; malformed fails closed. A bad value cannot come from the
+# user — the guard denies every write to this file — so it means corruption.
+printf 'phase=3\ntask=t\n' > .claude/.spec-phase
+printf '%s' "$(st)" | grep -qi 'corrupt' \
+  && bad "absent slice field reported as corrupt" || ok "absent slice field reads as 1/1"
+for junk in 'abc' '2/' '/5' '0/3' '4/2' '1/2/3'; do
+  printf 'phase=3\ntask=t\nslice=%s\n' "$junk" > .claude/.spec-phase
+  if printf '%s' "$(st)" | grep -qi 'corrupt'; then
+    ok "slice='$junk' fails closed"
+  else
+    bad "slice='$junk' was accepted"
+  fi
+done
+printf 'phase=4\ntask=t\nslice=2/2\n' > .claude/.spec-phase
+.claude/hooks/phase.sh slices 1 >/dev/null 2>&1 \
+  && bad "slices dropped the total below the current slice" \
+  || ok "slices refuses a total below the current slice"
+
+group "The slice boundary is a commit [5 -> 3]"
+setup_repo
+phase start sliced
+.claude/hooks/phase.sh slices 3 >/dev/null 2>&1
+printf 'phase=5\ntask=sliced\nslice=1/3\n' > .claude/.spec-phase
+
+# Dirty tree: the next slice would fold this diff into its baseline and the
+# review gate would never see it again. That is the escape Phase 5 exists to
+# block, so the boundary has to refuse.
+echo 'unreviewed' > src/leftover.ts
+reason=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh 3')")
+if printf '%s' "$reason" | grep -qi 'not been reviewed and committed'; then
+  ok "5 -> 3 denied while a diff is owed review"
+else
+  bad "5 -> 3 allowed with an unreviewed diff: '$reason'"
+fi
+
+git add -A >/dev/null 2>&1; git commit -qm "slice 1" >/dev/null 2>&1
+out=$(pl_bash '.claude/hooks/phase.sh 3' | .claude/hooks/phase-guard.sh)
+if [ -z "$out" ]; then
+  ok "5 -> 3 allowed once the slice is committed"
+else
+  bad "5 -> 3 blocked on a clean tree: $(printf '%s' "$out" | head -c 120)"
+fi
+.claude/hooks/phase.sh 3 >/dev/null 2>&1
+grep -q '^slice=2/3$' .claude/.spec-phase \
+  && ok "5 -> 3 advances the slice position" || bad "slice position did not advance"
+
+# The last slice has no next one. Closing out is `off`, which is the user's.
+printf 'phase=5\ntask=sliced\nslice=3/3\n' > .claude/.spec-phase
+reason=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh 3')")
+[ -n "$reason" ] && ok "5 -> 3 denied on the final slice" \
+                 || bad "5 -> 3 allowed past the final slice"
+# Every other move off 5 stays denied, sliced or not.
+reason=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh 4')")
+[ -n "$reason" ] && ok "5 -> 4 still denied" || bad "5 -> 4 escaped the review gate"
+printf 'phase=5\ntask=sliced\nslice=1/3\n' > .claude/.spec-phase
+reason=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh 2')")
+[ -n "$reason" ] && ok "5 -> 2 still denied mid-slice" || bad "5 -> 2 escaped the review gate"
+
+group "Changing the total after approval is the user's"
+setup_repo
+phase start sliced
+# Phase 1-2: the spec is not approved, so neither is the count in it.
+for p in 1 2; do
+  phase "$p"
+  out=$(pl_bash '.claude/hooks/phase.sh slices 5' | .claude/hooks/phase-guard.sh)
+  [ -z "$out" ] && ok "slices is silent at phase $p" \
+                || bad "slices prompted at phase $p, before the spec was approved"
+done
+# Phase 3+: the total is part of what was approved at 2 -> 3.
+for p in 3 4 5; do
+  printf 'phase=%s\ntask=sliced\nslice=1/5\n' "$p" > .claude/.spec-phase
+  d=$(pl_bash '.claude/hooks/phase.sh slices 8' | .claude/hooks/phase-guard.sh \
+      | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("hookSpecificOutput",{}).get("permissionDecision",""))
+except Exception: print("")' 2>/dev/null)
+  [ "$d" = ask ] && ok "slices asks at phase $p" || bad "slices did not ask at phase $p (got '$d')"
+done
+reason=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh slices 8')")
+for want in 'MORE WORK' 'retreat to Phase 2' 'checklist'; do
+  printf '%s' "$reason" | grep -qF "$want" \
+    && ok "the slices prompt says: '$want'" \
+    || bad "the slices prompt is missing: '$want'"
+done
+
+group "Closing out names the unfinished slices"
+setup_repo
+phase start sliced
+printf 'phase=5\ntask=sliced\nslice=2/5\n' > .claude/.spec-phase
+reason=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh off')")
+if printf '%s' "$reason" | grep -q 'slice 2 of 5'; then
+  ok "the close-out prompt names the slice position"
+else
+  bad "close-out does not mention the unfinished slices: '$reason'"
+fi
+printf '%s' "$reason" | grep -q '3 more are unimplemented' \
+  && ok "close-out counts what is left" || bad "close-out does not count the remainder"
+printf 'phase=5\ntask=sliced\nslice=5/5\n' > .claude/.spec-phase
+reason=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh off')")
+printf '%s' "$reason" | grep -qi 'unimplemented' \
+  && bad "close-out warns about slices on a finished task" \
+  || ok "a finished task closes out without a slice warning"
+
 group "Untracked fixes are re-reviewed [#2]"
 setup_repo
 phase off

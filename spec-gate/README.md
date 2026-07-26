@@ -831,12 +831,10 @@ confidence it hasn't earned.
   cases — but the integration with Claude Code is not. Take one real but small
   task through end to end before trusting it.
 
-## Proposed: multi-slice execution
+## Multi-slice execution
 
-**None of this is built.** It is written down because the design turns on one
-invariant that is easy to break by accident, and because most of the mechanism it
-needs is already present for other reasons. Nothing in this section is enforced
-today.
+**Built and enforced**, except for the idle-problem section at the end, which is
+still a proposal and says so.
 
 ### The problem
 
@@ -960,7 +958,9 @@ So "are all slices done?" belongs on `off` — already a user prompt from phases
 ending now leaves the task half-built.* It stays a prompt. Abandoning a task
 halfway is legitimate and the gate should not trap you in it.
 
-### The idle problem this also has to solve
+### Still proposed: the idle problem
+
+**Not built.** Everything above this heading is; this is not.
 
 Slices make Phase 4 repeatable, which makes it far more likely the model simply
 stops between laps. The cause is structural rather than a model quirk:

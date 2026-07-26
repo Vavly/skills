@@ -34,7 +34,16 @@ else
   changed_test_snapshot() { :; }
   changed_test_files() { :; }
   red_receipt_status() { printf 'unverifiable\n'; }
+  review_pending_paths() { :; }
+  slice_status() { printf 'absent\n'; }
+  slice_current() { printf '1\n'; }
+  slice_total() { printf '1\n'; }
 fi
+
+# The state file is written from exactly one place, so a field cannot be dropped
+# by a caller that forgot it existed. Adding `slice` to a `printf` in three
+# separate branches is how the task name would have gone missing on the fourth.
+write_state() { printf 'phase=%s\ntask=%s\nslice=%s\n' "$1" "$2" "$3" > "$STATE"; }
 
 # Indexing an array with an unvalidated value out of the state file used to
 # abort this script with "unbound variable" under set -u. A case is total.
@@ -159,22 +168,11 @@ red_tripwire() {
   esac
 }
 
-# Files the review gate would consider owed review — i.e. excluding the paths it
-# ignores. Reported by `status` and `off` because the surprising part of this
-# system is that turning the phase gate OFF makes review fire *more* often, not
-# less: with no phase file the Stop gate runs every turn.
-review_pending_paths() {
-  (
-    cd "$PROJECT_DIR" 2>/dev/null || exit 0
-    git rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 0
-    { git diff HEAD --name-only
-      git ls-files --others --exclude-standard
-    } 2>/dev/null | sort -u | while IFS= read -r p; do
-      [ -z "$p" ] && continue
-      is_review_excluded "$p" || printf '%s\n' "$p"
-    done
-  )
-}
+# review_pending_paths now lives in phase-policy.sh — phase-guard.sh gates the
+# 5 -> 3 slice boundary on it, and the two layers have to agree on what is owed.
+# It is still reported by `status` and `off` here, because the surprising part of
+# this system is that turning the phase gate OFF makes review fire *more* often,
+# not less: with no phase file the Stop gate runs every turn.
 
 report_review_state() {
   pending=$(review_pending_paths)
@@ -196,6 +194,12 @@ case "${1:-status}" in
     P=$(sed -n 's/^phase=//p' "$STATE" | head -1)
     T=$(sed -n 's/^task=//p' "$STATE" | head -1)
     echo "spec-driven: phase $(phase_name "$P")  (task: ${T:-unnamed})"
+    case "$(slice_status)" in
+      corrupt) echo "  -> slice position is CORRUPT. Recover with: .claude/hooks/phase.sh off" ;;
+      # A 1/1 task is the single-pass workflow and says nothing about slices, so
+      # nobody who never asked for them pays a line of output for them.
+      *) [ "$(slice_total)" -gt 1 ] && echo "  -> slice $(slice_current) of $(slice_total)" ;;
+    esac
     case "$P" in
       1) echo "  -> no files may be written"
          echo "  -> next: 2 Spec — Claude may advance" ;;
@@ -224,10 +228,49 @@ case "${1:-status}" in
     mkdir -p "$STATE_DIR"
     # A newline in the task name would inject extra lines into the state file.
     T=$(printf '%s' "${2:-unnamed}" | tr -d '\n\r')
-    printf 'phase=1\ntask=%s\n' "$T" > "$STATE"
+    write_state 1 "$T" "1/1"
     rm -f "$RECEIPT"
     snapshot_baseline
     echo "spec-driven: started '${T}' at phase 1 (Clarify)"
+    ;;
+
+  # Set the number of slices this task lands in. Its own command rather than a
+  # flag on a transition: the estimate turns out wrong in the middle of Execute,
+  # and deferring the declaration to the next boundary leaves the state file
+  # knowingly false in between.
+  #
+  # The guard decides whether this needs the user — silent while the spec is
+  # unapproved, a prompt once it is. Everything here is the arithmetic that
+  # holds whoever ran it to a coherent number.
+  slices)
+    [ -f "$STATE" ] || { echo "spec-driven: not started. Run: phase.sh start <task>"; exit 1; }
+    N="${2:-}"
+    case "$N" in
+      ''|*[!0-9]*) echo "usage: phase.sh slices <n>   (n a positive integer)"; exit 1 ;;
+    esac
+    [ "$N" -ge 1 ] || { echo "spec-driven: a task lands in at least one slice."; exit 1; }
+    if [ "$(slice_status)" = corrupt ]; then
+      echo "spec-driven: slice position is corrupt; refusing to build on it."
+      echo "  Recover with: .claude/hooks/phase.sh off"
+      exit 1
+    fi
+    CUR=$(slice_current)
+    # Slice 3 of 2 is not a state to enter, so this is a refusal rather than a
+    # prompt. Descoping remaining work is `slices` down to the current slice.
+    if [ "$N" -lt "$CUR" ]; then
+      echo "spec-driven: REFUSED — you are on slice $CUR, so the total cannot be $N."
+      echo "  Finish or abandon the current slice first."
+      exit 1
+    fi
+    P=$(sed -n 's/^phase=//p' "$STATE" | head -1)
+    T=$(sed -n 's/^task=//p' "$STATE" | head -1)
+    write_state "$P" "$T" "$CUR/$N"
+    echo "spec-driven: slice $CUR of $N"
+    if [ "$N" -gt 1 ]; then
+      echo "  -> update the slice checklist in docs/specs/ to match, now."
+      echo "     The count lives here and the seams live there; after a compaction"
+      echo "     whichever is read first is believed."
+    fi
     ;;
 
   red)
@@ -256,13 +299,27 @@ case "${1:-status}" in
       esac
     fi
     T=$(sed -n 's/^task=//p' "$STATE" | head -1)
-    printf 'phase=%s\ntask=%s\n' "$1" "$T" > "$STATE"
+    FROM=$(sed -n 's/^phase=//p' "$STATE" | head -1)
+    CUR=$(slice_current); TOT=$(slice_total)
+    # 5 -> 3 is the only transition that moves the slice on. The guard has
+    # already established that nothing is owed review and that a next slice
+    # exists; this is where the position actually advances.
+    if [ "$FROM" = 5 ] && [ "$1" = 3 ] && [ "$CUR" -lt "$TOT" ]; then
+      CUR=$((CUR + 1))
+      ADVANCED=1
+    else
+      ADVANCED=0
+    fi
+    write_state "$1" "$T" "$CUR/$TOT"
     # The receipt describes one Phase 3, and every phase change ends that Phase 3
     # — including a retreat back into it to fix the tests, which must be
     # re-verified rather than riding the old check.
     rm -f "$RECEIPT"
     snapshot_baseline
     echo "spec-driven: -> $(phase_name "$1")"
+    if [ "$ADVANCED" = 1 ]; then
+      echo "  -> slice $CUR of $TOT — tick the previous one off the checklist in docs/specs/"
+    fi
     ;;
 
   off)
@@ -274,8 +331,9 @@ case "${1:-status}" in
     ;;
 
   *)
-    echo "usage: phase.sh [status | start <task> | red | 1..5 | off]"
+    echo "usage: phase.sh [status | start <task> | red | slices <n> | 1..5 | off]"
     echo "       phase.sh red         run the Phase 3 tests and record RED if they fail"
+    echo "       phase.sh slices <n>  set how many slices this task lands in"
     echo "       phase.sh 4 --force   advance without the RED check"
     exit 1
     ;;

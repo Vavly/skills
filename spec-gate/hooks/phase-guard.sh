@@ -145,6 +145,20 @@ if [ -n "$CMD" ] && printf '%s' "$CMD" | grep -qE '(^|[^[:alnum:]_.+-])phase\.sh
   case "$ARG" in
     status|"") ;;                       # read-only, always fine
     red) ;;                             # verification, not advancement — see below
+    slices)
+      # Before the spec is approved the count is not approved either: the seams
+      # are declared in the spec and the 2 -> 3 prompt covers them, so asking
+      # separately would put the same question twice seconds apart.
+      #
+      # After that the total is something the user accepted, and changing it is
+      # theirs. Nothing here asks *why* it changed, because the model has already
+      # answered that by running this command at all: `slices` asserts more work
+      # than estimated, and a design that turned out wrong routes to the 4 -> 2
+      # contradiction path instead. The prompt's job is to surface the claim so
+      # it can be rejected.
+      if [ "$PHASE" -ge 3 ]; then
+        ask "Change the number of slices this task lands in? It is currently slice $(slice_current) of $(slice_total), and that total is part of what you approved at 2 -> 3. Claude is asserting this is MORE WORK than estimated — not that the design is wrong. If you think the spec itself no longer holds, decline and ask it to retreat to Phase 2 for a re-approved spec. Whatever you accept, the slice checklist in docs/specs/ must be updated to match."
+      fi ;;
     start)
       deny "The phase gate is already armed at phase $PHASE. Re-arming resets to Phase 1 and is the user's call: .claude/hooks/phase.sh start <task> in their own terminal." ;;
     off)
@@ -156,13 +170,36 @@ if [ -n "$CMD" ] && printf '%s' "$CMD" | grep -qE '(^|[^[:alnum:]_.+-])phase\.sh
       # moment the user decides what happens to the work — ship it, keep
       # iterating, throw it away. A model that disarms on its own has skipped
       # that conversation and presented the outcome as settled.
-      ask "End the spec-driven workflow for this task? This is the close-out decision: the phase gate stops, and whatever is in the working tree is what you are left with. If the work should become a pull request, say so instead of accepting — that happens before disarming, not after. Note that turning the gate off makes the review gate fire on EVERY turn while the tree is dirty, so decline this if the diff is not committed yet." ;;
+      # Completion is checked here, on the way out, and never at Phase 5 —
+      # `adversary` has to stay ignorant of the other slices, because telling it
+      # "this is slice 2 of 5" invites it to excuse a gap as coming later, which
+      # is the one thing a reviewer must refuse to grant.
+      OFF_SLICES=""
+      if [ "$(slice_current)" -lt "$(slice_total)" ]; then
+        OFF_SLICES=" You are on slice $(slice_current) of $(slice_total), so $(( $(slice_total) - $(slice_current) )) more are unimplemented — ending now leaves the task half-built, and nothing afterwards remembers that it was sliced."
+      fi
+      ask "End the spec-driven workflow for this task?${OFF_SLICES} This is the close-out decision: the phase gate stops, and whatever is in the working tree is what you are left with. If the work should become a pull request, say so instead of accepting — that happens before disarming, not after. Note that turning the gate off makes the review gate fire on EVERY turn while the tree is dirty, so decline this if the diff is not committed yet." ;;
     "$PHASE") ;;                        # no-op
     1|2|3|4|5)
       if [ "$PHASE" = 5 ]; then
-        # Phases 1-4 suppress the Stop gate, so any move off 5 escapes the
-        # review that is currently owed. Only `off` is safe, handled above.
-        advance_deny "$ARG"
+        # Phases 1-4 suppress the Stop gate, so a move off 5 escapes the review
+        # currently owed — it would launder an unreviewed diff into the next
+        # slice's baseline, where nothing would look at it again.
+        #
+        # 5 -> 3 is the one exception, and only once that escape is closed: the
+        # condition is that nothing is owed review, which is exactly what
+        # review_pending_paths reports. That puts every slice boundary on a
+        # commit, since committing is how the gate goes quiet. It stays the
+        # model's move because it expands no write access — Phase 3 is stricter
+        # than Phase 5, and the 3 -> 4 prompt is still ahead of it.
+        if [ "$ARG" = 3 ] && [ "$(slice_current)" -lt "$(slice_total)" ]; then
+          if [ -n "$(review_pending_paths)" ]; then
+            deny "Slice $(slice_current) of $(slice_total) is not finished: its diff has not been reviewed and committed, and starting the next slice now would fold it into the new baseline where the review gate stops seeing it. Commit this slice, then advance. Outstanding: $(review_pending_paths | tr '\n' ' ')"
+          fi
+          :                               # next slice: this one is clean
+        else
+          advance_deny "$ARG"
+        fi
       elif [ "$ARG" -lt "$PHASE" ]; then
         :                               # retreat: strictly more restrictive
       elif [ "$PHASE" = 1 ] && [ "$ARG" = 2 ]; then
