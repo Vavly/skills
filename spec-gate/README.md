@@ -31,7 +31,7 @@ spec-gate/
 ├── test.sh                          regression suite — not installed
 ├── settings.json                    → .claude/settings.json  (MERGE, see below)
 │                                    (.claude/spec-gate-test-cmd is written per
-│                                     repo at install; see RED tripwire)
+│                                     repo at install; see RED verification)
 ├── hooks/
 │   ├── review-gate.sh               → .claude/hooks/   Stop hook
 │   ├── phase-guard.sh               → .claude/hooks/   PreToolUse hook
@@ -79,10 +79,11 @@ mkdir -p .claude docs/specs
 cp -R "$SPEC_GATE"/hooks "$SPEC_GATE"/agents "$SPEC_GATE"/skills .claude/
 # settings.json is a MERGE, not a copy — see below.
 
-# Optional but recommended: teach the RED tripwire how to run this repo's tests.
+# Teach the RED check how to run this repo's tests. Without it the 3->4 gate
+# cannot be verified in-band and falls back to being terminal-only.
 printf 'yarn jest $SPEC_GATE_TEST_FILES\n' > .claude/spec-gate-test-cmd
 
-printf '.claude/.spec-phase\n.claude/.spec-baseline\n.claude/review-log.jsonl\n' >> .gitignore
+printf '.claude/.spec-phase\n.claude/.spec-baseline\n.claude/.spec-red\n.claude/review-log.jsonl\n' >> .gitignore
 git add .claude .gitignore && git commit -m "add review gate + spec-driven workflow"
 ```
 
@@ -141,10 +142,10 @@ Two places where Cursor is the better host:
   ends the turn on its second attempt. Cursor hands the agent the instruction as
   a follow-up message, capped by `loop_limit` (default 5).
 
-And one place it is worse: `preToolUse` has no `ask`, so the 2→3 approval only
-works because `phase.sh 3` is a shell command and reaches
-`beforeShellExecution`. The adapter downgrades a stray `ask` to `deny` rather
-than letting it evaporate.
+And one place it is worse: `preToolUse` has no `ask`, so all three approval
+prompts work only because `phase.sh 3`, `phase.sh 4` and `phase.sh off` are shell
+commands and reach `beforeShellExecution`. The adapter downgrades a stray `ask`
+to `deny` rather than letting it evaporate.
 
 **`readonly: false` on the Cursor adversary is deliberate.** Cursor can enforce
 read-only on a subagent, which Claude Code cannot — there it is only an
@@ -161,7 +162,8 @@ do not modify the files under review — is stated in the brief.
 /spec-phase start <task>     arm the gate at Phase 1
 /spec-driven <task>          run the workflow
 /spec-phase status           where am I
-/spec-phase <1-5>            advance — the two approval gates need a terminal
+/spec-phase red              run the Phase 3 tests, record RED if they fail
+/spec-phase <1-5>            advance — the two approval gates raise a prompt
 /spec-phase off              disarm
 ```
 
@@ -182,52 +184,76 @@ flowchart TD
     OFF["gate off<br/>no phase file · review gate armed every turn"]
 
     P1 -->|"model may advance"| P2
-    P2 ==>|"USER ONLY · approve the prompt<br/>spec approved"| P3
-    P3 ==>|"USER ONLY · terminal only<br/>every new test fails for the right reason"| P4
+    P2 ==>|"USER · approve the prompt<br/>spec approved"| P3
+    P3 ==>|"USER · approve the prompt<br/>after phase.sh red verifies RED"| P4
     P4 -->|"model may advance<br/>self-submits to review"| P5
-    P5 -->|"model may disarm"| OFF
+    P5 ==>|"USER · approve the prompt<br/>ship it, or keep iterating"| OFF
     P4 -.->|"spec contradicted · retreat is always allowed"| P2
 ```
 
-The two thick edges are the whole point of the workflow: **spec approval** and
-**observing RED**. Neither can be verified by a hook — only asserted — so both
-are reserved to the user. They are reserved *differently*, though, and the
-difference is about attention rather than mechanism.
+The thick edges are the decisions a hook cannot make for you: **spec approval**,
+**observing RED**, and **what happens to the finished work**. All three arrive as
+a confirmation prompt naming what accepting asserts.
 
-**2→3 asks.** The guard returns `permissionDecision: "ask"`, so you get a
-confirmation prompt naming what approving asserts. You are reading the spec in
-the conversation anyway, so approving in the same place is proportionate.
+**2→3 asks, always.** You are reading the spec in the conversation anyway, so
+approving in the same place is proportionate.
 
-**3→4 does not ask — it refuses.** You advance it yourself:
+**3→4 asks only once RED has been verified.** Before that the guard refuses it
+however it is spelled, and the refusal says to run the check first.
+
+**`off` from 4–5 asks.** It expands no write access at all, which is why it was
+originally the model's to take freely — and that turned out to be the wrong axis
+to reason on. `off` ends the task. A model that disarms on its own has decided
+the work is finished and presented that as settled, skipping the only
+conversation where you get to say *ship it*, *keep going*, or *throw it away*.
+See [Closing out](#closing-out).
+
+### RED verification
+
+This is the part of the workflow that changed most, and the reasoning is worth
+keeping.
+
+The 3→4 gate used to be terminal-only. The argument was that a permission prompt
+is a low-attention action — after twenty of them "yes" is a reflex — and the RED
+claim was pure assertion, so a reflex click would hollow it out. Making you type
+the command was the friction that kept it honest.
+
+It had a cost nobody predicted: the check ran in **the one place the model could
+not read**. The tests executed in your terminal, so the failure output — the
+entire artifact Phase 3 exists to produce — never entered the conversation. The
+model went into Execute knowing only that *something* had failed.
+
+So the check and the approval are now separate acts by separate parties:
 
 ```bash
-.claude/hooks/phase.sh 4      # in your terminal, not through Claude
+.claude/hooks/phase.sh red    # the model runs this — output lands in the transcript
+.claude/hooks/phase.sh 4      # the model runs this too — you approve the prompt
 ```
 
-That gate exists precisely because *the model's claim that the tests are red is
-the thing we don't trust*. A permission prompt is a low-attention action; after
-twenty of them "yes" is a reflex, and a reflex click would hollow the gate out
-completely. Typing the command is a high-attention one. The friction is the
-feature.
+`phase.sh red` runs the tests Phase 3 changed and **refuses if they pass**. A test
+that passes before the implementation exists is testing nothing, and advancing
+would carry that mistake into Execute. This converts *"trust me, they're red"*
+into *"verified not-green"* — narrower than "failing for the right reason", which
+stays human, but it catches the vacuous-test failure mode outright, which is the
+one that actually happens.
 
-One terminal trip per task, at the moment that most needs deliberateness.
-Everything else stays a slash command.
+What you approve at the prompt is the part the machine cannot check: that each
+test failed for the reason the spec expects, rather than on an import error or a
+typo in a fixture. You are reading real output to decide that, which is what
+makes the click worth something.
 
-### The RED tripwire
+**The receipt** is what stops the obvious attack. Between verification and
+approval the tests could change — verify RED, then quietly edit a test green.
+So `phase.sh red` writes `.claude/.spec-red` pinning the content hash of every
+test file it verified, and the guard offers the prompt only while that receipt
+still matches the tree. Touch a test afterwards, or add a new one, and the
+receipt goes stale and 3→4 goes back to being denied. The model cannot write the
+receipt itself: `.spec-red` is phase state, denied to Edit, Write and every Bash
+command that names it.
 
-Requiring a terminal makes the RED claim deliberate. It does not make it true.
-So `phase.sh 4` checks the cheap half mechanically: it runs the tests Phase 3
-changed, and **refuses to advance if they pass.** A test that passes before the
-implementation exists is testing nothing, and advancing would carry that mistake
-into Execute.
-
-This converts *"trust me, they're red"* into *"verified not-green"*. That is
-narrower than "failing for the right reason", which stays human — but it catches
-the vacuous-test failure mode outright, which is the one that actually happens.
-
-Configure it by putting a command in `.claude/spec-gate-test-cmd`. It runs from
-the project root with `$SPEC_GATE_TEST_FILES` set to the test files this phase
-changed, derived from the same phase-entry snapshot the Stop scan uses:
+Configure the check by putting a command in `.claude/spec-gate-test-cmd`. It runs
+from the project root with `$SPEC_GATE_TEST_FILES` set to the test files this
+phase changed, derived from the same phase-entry snapshot the Stop scan uses:
 
 ```bash
 # .claude/spec-gate-test-cmd — examples
@@ -236,48 +262,82 @@ pytest $SPEC_GATE_TEST_FILES
 go test ./...
 ```
 
-Because this runs in your terminal rather than in a hook, it has **no timeout to
-respect** and can take as long as the tests take. Scoped to the files one phase
-touched, that is usually well under a second. Its output is also exactly the
-failure output Phase 3 asks you to look at, so the check and the evidence are the
-same artifact.
+Scoped to the files one phase touched, that is usually well under a second.
 
-Three refusals, all recoverable:
+| Situation | `phase.sh red` | then `phase.sh 4` |
+| --- | --- | --- |
+| tests fail | RED verified, receipt written | **prompts** — you approve |
+| tests pass | **refused** — they are testing nothing | denied |
+| no test files changed during Phase 3 | **refused** — Phase 3 exists to produce them | denied |
+| tests edited after verification | — | denied, receipt stale |
+| no `spec-gate-test-cmd` configured | cannot run | denied — **terminal only**, as before |
 
-| Situation | Result |
-| --- | --- |
-| tests fail | advance allowed, "RED verified" |
-| tests pass | **refused** — they are testing nothing |
-| no test files changed during Phase 3 | **refused** — Phase 3 exists to produce them |
-| no `spec-gate-test-cmd` configured | advance allowed, with a visible notice |
+That last row is the deliberate fallback: with no test command there is nothing
+to put on screen, so there is nothing to approve, and the gate reverts to
+`.claude/hooks/phase.sh 4` in your own terminal. **Configuring
+`spec-gate-test-cmd` is what buys the in-band prompt.**
 
+Run from a terminal, `phase.sh 4` still behaves as it always did: it honours a
+valid receipt without re-running, and runs the check itself if there is none.
 Override any refusal with `phase.sh 4 --force`, which says plainly that it is
-running on your assertion instead. The model cannot use it: the guard denies
-`phase.sh 4` in any spelling, `--force` included.
+running on your assertion instead. The model cannot use it — the guard denies any
+`phase.sh` command containing `--force`, in every phase.
+
+### Closing out
+
+Phase 5 ends when the findings are handled — the *task* ends when you say what
+the work was for. Those are not the same moment, and collapsing them was a real
+failure in use: the model finished its review, ran `phase.sh off`, and reported
+the task as complete. Nothing was enforced wrongly. It simply answered a question
+it was never asked.
+
+So the workflow now ends with a question, and `off` is gated behind it:
+
+> Review is done and the log is above. Open a pull request?
+
+- **Yes** — the PR is opened, *then* the gate is disarmed.
+- **No** — the gate stays on and Phase 5 continues. Further changes get reviewed
+  exactly like the last ones did.
+
+**The ordering is load-bearing, not etiquette.** `off` returns the review gate to
+its default of firing every turn, and a dirty tree means review is owed — so
+disarming before the work is committed leaves you tripping the gate on your own
+finished diff, every turn, until you commit. Ship first, disarm second.
+
+The prompt on `off` is the backstop; the question above is the actual mechanism.
+A gate can stop the model from ending your task silently. It cannot make the
+model ask you a good question first — that part is in `spec-driven`'s Phase 5,
+under *instructed only*.
 
 The full policy, enforced in `phase-guard.sh` and covered by `test.sh`:
 
 | Transition | Who | Why |
 | --- | --- | --- |
 | `start` (→1) | model | most restrictive state; the workflow arms itself |
+| `red` | model | verifies, advances nothing; running it is how the evidence reaches you |
 | any `n` ≤ current | model | retreat, including the 4→2 contradiction path |
 | 1→2 | model | phase 2 writes only `docs/specs/`; a weak Clarify surfaces at 2→3 |
 | **2→3** | **user, prompt** | spec approval — the model would approve its own spec |
-| **3→4** | **user, terminal** | unlocks production code, asserts RED was observed |
+| **3→4, RED verified** | **user, prompt** | unlocks production code; you judge the failures on screen |
+| **3→4, otherwise** | **user, terminal** | nothing verified means nothing to approve |
 | 4→5 | model | self-submits to review; strictly more scrutiny |
 | **forward skips** (1→3, 2→4, 2→5, 3→5…) | **user, terminal** | route around the two gates above |
 | **any move off 5 except `off`** | **user, terminal** | phases 1–4 suppress the Stop gate, so this escapes a review that is owed |
 | **`off` from 1–3** | **user, terminal** | equivalent to jumping to Phase 4 |
-| `off` from 4–5 | model | expands nothing, and leaves the review gate armed every turn |
+| **`off` from 4–5** | **user, prompt** | ends the task; the close-out decision is not the model's |
 | **`start` while armed** | **user, terminal** | resets to Phase 1 and discards the current task |
+| **`4 --force`** | **user, terminal** | advances past the RED check on assertion alone |
 
 One asymmetry worth knowing: **`deny` holds in every permission mode, but a
 hook's `ask` is not documented to survive `bypassPermissions`.** An explicit
-`ask` *rule* in settings is, so `settings.json` carries one for the same
-transition:
+`ask` *rule* in settings is, so `settings.json` carries one per approval gate:
 
 ```json
-"permissions": { "ask": ["Bash(.claude/hooks/phase.sh 3*)"] }
+"permissions": { "ask": [
+  "Bash(.claude/hooks/phase.sh 3*)",
+  "Bash(.claude/hooks/phase.sh 4*)",
+  "Bash(.claude/hooks/phase.sh off*)"
+] }
 ```
 
 Ask rules also beat allow rules, so this still prompts if you have `Bash`
@@ -287,9 +347,10 @@ the residual hole — stated rather than papered over, since the 3→4 gate has 
 equivalent gap.
 
 Phase state is never writable by the model in any phase: the guard denies every
-Bash command that so much as names `.spec-phase` or `.spec-baseline`, so `rm`,
-`mv` and redirects are all covered. Nothing legitimate breaks, because the model
-reads phase state through `phase.sh status`, never through the file.
+Bash command that so much as names `.spec-phase`, `.spec-baseline` or
+`.spec-red`, so `rm`, `mv` and redirects are all covered. Nothing legitimate
+breaks, because the model reads phase state through `phase.sh status`, writes the
+RED receipt through `phase.sh red`, and never touches either file directly.
 
 With **no** phase file the Stop gate runs every turn — the intended default for
 ordinary work outside the workflow. When a phase file exists, phases 1–4 suppress
@@ -403,14 +464,21 @@ covered by a case in `test.sh`:
   per-call for `Edit`/`Write`/`NotebookEdit` and for the Bash write forms whose
   target can be parsed; caught per-turn by the phase scan for everything else.
 - **The model cannot advance its own phase** past the two approval gates, and
-  cannot touch the phase state file by any means. The transitions it may make
-  either restrict it or increase scrutiny.
+  cannot touch any phase state file by any means — including the RED receipt.
+  The transitions it may make either restrict it or increase scrutiny.
 - **A turn cannot end on an unreviewed diff**, including one that exists only in
   untracked files, and including a *fix* to an untracked file.
-- **Phase 3 cannot be left on passing tests.** `phase.sh 4` runs the tests the
-  phase changed and refuses to advance if they pass. Not a full verification of
-  "failing for the right reason" — but the vacuous-test case is mechanical now,
-  not attested.
+- **Phase 3 cannot be left on passing tests.** `phase.sh red` runs the tests the
+  phase changed and refuses if they pass; `phase.sh 4` is denied until that
+  check has passed. Not a full verification of "failing for the right reason" —
+  but the vacuous-test case is mechanical now, not attested.
+- **A verified test cannot be edited on the way to Phase 4.** The RED receipt
+  pins the content of every test file it saw fail, so verifying red and then
+  quietly changing a test puts 3→4 back behind a denial.
+- **The workflow cannot end silently.** `phase.sh off` prompts from phases 4–5
+  and is denied outright from 1–3, so the model cannot close out a task on its
+  own judgment. Whether it *asks well* before that prompt is instructed, not
+  enforced.
 - **Both hooks fail closed on bad state.** A corrupt phase file denies writes
   with a recovery instruction, rather than silently disabling the gate. Same for
   a missing JSON parser, or a missing `phase-policy.sh`. (`review-gate.sh` fails
@@ -429,10 +497,12 @@ Two limits worth stating plainly, since both look like enforcement and are not:
   advances to 5, the diff is never gated. The user *is* the checkpoint by design.
 
 **Instructed only** — everything in the SKILL.md bodies and the gate's block
-message: showing real failure output, not priming the reviewer, not padding the
-evidence log, stopping on contradiction, honoring severity levels, leaving tests
-frozen in Phase 4. These work most of the time and fail *silently* when they
-don't.
+message: showing real failure output, saying why each failure is the *expected*
+one, not priming the reviewer, not padding the evidence log, stopping on
+contradiction, honoring severity levels, leaving tests frozen in Phase 4, running
+the repo's own validations before leaving Phase 4, and asking about the pull
+request before closing out. These work most of the time and fail *silently* when
+they don't.
 
 The gate stops structural failures. It cannot stop a lazy Phase 1 or a
 self-congratulatory Phase 5 log.
@@ -445,8 +515,9 @@ self-congratulatory Phase 5 log.
 
 Builds a throwaway git repo in a temp dir, installs the hooks into it, and drives
 them with synthetic hook payloads. Nothing touches the repo you run it from.
-67 cases: the phase policy, every write vector, the advance-transition matrix,
-fail-closed behavior, the review gate, and the phase scan with its baseline.
+139 cases: the phase policy, every write vector, the advance-transition matrix,
+RED verification and the receipt's staleness rules, fail-closed behavior, the
+review gate, and the phase scan with its baseline.
 
 Cases tagged `[#n]` pin a bug from the review below. Those are the ones that must
 never quietly come back.
@@ -460,7 +531,9 @@ Recorded because the *reasons* generalise to anyone writing hooks:
    phase file, but nothing stopped `phase.sh 4` as an ordinary Bash call. The
    root problem is that a `PreToolUse` hook cannot distinguish a call the model
    chose to make from one a slash command told it to make — so the fix was not a
-   better regex but moving the two approval gates outside the tool layer.
+   better regex but taking the two approval gates out of the model's hands.
+   (Both are prompts again now that `phase.sh red` gives 3→4 something to show
+   you; what stays denied is anything that would route *around* a gate.)
 2. **Fixes to untracked files were never re-reviewed.** `git status --porcelain`
    lists untracked *names*, never *contents*, so rewriting a new file left the
    fingerprint unchanged. Untracked files are usually the actual work, so this
@@ -503,6 +576,15 @@ confidence it hasn't earned.
   approach, no defense of choices. A reviewer handed the author's reasoning
   mostly ratifies it. This single constraint is most of the difference between a
   gate and a rubber stamp.
+- **…but the spawn prompt opens with the stance, not the task.** "Task intent
+  only" was read literally at first, and produced spawn prompts like *"Message
+  banners should appear below the header, not above it."* Accurate, unprimed, and
+  it reads as *check that this works* — so it came back a confirmation. The brief
+  in `adversary.md` says all the right things, but the spawn message is the most
+  proximate instruction and it was setting a neutral frame. Both places that
+  delegate now carry a fixed adversarial preamble, with the one-line intent
+  dropped into it. Unprimed is about *withholding the author's reasoning*, not
+  about withholding the reviewer's job.
 - **"No findings" must be a normal outcome.** Both `adversary.md` and the Phase 5
   log say so explicitly. A reviewer that always finds three things trains you to
   skim; a log formatted to presume improvements gets improvements manufactured
@@ -510,8 +592,12 @@ confidence it hasn't earned.
 - **Complexity claims require Phase 1's scale figure.** Otherwise "optimize for
   time/space complexity" is an invitation to premature optimization.
 - **Phase 3 requires observing RED.** Writing tests then code lets the tests be
-  shaped by the implementation. Pasting real failure output is the cheapest proof
-  the test tests something.
+  shaped by the implementation. Real failure output is the cheapest proof the
+  test tests something.
+- **The model runs the RED check; the user judges its output.** The first version
+  had the user run it in a terminal, which put the failure output where the model
+  could not see it — Phase 3's whole artifact, produced and then discarded. Split
+  in two, each party does the half it is actually able to do.
 - **Phase state on disk, not in context** — compaction eats context, and the
   model would slide from Phase 1 to Phase 4 without noticing.
 - **The guard lives in `settings.json`, not skill frontmatter.** Frontmatter
@@ -534,11 +620,16 @@ confidence it hasn't earned.
   This is the mirror of the RED tripwire above: that one refuses to *leave*
   Phase 3 while tests pass, this one refuses to end a turn while they fail.
   ```bash
-  if ! <your test command> >/dev/null 2>&1; then
-    echo "REVIEW GATE: test suite failing. Fix before ending the turn." >&2
+  if ! <your validation command> >/dev/null 2>&1; then
+    echo "REVIEW GATE: repo validations failing. Fix before ending the turn." >&2
     exit 2
   fi
   ```
+  Phase 4 already *instructs* the model to work out what this repo validates a
+  change with — pre-commit hook, CI, contributor docs — and to run that before
+  advancing. This is the enforced version of that instruction, worth adding if
+  you catch it advancing on a red lint. Point it at whatever the repo already
+  defines, not at a list you maintain here; a second list is a list that drifts.
 - **Scope the gate by path** if gating every diff is too aggressive:
   `git diff HEAD --name-only | grep -qE '^(src/auth|src/billing)/' || exit 0`
 - **`permissions.deny` rules** are the only truly unbypassable layer — they beat
@@ -555,10 +646,12 @@ confidence it hasn't earned.
   thin Clarify surfaces the moment you read the spec at the 2→3 gate. To gate it
   too, add a branch calling `ask` for `PHASE=1, ARG=2` in the advance policy.
 - **Where each gate sits on the ask/deny dial** is one line each in
-  `phase-guard.sh`. To make 3→4 in-band as well, change its branch from
-  `advance_deny` to `ask` and add `Bash(.claude/hooks/phase.sh 4*)` to
-  `permissions.ask` — accepting that a reflex click then satisfies the RED
-  assertion. To make 2→3 terminal-only, do the reverse and drop its ask rule.
+  `phase-guard.sh`. To put 3→4 back on a terminal — worth it if you find yourself
+  clicking through the prompt without reading the failures — replace the
+  `red_receipt_status` case in its branch with a bare `advance_deny 4` and drop
+  `Bash(.claude/hooks/phase.sh 4*)` from `permissions.ask`. `phase.sh red` keeps
+  working and still puts the output in the transcript; only the approval moves.
+  Same shape in reverse for making 2→3 terminal-only.
 - **`spec-driven` may self-activate.** Five phases on a two-line fix is overhead,
   and that friction teaches you to bypass the gate — worse than not having it.
   Add `disable-model-invocation: true` if it fires on trivia.
@@ -572,17 +665,21 @@ confidence it hasn't earned.
   to remember the policy table.
 - **2→3 arrives as a permission prompt.** Approving it is your assertion that you
   read the spec, so read it before clicking.
-- **3→4 must be run from a terminal**, not through Claude:
-  `.claude/hooks/phase.sh 4`. Attempting it through Claude costs a turn on a
-  denial that explains itself.
-- **Every phase change re-snapshots the baseline.** If you deliberately want the
-  scan to stop flagging a file you have decided to keep, re-entering the phase
-  (`phase.sh 3` again) accepts the current tree as the new baseline.
+- **3→4 arrives as a permission prompt too, but only after `phase.sh red`.** What
+  you are approving is the *reason* the tests failed, which means reading the
+  output above the prompt. If the prompt appears without that output in the
+  transcript, decline — something ran the check out of your sight.
+- **Every phase change re-snapshots the baseline and voids the RED receipt.** If
+  you deliberately want the scan to stop flagging a file you have decided to
+  keep, re-entering the phase (`phase.sh 3` again) accepts the current tree as
+  the new baseline — and costs you a re-run of `phase.sh red`.
 - **`phase.sh off` ends the workflow, it does not stop review** — and it makes
   review fire *more* often, not less. With no phase file the Stop gate returns to
   its default of every turn, where the workflow had been suppressing it through
   phases 1–4. This surprises everyone once; `off` and `status` now both print what
-  is still owed review so it surprises you visibly rather than silently.
+  is still owed review so it surprises you visibly rather than silently. It is
+  also why the close-out prompt tells you to decline while the tree is dirty —
+  ship first, disarm second.
 - **The way to quiet the review gate is a clean tree**, not a switch. Commit the
   work, or add the path to `spec-gate-review-exclude` if it is something the gate
   should never have been judging.
@@ -598,6 +695,12 @@ confidence it hasn't earned.
   the brief wants it to prove findings by running things rather than asserting
   them. "Do not modify any file" is an instruction, not a constraint. Drop `Bash`
   from its `tools:` list if you would rather have the guarantee than the evidence.
+- **RED verification proves "not green", and nothing beyond it.** A test that
+  fails on a typo, a bad import, or `assert False` satisfies the check exactly as
+  well as one that fails on the behaviour it is specifying. The receipt stops the
+  tests moving between the check and your approval; it has nothing to say about
+  whether they were the right tests. That judgment is what the prompt is asking
+  you for, and reading the output is the only way to make it.
 - **Bash write detection remains best-effort by design.** A heredoc into a Python
   script, or any program that writes files as a side effect, is invisible to the
   guard. That is what the per-turn scan is for — but the scan reports after the

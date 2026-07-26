@@ -13,18 +13,15 @@ inactive, run `.claude/hooks/phase.sh start <short-task-name>` to arm the gate a
 Phase 1. Arming is yours to do — Phase 1 is the most restrictive state, so there
 is no risk in it.
 
-**The two approval gates are the user's**, and they work differently:
+**The two approval gates are the user's.** You run both commands; each raises a
+confirmation prompt, and the user accepting it *is* the approval. Say what you
+are asking them to approve **before** you make the call, so the prompt is never
+the first they hear of it. If they decline, stop — do not look for another route.
 
-- `2 → 3` — **run it.** `.claude/hooks/phase.sh 3` raises a confirmation prompt,
-  and the user approving it *is* the spec approval. Say what you are asking them
-  to approve before you make the call. If they decline, stop.
-- `3 → 4` — **do not run it.** The guard refuses this one however it is spelled,
-  because approving it asserts the user saw the tests fail, and that assertion is
-  too important to satisfy with a click. Tell them to run it themselves:
-
-  ```
-  .claude/hooks/phase.sh 4
-  ```
+- `2 → 3` — `.claude/hooks/phase.sh 3`. They are approving the spec.
+- `3 → 4` — `.claude/hooks/phase.sh red` first, then `.claude/hooks/phase.sh 4`.
+  The guard refuses the second until the first has passed, so this is two calls,
+  not one, and the failure output belongs between them.
 
 When a phase's exit criteria are met, **state that, say what you need from the
 user, and stop.** Do not carry on into the next phase's work.
@@ -33,6 +30,9 @@ Two transitions are yours outright, and you should take them: `1 → 2` once the
 blocking unknowns are answered, and `4 → 5` once the plan is complete and the
 suite is green. Retreating to a lower phase is also always yours — use it when
 the spec turns out to be wrong.
+
+**`off` is never yours.** It ends the task, and how a task ends is the user's to
+decide. See [Closing out](#closing-out).
 
 Phase state lives in `.claude/.spec-phase`, not in your context. Re-read it with
 `phase.sh status` whenever you are unsure where you are — after compaction,
@@ -107,16 +107,36 @@ the files it touches. Append it to the spec document.
 Then the tests. Cover, at minimum: empty and null inputs, boundary values,
 the failure modes named in the spec, and the concurrency case if there is one.
 
-Then — this is the phase's actual point — **run them and paste the failure
-output.** Not a summary of the failure. The output.
+Then — this is the phase's actual point — **run them and show the failure
+output.** Not a summary of the failure. The output. Use:
+
+```
+.claude/hooks/phase.sh red
+```
+
+It runs exactly the test files this phase changed, refuses if any of them pass,
+and records that RED was verified. Running it through your own test command
+instead proves the same thing to you and nothing to the gate.
 
 If a test passes before the implementation exists, it is testing nothing. Fix
 the test before continuing. Do not proceed until every new test fails for the
 reason you expect.
 
+"Verified RED" is a weaker claim than the one this phase makes. The check proves
+the tests are *not green*; it cannot tell an assertion failure from an import
+error or a typo in a fixture. **Read the output and say, per test, what it
+asserts and why this failure is the expected one.** A test that fails with
+`ReferenceError` when you expected a wrong return value is not red for the right
+reason — it is broken, and you fix it here rather than discovering it in Phase 4.
+
 **Exit:** plan approved, every new test failing for the right reason, output
-shown — then the user runs `.claude/hooks/phase.sh 4` in their own terminal. That
-command is their assertion that they saw RED, which is why it is not yours.
+shown and accounted for — then run `.claude/hooks/phase.sh 4`. The prompt it
+raises is the user's assertion that they read the failures and accept them.
+Do not make that call in the same breath as `red`: show the output, say what it
+means, and let them see it before the prompt appears.
+
+Once RED is recorded, **do not touch the test files again before advancing.** Any
+edit to them voids the verification and the guard will send you back to `red`.
 
 ## Phase 4 — Execute
 
@@ -130,20 +150,64 @@ Small functions, names that don't need comments. Comments explain *why*, never
 
 Run the suite after each step. Report failures with output, not paraphrase.
 
-**Exit:** plan complete, suite green, output shown — then run
+### Validate the repo, not just your tests
+
+The plan being finished is not the same as the repo being healthy. Before
+advancing, run the validations this repo expects of a change — linting, type
+checking, the full suite rather than the files you touched, and whatever else it
+gates on.
+
+**Work out what those are. Do not assume, and do not invent a list.** Every repo
+has already decided what "valid" means and encoded it somewhere: in what its
+pre-commit hook runs, what CI runs, what its contributor docs tell a human to run
+before pushing, or in an aggregate script that exists for exactly this purpose.
+Go find that, and run what it says. Your own approximation of a repo's checks is
+how a diff passes review and fails CI ten minutes later.
+
+Say which commands you settled on and where you got them. That one sentence is
+what makes a wrong guess visible instead of silent — and if the repo genuinely
+defines nothing, say that too, then assemble the minimum for the language and
+flag that you chose it.
+
+Show the output. **Every failure is yours to account for, including ones in files
+you did not touch** — a type error elsewhere that your change surfaced is your
+change's problem. If a failure genuinely predates your work, prove it rather than
+asserting it: stash the change, run the check, restore, and show both results.
+
+**Exit:** plan complete, repo validations green, output shown — then run
 `.claude/hooks/phase.sh 5` **yourself**. This transition is yours: advancing
 submits your work for adversarial review, so taking it costs you nothing and
 gains you scrutiny. Do not ask the user to run it, and do not ask them to approve
-it. Only 2 → 3 raises a prompt, and only 3 → 4 needs their terminal.
+it — only 2 → 3 and 3 → 4 raise prompts.
 
 ## Phase 5 — Adversarial review
 
 **You do not review your own work here.** Delegate to the `adversary` subagent.
 
-Give it the task intent in one or two sentences and nothing else. No summary of
-your approach, no defense of your choices, no list of what to look at. It forms
-its own judgment from the diff. Priming it is the difference between a review
-and a rubber stamp.
+**Open with the stance, not with the task.** A bare intent sentence — *"Message
+banners should appear below the header, not above it"* — reads as *check that
+this works*, and you get a confirmation instead of a review. Say what the
+reviewer is for before you say what the change was for:
+
+> You are adversarially reviewing an unreviewed diff in the working tree. Assume
+> it is wrong and find where. Your job is to break this change, not to approve it.
+>
+> The intent of the change, which is the only thing I am telling you:
+> **&lt;one or two sentences&gt;**
+>
+> I am deliberately not describing my approach, my reasoning, or where I think
+> you should look. Judge the diff and the surrounding code on their own terms.
+> If it holds up, say `sound` and stop — that is a normal outcome, not a failure
+> to find something.
+
+Everything after the intent line stays fixed. **The intent line is the only part
+you write**, and it stays at one or two sentences: no summary of your approach,
+no defense of your choices, no list of what to look at. Priming it is the
+difference between a review and a rubber stamp.
+
+That closing sentence is not softening the brief — it is load-bearing. Push a
+reviewer to be adversarial without it and you get manufactured findings, which
+cost you the same reading time and train you to skim the real ones.
 
 Then handle findings:
 
@@ -159,3 +223,25 @@ Close with an evidence log: what the reviewer found, what you changed, what you
 declined and why. **"Reviewer found nothing, no changes made" is a complete and
 unremarkable entry.** Do not pad it. A log that always shows improvements is
 a log that trains the reader to skim.
+
+### Closing out
+
+The findings being handled does not end the task. **Ask what happens to the
+work:**
+
+> Review is done and the log is above. Open a pull request?
+
+- **Yes** — open it. Then, and only then, run `.claude/hooks/phase.sh off`.
+  The order is load-bearing: `off` returns the review gate to firing every turn
+  on any dirty tree, so disarming before the work is committed leaves you
+  tripping the gate on your own finished diff.
+- **No** — **stay in Phase 5.** Do not disarm, do not commit, do not decide on
+  their behalf what the work was for. Say what is outstanding and wait. Further
+  changes get reviewed exactly like the last ones did, which is the point of
+  still being here.
+
+**Never run `phase.sh off` on your own initiative**, in any phase. Ending the
+workflow is the one decision that disposes of the whole task, and it is not
+yours. The guard raises a confirmation prompt as a backstop — treat that as the
+safety net it is, not as the asking. A prompt the user did not see coming is a
+worse conversation than the question above.

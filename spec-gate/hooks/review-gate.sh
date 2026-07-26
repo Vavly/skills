@@ -171,10 +171,26 @@ adversarial review.
 
 Before ending this turn:
 
-1. Delegate to the `adversary` subagent. Give it the task intent in one or two
-   sentences and nothing else — no summary of your approach, no defense of your
-   choices, no list of what you think it should look at. It forms its own
-   judgment from the diff. Priming it defeats the purpose of the gate.
+1. Delegate to the `adversary` subagent. Open with the stance, not the task — a
+   bare intent sentence reads as "check that this works" and gets you a
+   confirmation instead of a review. Use this shape, writing only the intent line:
+
+   ---
+   You are adversarially reviewing an unreviewed diff in the working tree.
+   Assume it is wrong and find where. Your job is to break this change, not to
+   approve it.
+
+   The intent of the change, which is the only thing I am telling you:
+   <one or two sentences>
+
+   I am deliberately not describing my approach, my reasoning, or where I think
+   you should look. Judge the diff and the surrounding code on their own terms.
+   If it holds up, say `sound` and stop — that is a normal outcome, not a
+   failure to find something.
+   ---
+
+   No summary of your approach, no defense of your choices, no list of what you
+   think it should look at. Priming it defeats the purpose of the gate.
 
 2. Act on the result:
    - `blocker` or `serious` findings: fix them, then stop. The gate will

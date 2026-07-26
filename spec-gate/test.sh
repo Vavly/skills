@@ -37,7 +37,7 @@ setup_repo() {
   echo 'orig' > src/x.ts
   echo 'orig' > src/x.test.ts
   echo 'orig' > tests/helper.ts
-  printf '.claude/.spec-phase\n.claude/.spec-baseline\n.claude/review-log.jsonl\n' > .gitignore
+  printf '.claude/.spec-phase\n.claude/.spec-baseline\n.claude/.spec-red\n.claude/review-log.jsonl\n' > .gitignore
   git add -A >/dev/null 2>&1; git commit -qm init
   export CLAUDE_PROJECT_DIR="$PWD"
   rm -f .git/claude-review-gate
@@ -134,6 +134,8 @@ expect_b "redirect into phase file denied"     DENY  'echo phase=5 > .claude/.sp
 expect_b "rm of phase file denied"             DENY  'rm .claude/.spec-phase'
 expect_b "mv of phase file denied"             DENY  'mv /tmp/x .claude/.spec-phase'
 expect_b "baseline file denied"                DENY  'rm .claude/.spec-baseline'
+expect_b "forging the RED receipt denied"      DENY  'printf x > .claude/.spec-red'
+expect_w "Write to the RED receipt denied"     DENY  .claude/.spec-red
 expect_w "Write to phase file denied"          DENY  .claude/.spec-phase
 phase 5
 expect_b "phase 5 cannot rewrite state [#8]"   DENY  'echo phase=4 > .claude/.spec-phase'
@@ -152,20 +154,29 @@ adv "1 -> 2 model may"                    1 2   ALLOW
 adv "1 -> 3 skip denied"                  1 3   DENY
 adv "1 -> 4 skip denied"                  1 4   DENY
 adv "2 -> 3 prompts for spec approval"    2 3   ASK
-adv "3 -> 4 unlocking code is the user's" 3 4   DENY
+adv "3 -> 4 denied while RED unverified"  3 4   DENY
 adv "3 -> 2 retreat allowed"              3 2   ALLOW
 adv "4 -> 2 contradiction retreat"        4 2   ALLOW
 adv "4 -> 5 self-submit to review"        4 5   ALLOW
 adv "5 -> 4 escaping review denied"       5 4   DENY
 adv "5 -> 2 escaping review denied"       5 2   DENY
+adv "1 -> off denied"                     1 off DENY
 adv "3 -> off denied"                     3 off DENY
-adv "5 -> off allowed"                    5 off ALLOW
-adv "4 -> off allowed"                    4 off ALLOW
+# `off` from 4-5 expands no write access, which is why it used to be allowed
+# outright. It still ends the task, and that decision is the user's.
+adv "5 -> off prompts, never silent"      5 off ASK
+adv "4 -> off prompts, never silent"      4 off ASK
 adv "status always allowed"               3 status ALLOW
+adv "red is the model's to run"           3 red    ALLOW
 adv "re-arming denied while armed"        3 start  DENY
 phase 3
 expect_b "alternate spelling denied [#1]" DENY 'bash .claude/hooks/phase.sh 4'
 expect_b "absolute spelling denied [#1]"  DENY "bash $PWD/.claude/hooks/phase.sh 4"
+# --force is the user's override for a refused RED check. If the model could
+# reach it, the check would be advisory.
+expect_b "--force is never the model's"   DENY '.claude/hooks/phase.sh 4 --force'
+phase 5
+expect_b "--force denied from phase 5 too" DENY '.claude/hooks/phase.sh 4 --force'
 
 phase 2
 reason=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh 3')")
@@ -181,15 +192,32 @@ else
 fi
 
 # The hook's `ask` is not documented to survive bypassPermissions, so
-# settings.json must carry an explicit ask rule for the same transition.
-if python3 -c '
+# settings.json must carry an explicit ask rule for both approval gates.
+for t in 3 4 off; do
+  if python3 -c '
 import json,sys
 d=json.load(open(".claude/settings.json"))
 rules=d.get("permissions",{}).get("ask",[])
-sys.exit(0 if any("phase.sh 3" in r for r in rules) else 1)' 2>/dev/null; then
-  ok "settings.json carries an ask rule covering bypassPermissions"
+sys.exit(0 if any("phase.sh "+sys.argv[1] in r for r in rules) else 1)' "$t" 2>/dev/null; then
+    ok "settings.json ask rule for phase.sh $t covers bypassPermissions"
+  else
+    bad "settings.json has no permissions.ask rule for phase.sh $t"
+  fi
+done
+
+# The close-out prompt is the last thing standing between "review done" and a
+# disarmed gate, so it has to say what accepting disposes of.
+phase 5
+reason=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh off')")
+if printf '%s' "$reason" | grep -qi 'pull request'; then
+  ok "the off prompt names the decision it is standing in for"
 else
-  bad "settings.json has no permissions.ask rule for phase.sh 3"
+  bad "off ask reason does not mention shipping the work: '$reason'"
+fi
+if printf '%s' "$reason" | grep -q '"'; then
+  bad "off ask reason contains a raw double quote — would break hand-built JSON"
+else
+  ok "off ask reason is JSON-safe"
 fi
 
 group "Corrupt state fails closed [#7]"
@@ -204,6 +232,25 @@ fi
 printf 'task=only\n' > .claude/.spec-phase
 expect_w "missing phase= denies writes"   DENY src/x.ts
 
+# phase.sh degrades rather than erroring when the policy file is gone, and the
+# degraded answer has to be a refusal — an advance nobody could check is the
+# fail-open this project keeps finding.
+setup_repo; phase start v; phase 3
+printf 'exit 1\n' > .claude/spec-gate-test-cmd
+printf 'a new test\n' > src/feature.test.ts
+mv .claude/hooks/phase-policy.sh "$WORK/policy.bak"
+out=$(.claude/hooks/phase.sh red 2>&1); rc=$?
+if [ "$rc" != 0 ] && ! printf '%s' "$out" | grep -qi 'command not found'; then
+  ok "phase.sh red refuses when phase-policy.sh is missing"
+else
+  bad "phase.sh red without a policy file — rc=$rc out=$(printf '%s' "$out" | tr '\n' ' ')"
+fi
+.claude/hooks/phase.sh 4 >/dev/null 2>&1
+[ "$(sed -n 's/^phase=//p' .claude/.spec-phase)" = 3 ] \
+  && ok "phase.sh 4 does not advance without a policy file" \
+  || bad "phase.sh 4 advanced with no policy file to check against"
+mv "$WORK/policy.bak" .claude/hooks/phase-policy.sh
+
 group "Review gate"
 setup_repo
 phase off
@@ -212,6 +259,24 @@ echo 'change' >> src/x.ts
 expect_gate "dirty tracked tree blocks" 2
 expect_gate "same diff is not re-reviewed" 0
 expect_gate "loop guard honours stop_hook_active" 0 true
+
+group "The block message sets the reviewer's stance"
+# A spawn prompt that is only task intent reads as "check that this works" and
+# comes back a confirmation. The framing has to survive edits to this message,
+# and so does the counterweight that stops it manufacturing findings.
+setup_repo
+phase off
+echo 'change' >> src/x.ts
+# Flattened: the phrases wrap across lines in the heredoc, so a line-oriented
+# grep would pin the line breaks rather than the wording.
+BLOCK=$(printf '{"stop_hook_active":false}' | .claude/hooks/review-gate.sh 2>&1 >/dev/null | tr '\n' ' ' | tr -s ' ')
+for want in 'adversarially reviewing' 'not to approve it' 'only thing I am telling you' 'normal outcome'; do
+  if printf '%s' "$BLOCK" | grep -qF "$want"; then
+    ok "block message carries: '$want'"
+  else
+    bad "block message is missing: '$want'"
+  fi
+done
 
 group "Untracked fixes are re-reviewed [#2]"
 setup_repo
@@ -281,8 +346,96 @@ expect_gate "a custom exclude path is honoured" 0
 echo 'hand written' >> src/x.ts
 expect_gate "non-excluded code still arms it" 2
 
-group "RED tripwire on 3 -> 4"
+group "RED verification — phase.sh red"
 cur_phase() { sed -n 's/^phase=//p' .claude/.spec-phase 2>/dev/null | head -1; }
+red() { # <label> <expect-rc> <expect-substring>
+  local out rc; out=$(.claude/hooks/phase.sh red 2>&1); rc=$?
+  if [ "$rc" = "$2" ] && printf '%s' "$out" | grep -qi "$3"; then
+    ok "$1"
+  else
+    bad "$1 — rc=$rc (want $2); output: $(printf '%s' "$out" | head -3 | tr '\n' ' ')"
+  fi
+}
+receipt() { [ -f .claude/.spec-red ] && echo yes || echo no; }
+
+setup_repo; phase start v; phase 3
+printf 'exit 1\n' > .claude/spec-gate-test-cmd      # tests fail = RED
+printf 'a new test\n' > src/feature.test.ts
+red "tests fail: RED verified" 0 "RED verified"
+[ "$(receipt)" = yes ] && ok "a receipt is written on RED" || bad "no receipt after a verified RED"
+[ "$(cur_phase)" = 3 ] && ok "red does not advance the phase" || bad "red advanced to $(cur_phase)"
+
+setup_repo; phase start v; phase 3
+printf 'exit 0\n' > .claude/spec-gate-test-cmd      # tests pass = vacuous
+printf 'a new test\n' > src/feature.test.ts
+red "tests pass: REFUSED" 1 "REFUSED"
+[ "$(receipt)" = no ] && ok "no receipt when the tests passed" || bad "receipt written for passing tests"
+
+setup_repo; phase start v; phase 3
+printf 'exit 1\n' > .claude/spec-gate-test-cmd
+printf 'prod only\n' > src/untested.ts              # no test file touched
+red "no tests written: REFUSED" 1 "no test files changed"
+
+setup_repo; phase start v; phase 3
+printf 'echo "GOT:[$SPEC_GATE_TEST_FILES]"; exit 1\n' > .claude/spec-gate-test-cmd
+printf 'a new test\n' > src/feature.test.ts
+out=$(.claude/hooks/phase.sh red 2>&1)
+if printf '%s' "$out" | grep -q 'GOT:\[.*src/feature.test.ts.*\]'; then
+  ok "the changed test files are passed to the command"
+else
+  bad "SPEC_GATE_TEST_FILES not populated: $(printf '%s' "$out" | grep GOT: | head -1)"
+fi
+
+setup_repo; phase start v; phase 4
+printf 'exit 1\n' > .claude/spec-gate-test-cmd
+red "red outside Phase 3 is refused" 1 "Phase 3"
+
+group "The receipt gates the 3 -> 4 prompt"
+# The whole point of the receipt: the model verifies, the user approves, and
+# between those two acts the tests must not move.
+setup_repo; phase start v; phase 3
+printf 'exit 1\n' > .claude/spec-gate-test-cmd
+printf 'a new test\n' > src/feature.test.ts
+expect_b "3 -> 4 denied before red runs"    DENY '.claude/hooks/phase.sh 4'
+.claude/hooks/phase.sh red >/dev/null 2>&1
+expect_b "3 -> 4 prompts once RED is on file" ASK '.claude/hooks/phase.sh 4'
+
+reason=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh 4')")
+if printf '%s' "$reason" | grep -qi 'reason the spec expects\|failed for the reason'; then
+  ok "the 3 -> 4 prompt says what the check does NOT prove"
+else
+  bad "3 -> 4 ask reason does not qualify the claim: '$reason'"
+fi
+if printf '%s' "$reason" | grep -q '"'; then
+  bad "3 -> 4 ask reason contains a raw double quote — would break hand-built JSON"
+else
+  ok "3 -> 4 ask reason is JSON-safe"
+fi
+
+# Verify RED, then edit the test green. The receipt must not still vouch for it.
+printf 'a new test, quietly rewritten\n' > src/feature.test.ts
+expect_b "editing a test after RED voids the prompt" DENY '.claude/hooks/phase.sh 4'
+out=$(.claude/hooks/phase.sh status 2>&1)
+printf '%s' "$out" | grep -qi 'STALE' && ok "status reports the stale receipt" \
+  || bad "status did not report a stale receipt: $(printf '%s' "$out" | tr '\n' ' ')"
+
+# A second test file appearing after verification is equally unvouched-for.
+setup_repo; phase start v; phase 3
+printf 'exit 1\n' > .claude/spec-gate-test-cmd
+printf 'a new test\n' > src/feature.test.ts
+.claude/hooks/phase.sh red >/dev/null 2>&1
+printf 'another test\n' > src/second.test.ts
+expect_b "an unverified extra test voids the prompt" DENY '.claude/hooks/phase.sh 4'
+
+# Retreating into Phase 3 to fix the tests must not ride the old receipt.
+setup_repo; phase start v; phase 3
+printf 'exit 1\n' > .claude/spec-gate-test-cmd
+printf 'a new test\n' > src/feature.test.ts
+.claude/hooks/phase.sh red >/dev/null 2>&1
+phase 2; phase 3
+expect_b "a phase change discards the receipt" DENY '.claude/hooks/phase.sh 4'
+
+group "phase.sh 4 in a terminal"
 tw() { # <label> <expect-phase> <expect-substring> [--force]
   local out; out=$(.claude/hooks/phase.sh 4 ${4:-} 2>&1)
   if [ "$(cur_phase)" = "$2" ] && printf '%s' "$out" | grep -qi "$3"; then
@@ -294,33 +447,24 @@ tw() { # <label> <expect-phase> <expect-substring> [--force]
 
 setup_repo; phase start v; phase 3
 printf 'a new test\n' > src/feature.test.ts
-tw "unconfigured: advances, but says so" 4 "no RED tripwire configured"
+tw "unconfigured: advances, but says so" 4 "no test command configured"
 
 setup_repo; phase start v; phase 3
-printf 'exit 1\n' > .claude/spec-gate-test-cmd      # tests fail = RED
+printf 'exit 1\n' > .claude/spec-gate-test-cmd
 printf 'a new test\n' > src/feature.test.ts
-tw "tests fail: RED verified, advance allowed" 4 "RED verified"
+tw "no receipt: runs the check itself" 4 "RED verified"
+
+setup_repo; phase start v; phase 3
+printf 'exit 1\n' > .claude/spec-gate-test-cmd
+printf 'a new test\n' > src/feature.test.ts
+.claude/hooks/phase.sh red >/dev/null 2>&1
+tw "a valid receipt is honoured without re-running" 4 "receipt verified"
 
 setup_repo; phase start v; phase 3
 printf 'exit 0\n' > .claude/spec-gate-test-cmd      # tests pass = vacuous
 printf 'a new test\n' > src/feature.test.ts
 tw "tests pass: REFUSED, still Phase 3" 3 "REFUSED"
 tw "--force overrides the refusal" 4 "skipping the RED tripwire" --force
-
-setup_repo; phase start v; phase 3
-printf 'exit 1\n' > .claude/spec-gate-test-cmd
-printf 'prod only\n' > src/untested.ts              # no test file touched
-tw "no tests written: REFUSED" 3 "no test files changed"
-
-setup_repo; phase start v; phase 3
-printf 'echo "GOT:[$SPEC_GATE_TEST_FILES]"; exit 1\n' > .claude/spec-gate-test-cmd
-printf 'a new test\n' > src/feature.test.ts
-out=$(.claude/hooks/phase.sh 4 2>&1)
-if printf '%s' "$out" | grep -q 'GOT:\[.*src/feature.test.ts.*\]'; then
-  ok "the changed test files are passed to the command"
-else
-  bad "SPEC_GATE_TEST_FILES not populated: $(printf '%s' "$out" | grep GOT: | head -1)"
-fi
 
 setup_repo; phase start v; phase 5
 printf 'exit 0\n' > .claude/spec-gate-test-cmd      # would refuse if it ran
@@ -362,11 +506,20 @@ expect_c "list_dir allowed"                  allow "$(cur_tool '{"path":"src"}' 
 expect_c "unknown tool shape allowed"        allow "$(cur_tool '{"pattern":"foo"}')"
 expect_c "phase 3: shell write denied"       deny  "$(cur_shell 'echo hi > src/y.ts')"
 expect_c "phase 3: read-only shell allowed"  allow "$(cur_shell 'cat src/x.ts')"
-expect_c "self-advance denied"               deny  "$(cur_shell '.claude/hooks/phase.sh 4')"
+expect_c "3 -> 4 denied without a receipt"   deny  "$(cur_shell '.claude/hooks/phase.sh 4')"
 expect_c "shell seen via preToolUse defers"  allow "$(cur_tool '{"command":".claude/hooks/phase.sh 4"}')"
 
 phase 2
 expect_c "2 -> 3 asks, on the event that can" ask  "$(cur_shell '.claude/hooks/phase.sh 3')"
+
+phase 3
+printf 'exit 1\n' > .claude/spec-gate-test-cmd
+printf 'a new test\n' > src/feature.test.ts
+.claude/hooks/phase.sh red >/dev/null 2>&1
+expect_c "3 -> 4 asks once RED is on file"   ask   "$(cur_shell '.claude/hooks/phase.sh 4')"
+
+phase 5
+expect_c "closing out asks in Cursor too"    ask   "$(cur_shell '.claude/hooks/phase.sh off')"
 
 cstop() {
   python3 -c 'import json,sys; print(json.dumps({"hook_event_name":"stop","status":sys.argv[1],"loop_count":int(sys.argv[2]),"cwd":sys.argv[3],"workspace_roots":[sys.argv[3]]}))' "${1:-completed}" "${2:-0}" "$PWD" \

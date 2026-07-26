@@ -29,10 +29,13 @@ is_spec_path() {
   return 1
 }
 
-# Phase state is never the model's to touch, in any phase.
+# Phase state is never the model's to touch, in any phase. .spec-red is in here
+# for the same reason as the other two: the model runs the RED check through
+# phase.sh, which writes the receipt only when the tests actually failed. A model
+# that could write the receipt directly could assert RED without running anything.
 is_phase_state() {
   case "$1" in
-    *.spec-phase|*.spec-baseline) return 0 ;;
+    *.spec-phase|*.spec-baseline|*.spec-red) return 0 ;;
   esac
   return 1
 }
@@ -122,6 +125,51 @@ tree_snapshot() {
   # One hash-object process for the whole list, not one per file.
   paste -d' ' <(printf '%s' "$existing" | git hash-object --stdin-paths 2>/dev/null) \
               <(printf '%s' "$existing") 2>/dev/null
+}
+
+# --- The RED receipt ---------------------------------------------------------
+# Phase 3 -> 4 rests on a claim no hook can check: "the new tests fail for the
+# reason I expect." The mechanical half of that — they are not green — is
+# checkable, and `phase.sh red` checks it. What it leaves behind is this receipt.
+#
+# The receipt exists because the check and the advance are separate acts by
+# separate parties: the model verifies, the user approves. Between the two, the
+# tests could change. So the receipt pins the exact *content* of every test file
+# it verified; if any of them moves afterwards the receipt goes stale and the
+# approval prompt is not offered. Verifying RED and then quietly editing a test
+# green is the one attack this design has to answer.
+#
+# Sourced by phase.sh (writes it) and phase-guard.sh (reads it to decide whether
+# 3 -> 4 may be offered as a prompt). Both need PROJECT_DIR set.
+red_receipt_path() { printf '%s/.claude/.spec-red' "${PROJECT_DIR%/}"; }
+
+# "<content-hash> <path>" lines for the test files changed since the phase began,
+# from the same snapshot the Stop scan uses. Must run from the project root.
+changed_test_snapshot() {
+  base=$(cat "${PROJECT_DIR%/}/.claude/.spec-baseline" 2>/dev/null)
+  tree_snapshot | while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    case $'\n'"$base"$'\n' in
+      *$'\n'"$line"$'\n'*) continue ;;   # unchanged since phase entry
+    esac
+    is_test_path "${line#* }" && printf '%s\n' "$line"
+  done
+}
+
+changed_test_files() { changed_test_snapshot | sed 's/^[^ ]* //'; }
+
+# valid | stale | none | unverifiable. Runs in a subshell so callers do not need
+# to be in the project root, and so a failed cd cannot strand them elsewhere.
+red_receipt_status() {
+  (
+    r=$(red_receipt_path)
+    [ -r "$r" ] || { printf 'none\n'; exit 0; }
+    cd "$PROJECT_DIR" 2>/dev/null || { printf 'unverifiable\n'; exit 0; }
+    git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { printf 'unverifiable\n'; exit 0; }
+    want=$(sed -n '/^tests:$/,$p' "$r" | sed '1d')
+    [ -n "$want" ] || { printf 'stale\n'; exit 0; }
+    if [ "$want" = "$(changed_test_snapshot)" ]; then printf 'valid\n'; else printf 'stale\n'; fi
+  )
 }
 
 # --- The policy --------------------------------------------------------------
