@@ -1,7 +1,6 @@
 ---
 name: adversary
 description: Adversarial reviewer for a working-tree diff. Its job is to break the change, not to approve it. Use whenever a diff is ready to be judged, and always when the review gate asks for it.
-model: opus
 readonly: false
 ---
 

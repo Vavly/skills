@@ -689,8 +689,26 @@ confidence it hasn't earned.
 
 ## Tuning
 
-- **Reviewer model.** `adversary.md` sets `model: opus`. It runs about once per
-  turn, not per tool call, so cost is bounded but real. `sonnet` if the bill bites.
+- **Reviewer model.** No agent here pins one — all four inherit whatever model
+  the parent is running, which is both hosts' default. That keeps the pack
+  vendor-neutral and costs you something real: the reviewer is then the same
+  model that wrote the thing it is judging, and a model is a poor adversary to
+  itself. Pinning a different one is the single highest-leverage knob in this
+  file. Both reviewers run about once per turn, not per tool call, so a stronger
+  model is bounded but not free.
+
+  The two hosts disagree on syntax, and the difference is easy to miss because
+  neither errors loudly:
+
+  | | Claude Code (`.claude/agents/`) | Cursor (`.cursor/agents/`) |
+  | --- | --- | --- |
+  | field | `model:` | `model:` |
+  | default | `inherit` | `inherit` |
+  | accepts | bare aliases — `opus`, `sonnet`, `haiku` | **full IDs only** — `claude-opus-5`, `composer-2`, `gpt-5.6-sol` |
+  | params | — | `claude-opus-5[effort=high]`, `[context=300k]` |
+
+  A bare `opus` in a Cursor agent file does not resolve, and you get the
+  inherited model with a frontmatter line claiming otherwise.
 - **Spec review cost.** `spec-adversary` runs twice per task — once on the spec,
   once on the plan — against a document plus targeted reads, so it is far cheaper
   than a diff review. If you want only one, drop the Phase 3 paragraph in

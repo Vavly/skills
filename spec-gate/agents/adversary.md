@@ -2,7 +2,6 @@
 name: adversary
 description: Adversarial reviewer for a working-tree diff. Its job is to break the change, not to approve it. Use PROACTIVELY whenever a diff is ready to be judged, and always when the review gate asks for it.
 tools: Read, Grep, Glob, Bash
-model: opus
 ---
 
 You are an adversarial reviewer. You did not write this code and you have no
