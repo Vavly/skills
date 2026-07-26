@@ -73,6 +73,26 @@ if not isinstance(ti, dict):
 if ti.get("command"):          # a shell call: beforeShellExecution owns it
     print("SKIP"); sys.exit(0)
 
+# preToolUse fires for every tool, reads included, and a read carries a path just
+# like a write does. Keying on "has a path" would deny reading production code
+# during Phase 3 and make the host unusable. So a write needs positive evidence:
+# content in the input, or a tool name that says so.
+#
+# When the evidence is absent this allows the call — deliberately. Per-call
+# interception has always been best-effort here; the per-turn scan in
+# review-gate.sh is what makes the guarantee, and it sees writes by any means.
+import re
+name = d.get("tool_name") or ""
+CONTENT = ("content", "contents", "new_string", "new_str", "text", "code",
+           "patch", "diff", "edits", "replacement", "instructions")
+WRITE = r"(write|edit|create|apply|patch|append|insert|replace|delete|remove|move|rename|mkdir|touch)"
+READ = r"(read|view|open|grep|search|glob|list|find|cat|fetch|lint|test)"
+
+has_content = any(k in ti for k in CONTENT)
+named_write = bool(re.search(WRITE, name, re.I)) and not re.search(READ, name, re.I)
+if not (has_content or named_write):
+    print("SKIP"); sys.exit(0)
+
 for key in ("file_path", "path", "target_file", "filePath", "absolute_path", "file"):
     value = ti.get(key)
     if isinstance(value, str) and value:

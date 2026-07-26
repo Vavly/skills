@@ -350,9 +350,15 @@ expect_c "dormant: shell allowed"            allow "$(cur_shell 'echo hi > src/y
 expect_c "dormant: write allowed"            allow "$(cur_tool '{"file_path":"src/x.ts"}')"
 
 phase start v; phase 3
-expect_c "phase 3: production write denied"  deny  "$(cur_tool '{"file_path":"src/x.ts"}')"
-expect_c "phase 3: test write allowed"       allow "$(cur_tool '{"file_path":"src/x.test.ts"}')"
-expect_c "alternate path key honoured"       deny  "$(cur_tool '{"target_file":"src/x.ts"}')"
+expect_c "write with content denied"         deny  "$(cur_tool '{"file_path":"src/x.ts","content":"x"}')"
+expect_c "write by tool name denied"         deny  "$(cur_tool '{"file_path":"src/x.ts"}' write_file)"
+expect_c "edit with new_string denied"       deny  "$(cur_tool '{"target_file":"src/x.ts","new_string":"x"}')"
+expect_c "test file write allowed"           allow "$(cur_tool '{"file_path":"src/x.test.ts","content":"x"}' write_file)"
+# preToolUse fires for reads too, and a read carries a path exactly like a write.
+# Treating "has a path" as a write would block reading production code in Phase 3.
+expect_c "READ of production code allowed"   allow "$(cur_tool '{"path":"src/x.ts"}' read_file)"
+expect_c "grep over production allowed"      allow "$(cur_tool '{"path":"src/x.ts","pattern":"foo"}' grep_search)"
+expect_c "list_dir allowed"                  allow "$(cur_tool '{"path":"src"}' list_dir)"
 expect_c "unknown tool shape allowed"        allow "$(cur_tool '{"pattern":"foo"}')"
 expect_c "phase 3: shell write denied"       deny  "$(cur_shell 'echo hi > src/y.ts')"
 expect_c "phase 3: read-only shell allowed"  allow "$(cur_shell 'cat src/x.ts')"
