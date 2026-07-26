@@ -17,6 +17,14 @@ is_test_path() {
   case "$1" in
     */tests/*|tests/*|*/test/*|test/*|*/spec/*|spec/*|*/__tests__/*) return 0 ;;
     *_test.*|*.test.*|*_spec.*|*.spec.*|test_*.py|*Test.java|*Tests.cs)  return 0 ;;
+    # A whole suite in one shell script, which is how most tool repos test
+    # themselves — including this one. Without it the repo's only test file
+    # scores as production and Phase 3 denies every edit to it, which locks the
+    # workflow out of exactly the repos spec-gate is written in. Matched by exact
+    # basename rather than a *test*.sh glob so that deploy-test.sh and the like
+    # keep scoring as production: the dangerous direction here is calling
+    # production code a test, since that is what opens Phase 3 up to it.
+    test.sh|*/test.sh|tests.sh|*/tests.sh|run-tests.sh|*/run-tests.sh) return 0 ;;
   esac
   return 1
 }

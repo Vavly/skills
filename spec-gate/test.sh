@@ -128,6 +128,12 @@ expect_b "runtime-computed target denied"      DENY  'echo x > $(mktemp)'
 expect_b "cp to a test path allowed"           ALLOW 'cp /tmp/e tests/ok.test.ts'
 expect_b "read-only command still allowed"     ALLOW 'cat src/x.ts && ls -la'
 expect_b "quoted path with space denied [#6]"  DENY  'echo x > "src/a b.ts"'
+# A shell repo keeps its whole suite in one script. Scoring that as production
+# locked Phase 3 out of editing the only tests such a repo has.
+expect_w "test.sh is a test file"              ALLOW test.sh
+expect_w "nested test.sh is a test file"       ALLOW spec-gate/test.sh
+expect_w "run-tests.sh is a test file"         ALLOW run-tests.sh
+expect_w "deploy-test.sh stays production"     DENY  scripts/deploy-test.sh
 
 group "Phase state is never the model's [#8]"
 expect_b "redirect into phase file denied"     DENY  'echo phase=5 > .claude/.spec-phase'
