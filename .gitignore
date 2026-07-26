@@ -1,1 +1,5 @@
 .DS_Store
+.claude/.spec-phase
+.claude/.spec-baseline
+.claude/.spec-red
+.claude/review-log.jsonl

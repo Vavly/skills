@@ -1,0 +1,45 @@
+{
+  "permissions": {
+    "ask": [
+      "Bash(.claude/hooks/phase.sh 3*)",
+      "Bash(.claude/hooks/phase.sh 4*)",
+      "Bash(.claude/hooks/phase.sh off*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|NotebookEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/phase-guard.sh",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/review-gate.sh",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "adversary|spec-adversary",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -c '{t: now|todate, agent: .agent_type, msg: .last_assistant_message}' >> \"$CLAUDE_PROJECT_DIR\"/.claude/review-log.jsonl"
+          }
+        ]
+      }
+    ]
+  }
+}
