@@ -19,6 +19,12 @@ what you are asking them to approve before you make the call, so the prompt is
 not the first they hear of it. If they decline, stop; do not look for another
 route forward.
 
+At `2 → 3`, if the spec has not been through the `spec-adversary` reviewer in this
+conversation, say so before you run it. The prompt tells them to decline in that
+case, and hearing it from you first is the difference between a choice and a
+surprise. They may still want to advance — that is theirs to decide, not yours to
+withhold.
+
 `3 → 4` additionally needs RED verified first — the guard denies it otherwise and
 says so. If it does, run `.claude/hooks/phase.sh red`, show its output in full,
 and only then advance.

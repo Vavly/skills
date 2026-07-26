@@ -10,7 +10,8 @@ each outcome*:
 2. **A phase gate** — a `PreToolUse` hook enforcing a five-phase workflow
    (clarify → spec → plan + failing tests → execute → review), where production
    code is blocked *at the tool level* until a spec exists and the user has
-   approved it.
+   approved it. A second subagent, `spec-adversary`, attacks the spec and the
+   plan on paper before that approval is asked for.
 
 Design premise: **prompts raise the average, hooks raise the minimum.** Anything
 that must always happen is a hook. Anything needing judgment is a prompt. The
@@ -39,13 +40,15 @@ spec-gate/
 │   ├── phase.sh                     → .claude/hooks/   phase state CLI
 │   ├── cursor-guard.sh              → .claude/hooks/   Cursor adapter
 │   └── cursor-stop.sh               → .claude/hooks/   Cursor adapter
-├── agents/adversary.md              → .claude/agents/
+├── agents/
+│   ├── adversary.md                 → .claude/agents/   judges the diff
+│   └── spec-adversary.md            → .claude/agents/   judges the spec + plan
 ├── skills/
 │   ├── spec-driven/SKILL.md         → .claude/skills/  the workflow
 │   └── spec-phase/SKILL.md          → .claude/skills/  user-only phase control
 └── cursor/                          for Cursor instead of / alongside Claude Code
     ├── hooks.json                   → .cursor/hooks.json
-    └── agents/adversary.md          → .cursor/agents/adversary.md
+    └── agents/*.md                  → .cursor/agents/
 ```
 
 `phase-policy.sh` is sourced by both hooks rather than executed. It holds the
@@ -112,7 +115,7 @@ becomes an instruction.
 ```bash
 mkdir -p .cursor/agents
 cp "$SPEC_GATE"/cursor/hooks.json .cursor/hooks.json          # MERGE if one exists
-cp "$SPEC_GATE"/cursor/agents/adversary.md .cursor/agents/
+cp "$SPEC_GATE"/cursor/agents/*.md .cursor/agents/
 ```
 
 The hook scripts stay in `.claude/hooks/`, which `.cursor/hooks.json` points at
@@ -156,6 +159,12 @@ exactly one test went red. That needs writes. `readonly: true` would have
 prevented the review that justified the exercise. The constraint that matters —
 do not modify the files under review — is stated in the brief.
 
+**`readonly: true` on the Cursor `spec-adversary` is deliberate for the mirror
+reason.** Nothing in a spec review is proved by writing: its findings come from
+reading the repo the spec makes claims about — grep for the helper it names,
+count the callers of the contract it changes. Writes would buy it nothing and put
+it one slip from editing the document it is judging.
+
 ## Use
 
 ```
@@ -177,8 +186,8 @@ flowchart TD
     S["/spec-phase start [task]"] --> P1
 
     P1["Phase 1 · Clarify<br/>writes nothing"]
-    P2["Phase 2 · Spec<br/>writes docs/specs/ only"]
-    P3["Phase 3 · Plan + failing tests<br/>writes tests only"]
+    P2["Phase 2 · Spec<br/>writes docs/specs/ only<br/>spec-adversary reviews it first"]
+    P3["Phase 3 · Plan + failing tests<br/>writes tests only<br/>spec-adversary reviews the plan"]
     P4["Phase 4 · Execute<br/>writes production code<br/>review gate suppressed"]
     P5["Phase 5 · Adversarial review<br/>review gate ARMED"]
     OFF["gate off<br/>no phase file · review gate armed every turn"]
@@ -207,6 +216,54 @@ to reason on. `off` ends the task. A model that disarms on its own has decided
 the work is finished and presented that as settled, skipping the only
 conversation where you get to say *ship it*, *keep going*, or *throw it away*.
 See [Closing out](#closing-out).
+
+### Reviewing the spec, not just the diff
+
+Adversarial review of a diff catches the wrong implementation. It cannot catch the
+wrong *design*: by the time a diff exists the design has already been paid for in
+tests and in code, and a reviewer looking at a faithful implementation of a bad
+spec mostly reports that it looks faithful.
+
+So the spec gets its own reviewer, `spec-adversary`, at the two points where the
+design is still cheap to change:
+
+- **End of Phase 2, before the 2→3 prompt.** The model spawns it, handles the
+  findings, and reports the verdict *with* the approval request. What you approve
+  is the spec as amended, and you can see what moved.
+- **Start of Phase 3, once the plan is appended and before any test is written.**
+  A plan reviewed after the tests costs two rewrites instead of one.
+
+Its brief is deliberately not the code adversary's. That one attacks concurrency,
+error paths and injection, none of which prose has anything to say about. This
+one attacks:
+
+- **Assumptions** — what breaks if each is false, and which the repo can already
+  answer, because an assumption the repo answers is an unverified claim.
+- **Internal consistency** — an approach that needs something listed out of
+  scope, types that omit the error cases the prose describes, a rejected
+  alternative rejected for a reason that is not true.
+- **Architecture** — where state lives, which existing contract this changes and
+  who depends on it, a new abstraction over something the repo already has.
+- **What the implementer will be forced to invent** — the questions Phase 4 will
+  hit that the spec does not answer. This one is aimed squarely at the failure
+  the whole workflow exists to prevent: a silent redesign mid-execution.
+- **Testability** — Phase 3 has to write a failing test per named failure mode,
+  so a requirement no test could pin is a finding.
+
+Two rules keep it useful rather than noisy. One is borrowed from `adversary`:
+`sound` is a normal outcome. The other is specific to reviewing a design —
+*"I would have designed it differently"* is not a finding. Without that second
+rule a spec reviewer redesigns the feature every time you run it, which is
+expensive, unfalsifiable, and indistinguishable from a real objection.
+
+**This layer is instructed, not enforced**, and the limit is deliberate. No hook
+can judge whether a subagent read the spec, and gating 2→3 on a `SubagentStop`
+receipt would put a hard block on the workflow the day that payload shape changes
+— the fail-*closed* mirror of the bugs in [Fixed in review](#fixed-in-review).
+What the gate does instead is one sentence in the 2→3 prompt: *if you have not
+seen the reviewer's verdict in this conversation, decline.* Same shape as the
+advice for 3→4, and the same reason — an approval is worth something only when
+there is something on screen to approve.
 
 ### RED verification
 
@@ -362,7 +419,8 @@ reviewing twice costs twice.
 | `phase-guard.sh` | `PreToolUse` | per tool call | *prevents* the wrong kind of work for the phase |
 | `review-gate.sh` — phase scan | `Stop` | per turn | *catches* phase violations the guard could not see |
 | `review-gate.sh` — review gate | `Stop` | per turn | blocks *ending a turn* on an unreviewed diff |
-| `adversary` | subagent | on delegation | does the judging |
+| `adversary` | subagent | on delegation | judges the diff |
+| `spec-adversary` | subagent | Phase 2 exit, Phase 3 plan | judges the design before it is built |
 
 Write detection is deliberately split across two layers, because neither can do
 the job alone:
@@ -498,14 +556,18 @@ Two limits worth stating plainly, since both look like enforcement and are not:
 
 **Instructed only** — everything in the SKILL.md bodies and the gate's block
 message: showing real failure output, saying why each failure is the *expected*
-one, not priming the reviewer, not padding the evidence log, stopping on
+one, **sending the spec and the plan to `spec-adversary` before asking for
+approval**, not priming either reviewer, not padding the evidence log, stopping on
 contradiction, honoring severity levels, leaving tests frozen in Phase 4, running
 the repo's own validations before leaving Phase 4, and asking about the pull
 request before closing out. These work most of the time and fail *silently* when
 they don't.
 
-The gate stops structural failures. It cannot stop a lazy Phase 1 or a
-self-congratulatory Phase 5 log.
+The gate stops structural failures. It cannot stop a lazy Phase 1, a spec review
+that was never spawned, or a self-congratulatory Phase 5 log. For the spec review
+the backstop is attention rather than enforcement: the 2→3 prompt tells you to
+decline if the verdict is not in the transcript, which works exactly as well as
+you read it.
 
 ## Tests
 
@@ -515,9 +577,13 @@ self-congratulatory Phase 5 log.
 
 Builds a throwaway git repo in a temp dir, installs the hooks into it, and drives
 them with synthetic hook payloads. Nothing touches the repo you run it from.
-139 cases: the phase policy, every write vector, the advance-transition matrix,
+150 cases: the phase policy, every write vector, the advance-transition matrix,
 RED verification and the receipt's staleness rules, fail-closed behavior, the
-review gate, and the phase scan with its baseline.
+review gate, and the phase scan with its baseline. A handful assert *text* rather
+than behavior — the two reviewers' briefs, the spawn framing in the block message,
+and the workflow's instruction to review the spec before asking. Those are the
+parts of this toolkit an edit can silently hollow out, since nothing executes
+them.
 
 Cases tagged `[#n]` pin a bug from the review below. Those are the ones that must
 never quietly come back.
@@ -585,6 +651,22 @@ confidence it hasn't earned.
   delegate now carry a fixed adversarial preamble, with the one-line intent
   dropped into it. Unprimed is about *withholding the author's reasoning*, not
   about withholding the reviewer's job.
+- **The spec is reviewed before the user is asked, not after.** Reversing those
+  two spends the user's attention as the first filter, and once they have approved
+  a spec, a later objection to it costs a retreat rather than an edit. The model
+  is also the wrong reviewer of its own spec for the same reason it is the wrong
+  reviewer of its own diff.
+- **`spec-adversary` is a separate agent, not `adversary` pointed at a markdown
+  file.** The code brief opens with `git diff HEAD` and prioritises concurrency,
+  error paths and injection; aimed at prose it returns either style notes or a
+  summary. The defects that matter in a spec — a load-bearing false assumption, an
+  approach that needs something declared out of scope, a decision left open that
+  the implementer will invent — need their own checklist and their own severity
+  scale.
+- **"I would have designed it differently" is not a spec finding.** The rule that
+  makes design review survivable. Without it the reviewer proposes an alternative
+  architecture every run, which is unfalsifiable, expensive to answer, and
+  indistinguishable from a real objection.
 - **"No findings" must be a normal outcome.** Both `adversary.md` and the Phase 5
   log say so explicitly. A reviewer that always finds three things trains you to
   skim; a log formatted to presume improvements gets improvements manufactured
@@ -609,12 +691,19 @@ confidence it hasn't earned.
 
 - **Reviewer model.** `adversary.md` sets `model: opus`. It runs about once per
   turn, not per tool call, so cost is bounded but real. `sonnet` if the bill bites.
+- **Spec review cost.** `spec-adversary` runs twice per task — once on the spec,
+  once on the plan — against a document plus targeted reads, so it is far cheaper
+  than a diff review. If you want only one, drop the Phase 3 paragraph in
+  `spec-driven/SKILL.md` and keep the Phase 2 pass; the plan is the cheaper of the
+  two to get wrong. Dropping the Phase 2 pass instead defeats the point, since the
+  approval it feeds is the expensive one.
 - **Per-turn review during Execute.** Phase 4 currently suppresses the Stop gate.
   Drop the `4` from the `case` list in `review-gate.sh` for incremental review at
   incremental cost.
-- **Second reviewer.** Largest available quality gain: a second read-only
-  subagent with a *different* brief, run in parallel — one on correctness, one on
-  security or effects on callers. Copy `adversary.md`, narrow the prompt.
+- **Second reviewer on the diff.** The Phase 5 equivalent of what
+  `spec-adversary` does for the design: a second read-only subagent with a
+  *different* brief, run in parallel — one on correctness, one on security or
+  effects on callers. Copy `adversary.md`, narrow the prompt.
 - **Green-suite tripwire** in `review-gate.sh` before the block, so a broken
   suite is caught deterministically rather than by a model that may not bother.
   This is the mirror of the RED tripwire above: that one refuses to *leave*
@@ -691,6 +780,16 @@ confidence it hasn't earned.
   reasoning — real, but it will systematically miss what the implementer would
   systematically miss. This raises the floor; it does not replace human review on
   anything that matters.
+- **A spec review can only tell you these specific things are wrong.** `sound`
+  means the reviewer could not break the design from the document and the repo —
+  not that the design is right. It reads what the spec says, so a requirement
+  nobody wrote down is invisible to it, and Phase 1 is still where that gets
+  caught. It also shares the implementer's blind spots, exactly as `adversary`
+  does.
+- **Nothing enforces that the spec review happened.** It is a prompt: the model
+  can skip the delegation and go straight to the 2→3 prompt, and the only signal
+  is the missing verdict in the transcript. The prompt says to decline in that
+  case, which is a reminder, not a gate.
 - **`adversary` is not read-only.** Its frontmatter grants `Bash`, deliberately —
   the brief wants it to prove findings by running things rather than asserting
   them. "Do not modify any file" is an instruction, not a constraint. Drop `Bash`
@@ -710,6 +809,6 @@ confidence it hasn't earned.
 - **No enforcement between Phase 4 exit and Phase 5.** If the user never advances,
   the diff is never gated. The user *is* the checkpoint by design.
 - **Hook registration, subagent delegation, and skill auto-activation are
-  unverified inside a live session.** The scripts are tested — `./test.sh`, 67
+  unverified inside a live session.** The scripts are tested — `./test.sh`, 150
   cases — but the integration with Claude Code is not. Take one real but small
   task through end to end before trusting it.

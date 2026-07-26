@@ -200,8 +200,13 @@ case "${1:-status}" in
       1) echo "  -> no files may be written"
          echo "  -> next: 2 Spec — Claude may advance" ;;
       2) echo "  -> docs/specs/ only"
-         echo "  -> next: 3 Plan + tests — USER ONLY: run '.claude/hooks/phase.sh 3' in a terminal" ;;
+         # Said here because status is what the model re-reads after compaction,
+         # and the spec review is instructed rather than enforced — the one step
+         # a forgetful model can drop without anything noticing.
+         echo "  -> the spec goes to the spec-adversary subagent before you are asked"
+         echo "  -> next: 3 Plan + tests — Claude may ask you to approve it" ;;
       3) echo "  -> tests only; production code blocked"
+         echo "  -> the plan goes to spec-adversary before the tests are written"
          case "$(red_receipt_status)" in
            valid) echo "  -> RED verified — next: 4 Execute, Claude may ask you to approve it" ;;
            stale) echo "  -> RED receipt STALE: the tests changed since. Re-run '.claude/hooks/phase.sh red'" ;;

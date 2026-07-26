@@ -172,7 +172,14 @@ if [ -n "$CMD" ] && printf '%s' "$CMD" | grep -qE '(^|[^[:alnum:]_.+-])phase\.sh
       elif [ "$PHASE" = 2 ] && [ "$ARG" = 3 ]; then
         # Spec approval, in band. The user is reading the spec in the
         # conversation anyway, so one confirmation is proportionate.
-        ask "Approve the spec and advance to Phase 3 (Plan + failing tests)? Approving asserts that you have read docs/specs/ and accept the approach, the types, and the out-of-scope list. Phase 3 writes tests only; production code stays blocked until Phase 4."
+        #
+        # The spec review this mentions is instructed, not enforced: no hook can
+        # judge whether a subagent actually read the spec, and gating this
+        # transition on a SubagentStop receipt would hand the workflow a hard
+        # block whenever that payload shape changed. So the prompt does the one
+        # thing it can — tell the user what should already be on screen, and
+        # what its absence means.
+        ask "Approve the spec and advance to Phase 3 (Plan + failing tests)? Approving asserts that you have read docs/specs/ and accept the approach, the types, and the out-of-scope list. The spec should have been through the spec-adversary reviewer first: if you have not seen its verdict in this conversation, decline and ask for it. Phase 3 writes tests only; production code stays blocked until Phase 4."
       elif [ "$PHASE" = 3 ] && [ "$ARG" = 4 ]; then
         # Unlocking production code. This used to be terminal-only, on the
         # grounds that a permission prompt is a low-attention action and the RED

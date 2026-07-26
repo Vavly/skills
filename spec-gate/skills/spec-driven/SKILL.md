@@ -1,6 +1,6 @@
 ---
 name: spec-driven
-description: Structured five-phase workflow for non-trivial feature work and refactors — clarify, spec, plan with failing tests, execute, adversarial review. Use when the task is large enough that getting the design wrong is expensive. Skip for one-line fixes, typos, and exploration.
+description: Structured five-phase workflow for non-trivial feature work and refactors — clarify, spec, plan with failing tests, execute, adversarial review. The spec and the plan are adversarially reviewed before the user is asked to approve them. Use when the task is large enough that getting the design wrong is expensive. Skip for one-line fixes, typos, and exploration.
 argument-hint: "[short task name]"
 ---
 
@@ -18,7 +18,8 @@ confirmation prompt, and the user accepting it *is* the approval. Say what you
 are asking them to approve **before** you make the call, so the prompt is never
 the first they hear of it. If they decline, stop — do not look for another route.
 
-- `2 → 3` — `.claude/hooks/phase.sh 3`. They are approving the spec.
+- `2 → 3` — `.claude/hooks/phase.sh 3`. They are approving the spec — which by
+  then has been through `spec-adversary`, not just through you.
 - `3 → 4` — `.claude/hooks/phase.sh red` first, then `.claude/hooks/phase.sh 4`.
   The guard refuses the second until the first has passed, so this is two calls,
   not one, and the failure output belongs between them.
@@ -92,10 +93,54 @@ phase.
 - Assumptions from Phase 1.
 - Out of scope — what you are deliberately not doing.
 
-**Exit:** the user approves the spec. Say what you are asking them to accept, then
-run `.claude/hooks/phase.sh 3` — the confirmation prompt is their approval. A
-declined prompt means the spec is not finished; ask what is wrong rather than
-retrying.
+### Have it reviewed before you ask
+
+**You do not review your own spec.** When it is written, delegate to the
+`spec-adversary` subagent — a design is cheapest to break here, before tests are
+written against it and code against those tests. Do this *before* you ask the
+user for anything.
+
+Same rule as Phase 5: **open with the stance, not the task.** The difference is
+what you are withholding. A spec *is* your reasoning written down, so the
+reviewer gets all of it; what you keep back is which parts you are unsure about
+and where you think it should look.
+
+> You are adversarially reviewing a spec that has not been approved yet:
+> `docs/specs/<task>.md`. Assume the design is wrong and find where. Your job is
+> to break it on paper, not to approve it.
+>
+> The task intent, which is the only framing I am giving you:
+> **&lt;one or two sentences&gt;**
+>
+> The spec is my reasoning in full — read it against the repo and check what it
+> claims. I am not telling you which parts I am unsure about, or where to look.
+> If it holds up, say `sound` and stop — that is a normal outcome, not a failure
+> to find something.
+
+Everything after the intent line stays fixed, for the reason it does in Phase 5:
+a reviewer told where to look reports back on where you sent it.
+
+Then handle the verdict:
+
+- `blocker` / `serious` — fix the spec. If a finding takes out the approach
+  rather than a detail, that is a rewrite of the spec, not a footnote added to
+  it.
+- `minor` — fold it into the spec or report it with your recommendation. Do not
+  silently fix or silently drop it.
+- Disagree with a finding? Say so with reasoning, and put the reasoning in the
+  spec if it changes an assumption. Never discard one quietly.
+- `cannot-assess` — report what it said it needed. It is not a pass.
+
+Re-run the reviewer only if the approach changed. A wording fix does not need a
+second pass, and a second pass you did not need trains you to skip the first.
+
+**Exit:** the spec has been reviewed and the findings are handled, then the user
+approves it. The verdict, what you changed in response, and what you declined all
+go to them **before** the prompt appears — they are approving the spec as it now
+stands, so say what moved. "Reviewer found nothing, spec unchanged" is a complete
+report. Then run `.claude/hooks/phase.sh 3` — the confirmation prompt is their
+approval. A declined prompt means the spec is not finished; ask what is wrong
+rather than retrying.
 
 ## Phase 3 — Plan and failing tests
 
@@ -103,6 +148,19 @@ Two artifacts, in this order.
 
 The plan: ordered steps, each small enough to verify on its own, each naming
 the files it touches. Append it to the spec document.
+
+Then send it back to `spec-adversary` — the same preamble as Phase 2, with the
+scope narrowed to the new material:
+
+> …judge the plan appended to `docs/specs/<task>.md` against the spec above it.
+> The spec is approved; the plan is not.
+
+**Before the tests, not after.** Tests written against a plan that then gets
+restructured are paid for twice, once in writing them and once in unpicking them.
+Handle the findings exactly as in Phase 2. If one lands on the spec rather than
+the plan, that is the contradiction rule in [Standing
+commitments](#standing-commitments) — stop and ask to return to Phase 2 rather
+than patching the plan around an approved spec you no longer believe.
 
 Then the tests. Cover, at minimum: empty and null inputs, boundary values,
 the failure modes named in the spec, and the concurrency case if there is one.
@@ -129,11 +187,12 @@ asserts and why this failure is the expected one.** A test that fails with
 `ReferenceError` when you expected a wrong return value is not red for the right
 reason — it is broken, and you fix it here rather than discovering it in Phase 4.
 
-**Exit:** plan approved, every new test failing for the right reason, output
-shown and accounted for — then run `.claude/hooks/phase.sh 4`. The prompt it
-raises is the user's assertion that they read the failures and accept them.
-Do not make that call in the same breath as `red`: show the output, say what it
-means, and let them see it before the prompt appears.
+**Exit:** plan reviewed and its findings handled, every new test failing for the
+right reason, output shown and accounted for — then run
+`.claude/hooks/phase.sh 4`. The prompt it raises is the user's assertion that they
+read the failures and accept them. Do not make that call in the same breath as
+`red`: show the output, say what it means, and let them see it before the prompt
+appears.
 
 Once RED is recorded, **do not touch the test files again before advancing.** Any
 edit to them voids the verification and the guard will send you back to `red`.
@@ -182,7 +241,10 @@ it — only 2 → 3 and 3 → 4 raise prompts.
 
 ## Phase 5 — Adversarial review
 
-**You do not review your own work here.** Delegate to the `adversary` subagent.
+**You do not review your own work here.** Delegate to the `adversary` subagent —
+that one, not the `spec-adversary` from Phases 2 and 3. Different subject,
+different brief: this one attacks the code that got written, and it is told
+nothing about the spec it was written from.
 
 **Open with the stance, not with the task.** A bare intent sentence — *"Message
 banners should appear below the header, not above it"* — reads as *check that

@@ -278,6 +278,65 @@ for want in 'adversarially reviewing' 'not to approve it' 'only thing I am telli
   fi
 done
 
+group "The spec is reviewed before the 2 -> 3 prompt"
+# The spec review is instructed, not enforced, so everything load-bearing about it
+# is text — in three separate files, and every one of them is something an edit can
+# silently delete. Pin the parts that make it a review instead of a rubber stamp:
+# the brief exists, the workflow names the reviewer it has to spawn, and the
+# approval prompt says what a missing verdict means.
+setup_repo
+[ -f .claude/agents/spec-adversary.md ] \
+  && ok "spec-adversary is installed alongside adversary" \
+  || bad "no .claude/agents/spec-adversary.md — the Phase 2 review has no reviewer"
+BRIEF=$(tr '\n' ' ' < .claude/agents/spec-adversary.md 2>/dev/null | tr -s ' ')
+# 'designed it differently' is the rule that stops a design reviewer from
+# proposing a new architecture every run; 'manufacture' and 'sound' are the same
+# counterweights the code adversary carries.
+for want in 'not to approve it' 'Do not manufacture findings' 'designed it differently' 'sound'; do
+  if printf '%s' "$BRIEF" | grep -qF "$want"; then
+    ok "spec-adversary brief carries: '$want'"
+  else
+    bad "spec-adversary brief is missing: '$want'"
+  fi
+done
+
+WORKFLOW=$(tr '\n' ' ' < .claude/skills/spec-driven/SKILL.md 2>/dev/null | tr -s ' ')
+for want in 'spec-adversary' 'You do not review your own spec' 'Before the tests, not after'; do
+  if printf '%s' "$WORKFLOW" | grep -qF "$want"; then
+    ok "the workflow demands the spec review: '$want'"
+  else
+    bad "spec-driven no longer instructs the spec review: '$want' is gone"
+  fi
+done
+
+phase start v; phase 2
+reason=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh 3')")
+if printf '%s' "$reason" | grep -qi 'spec-adversary'; then
+  ok "the 2 -> 3 prompt names the reviewer, so a missing verdict is visible"
+else
+  bad "2 -> 3 prompt does not mention the spec review: '$reason'"
+fi
+
+# Both reviewers' verdicts are worth logging, and a matcher is exact alternation
+# rather than a substring — the same property that let NotebookEdit through [#5].
+# So 'adversary' alone would silently stop logging the spec reviews.
+if python3 -c '
+import json,sys
+d=json.load(open(".claude/settings.json"))
+ms=[h.get("matcher","") for h in d.get("hooks",{}).get("SubagentStop",[])]
+sys.exit(0 if any("spec-adversary" in m for m in ms) else 1)' 2>/dev/null; then
+  ok "the review log matcher covers spec-adversary too"
+else
+  bad "settings.json SubagentStop matcher does not name spec-adversary"
+fi
+
+# Cursor reads .cursor/agents/, not .claude/agents/. An agent added on one side
+# only is an agent the workflow names and that host cannot spawn.
+a=$(cd "$SRC/agents" && ls *.md | sort)
+c=$(cd "$SRC/cursor/agents" && ls *.md | sort)
+[ "$a" = "$c" ] && ok "the Claude Code and Cursor agent sets match" \
+  || bad "agents differ — .claude: $(echo $a) / .cursor: $(echo $c)"
+
 group "Untracked fixes are re-reviewed [#2]"
 setup_repo
 phase off

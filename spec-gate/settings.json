@@ -32,7 +32,7 @@
     ],
     "SubagentStop": [
       {
-        "matcher": "adversary",
+        "matcher": "adversary|spec-adversary",
         "hooks": [
           {
             "type": "command",
