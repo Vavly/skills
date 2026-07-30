@@ -63,8 +63,8 @@ and no `chmod` step is needed.
 ## Requirements
 
 - A git repo. Both Stop-hook jobs fingerprint the working tree with
-  `git diff HEAD`, `git status --porcelain` and `git hash-object`; outside a work
-  tree the hooks exit silently.
+  `git diff HEAD`, `git ls-files` and `git hash-object`; outside a work tree the
+  hooks exit silently.
 - **Either `jq` or `python3`** — the hooks detect which is available. The
   optional `SubagentStop` review log in `settings.json` is the one jq-only piece;
   drop that block if you have neither. (`test.sh` additionally wants `python3`, to
@@ -149,6 +149,16 @@ And one place it is worse: `preToolUse` has no `ask`, so all three approval
 prompts work only because `phase.sh 3`, `phase.sh 4` and `phase.sh off` are shell
 commands and reach `beforeShellExecution`. The adapter downgrades a stray `ask`
 to `deny` rather than letting it evaporate.
+
+**Session reuse assumes the host can resume a subagent.** Claude Code can — the
+main agent messages an existing subagent by name and it picks up its transcript.
+Whether Cursor exposes an equivalent for `.cursor/agents/` subagents is
+**unverified here**, and if it does not, every round spawns cold and the reuse
+instruction is a no-op rather than a failure. The *Follow-up rounds* section stays
+in both copies of each brief regardless: it is written as "when you are asked
+again in this session", so on a host that cannot resume it simply never applies —
+and the two agent sets are kept identical on purpose, since a brief that differs
+per host is a brief that drifts.
 
 **`readonly: false` on the Cursor adversary is deliberate.** Cursor can enforce
 read-only on a subagent, which Claude Code cannot — there it is only an
@@ -256,6 +266,9 @@ Two rules keep it useful rather than noisy. One is borrowed from `adversary`:
 rule a spec reviewer redesigns the feature every time you run it, which is
 expensive, unfalsifiable, and indistinguishable from a real objection.
 
+Both passes are the **same session**, resumed — see [One reviewer session per
+subject, per slice](#one-reviewer-session-per-subject-per-slice).
+
 **This layer is instructed, not enforced**, and the limit is deliberate. No hook
 can judge whether a subagent read the spec, and gating 2→3 on a `SubagentStop`
 receipt would put a hard block on the workflow the day that payload shape changes
@@ -264,6 +277,180 @@ What the gate does instead is one sentence in the 2→3 prompt: *if you have not
 seen the reviewer's verdict in this conversation, decline.* Same shape as the
 advice for 3→4, and the same reason — an approval is worth something only when
 there is something on screen to approve.
+
+### One reviewer session per subject, per slice
+
+Review is a loop, not a single call: a verdict arrives, findings get fixed, and
+the fixed tree is owed review again. The first design spawned a fresh reviewer
+for every lap of that loop, and the second lap was where it broke down. A cold
+reviewer re-reads the whole diff blind, has no idea a line exists to close a
+finding it never saw, and so cannot answer the only question the round is
+actually asking — *did the fix work?* It can only say what it thinks of the code
+now, which is a different and much weaker claim.
+
+So each reviewer is spawned once and **resumed** for every later round:
+
+| Session | Agent | Opened | Resumed for | Ends |
+| --- | --- | --- | --- | --- |
+| design | `spec-adversary` | Phase 2 on the spec; Phase 3 on the plan, from slice 2 on | the Phase 3 plan, and each re-read after a revision | slice boundary |
+| code | `adversary` | Phase 5, on the diff | each re-review after a fix | slice boundary |
+
+Three properties, each load-bearing:
+
+**The two sessions never merge.** A design reviewer that has read the diff stops
+judging the design; a code reviewer that has read the spec starts checking the
+code against the author's stated intent, which is precisely what
+[the reviewer gets task intent
+only](#design-decisions-worth-not-re-litigating) exists to withhold. One session
+per subject, and the subjects do not meet.
+
+**Neither session crosses a slice boundary.** The next slice spawns both cold. A
+code reviewer still holding the previous slice's diff re-reports work that is
+already committed and reviewed, and grades the new diff on credit the last one
+earned — and by slice five it is carrying five diffs, which is the exact
+condition slicing exists to avoid, reassembled inside the reviewer. It also keeps
+`adversary` ignorant of the slice structure, which
+[it should be](#completion-is-checked-on-the-way-out-not-at-phase-5).
+`spec-adversary` is the opposite case: it judges plans, and *"slice 2 needs the
+types slice 3 introduces"* is only findable by a reviewer that can see the
+ordering.
+
+**The follow-up message points at the change, and withholds the argument.** This
+is the one place the round-one rules are deliberately relaxed. Round one withholds
+the author's reasoning to protect an independent judgment; by round two the
+reviewer *holds the findings*, so there is no independent judgment left to
+protect, and making it hunt for the edits buys nothing but a re-read. So the
+follow-up says where the change is and which findings the author claims to have
+addressed:
+
+> The **&lt;spec | working tree&gt;** has changed since your verdict. Everything you
+> had already judged is staged, so `git diff` is exactly what moved.
+>
+> Findings I acted on: **&lt;list&gt;**. Findings I left: **&lt;list&gt;**. Check that
+> against the code rather than taking it from me — anything you still consider
+> open, report again, and anything I broke is new. If it holds up now, say
+> `sound` and stop.
+
+What stays out is the *case for the fix*. No explanation of why it is right, no
+argument for a finding that was declined — that argument goes to the **user**, in
+the evidence log, where they can weigh it. Arguing a reviewer round to your
+position does not resolve a finding, it removes the reviewer. Both briefs
+correspondingly treat the "findings I acted on" list as a **claim to check, not a
+report to accept**, and rate a finding reported as fixed but not fixed a
+`blocker` — from that point everything downstream is being decided on the author's
+summary instead of on the code.
+
+#### The index is the bookmark
+
+The staging convention is what makes the second round cheap, and it is one
+invariant: **staged is what the reviewer has already judged, unstaged is what has
+moved since.** Two `git add` calls maintain it — one before the first round, one
+the moment each verdict lands and *before* anything is touched in response.
+
+Staging between fixing and messaging is the one ordering that destroys the signal,
+and it destroys it in the dangerous direction: the fixes go into the index, the
+reviewer opens `git diff` on what looks like an untouched tree, and *nothing moved
+since my verdict* reads as *nothing to re-review*. Both the workflow and the block
+message say not to, and because that is prose, both briefs also carry the
+backstop — **an empty `git diff` is not evidence that nothing changed**, it is
+equally consistent with the convention having been broken, so re-read `git diff
+HEAD` and say which of the two you concluded. Never a `sound` verdict reasoned from
+"nothing appears to have moved." That turns a broken ordering into a wasted round
+instead of a fix waved through.
+
+That convention put a requirement on the gate: **`git add` must not look like a
+change.** It did, and both of the fingerprint's original sources were the reason —
+`git status --porcelain` rewrites its status codes when a file is staged (`?? f`
+becomes `A  f`), and `git diff HEAD` starts including a new file the moment it is
+added, having ignored it while untracked. Either one moves the fingerprint on
+byte-identical content, which is the *"committing re-armed the gate"* failure from
+[What the review gate ignores](#what-the-review-gate-ignores) arriving through a
+different door — and this door is one the workflow now walks through on every
+task.
+
+So the fingerprint is now built only from what `git add` cannot move: content
+hashes from `tree_snapshot`, plus deletions (which `tree_snapshot` drops, since it
+only hashes files that exist) and mode changes. Fourteen cases in `test.sh` pin it,
+including the one that matters most — *a fix on top of a staged base is still owed
+review* — because invariance bought by dropping content from the fingerprint would
+pass every other test on the list.
+
+Modes needed two sources, and finding that out cost a real hole. `git diff HEAD
+--summary` reports a tracked file's `mode change`, but a **new** file's mode
+reaches it only as `create mode`, which appears only once the file is staged — so
+filtering to the index-invariant half left `chmod +x` on a new file invisible.
+Review a new script, make it executable, and the mode shipped unreviewed.
+`tree_snapshot` now carries an `x` flag on the hash field for executable files,
+which is index-blind because it comes from the filesystem. The flag rides on the
+hash field rather than becoming a third column so that every consumer's
+`${line#* }` still yields the path — the alternative was editing four call sites
+to widen a format they all parse by hand.
+
+With no `phase-policy.sh` there is no shared snapshot to hash, and the fallback is
+the old index-sensitive pair plus a warning on stderr. A gate that costs one extra
+round after a `git add` is a bill; a gate that quietly stopped firing is the whole
+guarantee. Duplicating `tree_snapshot` into the hook to avoid that would be the
+other kind of mistake — one copy of that logic, by design.
+
+#### The gate says what moved, so the model does not have to be believed
+
+Everything else in a follow-up message is the author's account of its own fixes.
+One part is not: the marker file now holds **the snapshot** rather than just its
+hash, so the next round can be diffed against the last one and the block message
+states the result as fact.
+
+```
+Changed since the last review round:
+  src/new.ts
+No longer differs from HEAD (reverted or committed):
+  src/old.ts
+```
+
+That is worth more than the token saving. It is a fact where the rest of the
+message is a claim — it does not depend on the author having staged in the right
+order, or having remembered every file they touched, and `adversary`'s brief is
+told to treat it as ground truth and to start at any gap between it and what the
+author described. The reverse direction is reported separately and deliberately: a
+path that went back to matching HEAD is not the same event as one that changed, but
+the reviewer's judgment of it is void either way.
+
+Comparison is exact-line, the same idiom the phase scan uses against its baseline,
+so a path whose snapshot line is byte-identical is not reported however the index
+has moved underneath it. Two details that were only obvious once written down: the
+*gone* direction has to compare paths rather than lines, or a changed file appears
+in both lists and the one part of the message claiming to be factual contains a
+lie; and a **clean tree deletes the marker**, because a round is only in flight
+while something is owed — otherwise the next task's first round reports the last
+task's committed work as reverted, which is true and useless. A marker written by
+an older version holds a bare hash: line 1 still answers *same diff?*, and the
+missing snapshot means one round reports no delta, exactly like any first round.
+
+What this does not do is verify the *session* was resumed. It verifies the paths.
+Those are different claims, and only one of them is now a fact.
+
+Both briefs carry a **Follow-up rounds** section holding the other half of the
+bargain: read `git diff` for what moved but judge it against `git diff HEAD`,
+because a fix that reads well in isolation is the same trap as a diff that reads
+well in isolation; re-read rather than answer from memory; account for every prior
+finding as closed / open / not re-checked; treat the fix as new code and look for
+what it broke; and — the anchoring rule — *do not accept a fix because it is the
+one you asked for*. They also say that closing everything and adding nothing is the
+expected shape of a working fix round, since without that a second verdict gets
+padded to match the length of the first, and that an unstaged tree means the
+convention is not in use — which they should say rather than guess which hunks are
+new.
+
+The evidence log gains one entry per round rather than one per review. **A finding
+the reviewer closed and a finding it never re-checked look identical in a log that
+only records the final verdict**, and only one of them is done.
+
+**Enforced: none of it.** The gate fingerprints diffs; it cannot see whether a
+subagent was spawned or resumed, and the `SubagentStop` log records agent type,
+not session identity. What the gate contributes is the block message, which asks
+for the resume in step 1 and hands over the follow-up wording. If a session
+handle is lost — after a compaction, most likely — the instruction is to spawn a
+fresh one and *say so in the log*, because a round that started cold cannot
+confirm that anything was closed.
 
 ### RED verification
 
@@ -418,9 +605,9 @@ reviewing twice costs twice.
 | --- | --- | --- | --- |
 | `phase-guard.sh` | `PreToolUse` | per tool call | *prevents* the wrong kind of work for the phase |
 | `review-gate.sh` — phase scan | `Stop` | per turn | *catches* phase violations the guard could not see |
-| `review-gate.sh` — review gate | `Stop` | per turn | blocks *ending a turn* on an unreviewed diff |
-| `adversary` | subagent | on delegation | judges the diff |
-| `spec-adversary` | subagent | Phase 2 exit, Phase 3 plan | judges the design before it is built |
+| `review-gate.sh` — review gate | `Stop` | per turn | blocks *ending a turn* on an unreviewed diff, and reports which paths moved since the last round |
+| `adversary` | subagent | on delegation, resumed per round | judges the diff |
+| `spec-adversary` | subagent | Phase 2 exit, Phase 3 plan, same session | judges the design before it is built |
 
 Write detection is deliberately split across two layers, because neither can do
 the job alone:
@@ -463,7 +650,10 @@ flowchart TD
     RG -->|"unreviewed diff"| BLOCK["BLOCK · exit 2<br/>stderr instructs Claude to delegate"]
     BLOCK --> ADV["adversary subagent<br/>separate context<br/>gets task intent only"]
     ADV --> V["VERDICT<br/>sound / findings / cannot-assess"]
-    V --> DONE
+    V -->|"blocker / serious"| FIX["fix the finding"]
+    FIX -->|"diff moved · review owed again"| RESUME["same session, resumed<br/>fixes are unstaged: git diff<br/>the case for them is not given"]
+    RESUME --> ADV
+    V -->|"sound · minor · cannot-assess"| DONE
 ```
 
 ### What the review gate ignores
@@ -505,6 +695,12 @@ than being work it should judge, and writing one would otherwise demand a review
 of having written it. Note that `.claude/` itself is *not* excluded — commit it
 at install, as above, so hook changes stay visible and reviewable.
 
+The fingerprint also ignores the **index**: `git add` and `git restore --staged`
+move no part of it, because it is built from file contents plus deletions and mode
+changes rather than from `git status` codes. That is what lets the workflow stage
+the work before the first review round without paying for a review of having run
+`git add` — see [The index is the bookmark](#the-index-is-the-bookmark).
+
 The loop guard is `stop_hook_active`: exactly one forced pass per user turn, so
 neither the scan nor the gate can spin. Fixes made in response to findings change
 the diff fingerprint and get reviewed on the *following* turn rather than
@@ -525,7 +721,14 @@ covered by a case in `test.sh`:
   cannot touch any phase state file by any means — including the RED receipt.
   The transitions it may make either restrict it or increase scrutiny.
 - **A turn cannot end on an unreviewed diff**, including one that exists only in
-  untracked files, and including a *fix* to an untracked file.
+  untracked files, and including a *fix* to an untracked file. Staging changes
+  nothing about that: `git add` moves no part of the fingerprint, and a fix on top
+  of a staged base is still owed review.
+- **Which paths moved between two review rounds is computed, not reported.** The
+  gate diffs the current snapshot against the one it recorded last round, so the
+  list handed to the reviewer does not depend on the model's memory of what it
+  edited or on its having staged in the right order. *Using* the list is
+  instructed; the list itself is a fact.
 - **Phase 3 cannot be left on passing tests.** `phase.sh red` runs the tests the
   phase changed and refuses if they pass; `phase.sh 4` is denied until that
   check has passed. Not a full verification of "failing for the right reason" —
@@ -557,11 +760,13 @@ Two limits worth stating plainly, since both look like enforcement and are not:
 **Instructed only** — everything in the SKILL.md bodies and the gate's block
 message: showing real failure output, saying why each failure is the *expected*
 one, **sending the spec and the plan to `spec-adversary` before asking for
-approval**, not priming either reviewer, not padding the evidence log, stopping on
-contradiction, honoring severity levels, leaving tests frozen in Phase 4, running
-the repo's own validations before leaving Phase 4, and asking about the pull
-request before closing out. These work most of the time and fail *silently* when
-they don't.
+approval**, not priming either reviewer, **resuming the same reviewer session for
+later rounds and starting both fresh at a slice boundary**, maintaining the
+staging convention and passing the gate's path delta on verbatim, not padding the
+evidence log, stopping on contradiction, honoring severity levels, leaving tests
+frozen in Phase 4, running the repo's own validations before leaving Phase 4, and
+asking about the pull request before closing out. These work most of the time and
+fail *silently* when they don't.
 
 The gate stops structural failures. It cannot stop a lazy Phase 1, a spec review
 that was never spawned, or a self-congratulatory Phase 5 log. For the spec review
@@ -577,13 +782,20 @@ you read it.
 
 Builds a throwaway git repo in a temp dir, installs the hooks into it, and drives
 them with synthetic hook payloads. Nothing touches the repo you run it from.
-150 cases: the phase policy, every write vector, the advance-transition matrix,
+251 cases: the phase policy, every write vector, the advance-transition matrix,
 RED verification and the receipt's staleness rules, fail-closed behavior, the
-review gate, and the phase scan with its baseline. A handful assert *text* rather
-than behavior — the two reviewers' briefs, the spawn framing in the block message,
-and the workflow's instruction to review the spec before asking. Those are the
-parts of this toolkit an edit can silently hollow out, since nothing executes
-them.
+review gate with its index-invariance and its between-rounds delta, the slice
+position and its boundary rules, and the phase scan with its baseline.
+
+A couple of dozen assert *text* rather than behavior — the two reviewers' briefs
+including their follow-up rules, the spawn framing and the resume instruction in
+the block message, the two session reminders in `phase.sh status`, and the
+workflow's instructions to review the spec before asking and to reuse the reviewer
+session. Those are the parts of this toolkit an edit can silently hollow out, since
+nothing executes them. The two briefs' follow-up sections are additionally compared
+*across hosts*, byte for byte, because per-host copies drift — and the line count
+is asserted before the comparison, because two *missing* sections compare equal and
+a diff of two empty streams is a green test. That mistake was made by hand first.
 
 Cases tagged `[#n]` pin a bug from the review below. Those are the ones that must
 never quietly come back.
@@ -651,6 +863,19 @@ confidence it hasn't earned.
   delegate now carry a fixed adversarial preamble, with the one-line intent
   dropped into it. Unprimed is about *withholding the author's reasoning*, not
   about withholding the reviewer's job.
+- **One reviewer session per subject, resumed across rounds, reset per slice.**
+  The unprimed-reviewer rule is about withholding the *author's reasoning*, not
+  about withholding the reviewer's own memory. A reviewer that cannot remember
+  what it found cannot tell you a fix closed it — it can only re-review the code
+  from scratch and report what it thinks now, which is the weaker claim and costs
+  a full re-read to get. Round two then drops the withholding — the reviewer
+  already holds the findings, so pointing at the fixes with `git diff` and naming
+  which ones were addressed costs no independence and saves the re-read. What keeps
+  it from decaying into agreement is that the list is *a claim to check*, that the
+  case for the fix goes to the user rather than to the reviewer, and the anchoring
+  rule in both briefs: *do not accept a fix because it is the one you asked for.*
+  See [One reviewer session per subject, per
+  slice](#one-reviewer-session-per-subject-per-slice).
 - **The spec is reviewed before the user is asked, not after.** Reversing those
   two spends the user's attention as the first filter, and once they have approved
   a spec, a later objection to it costs a retreat rather than an edit. The model
@@ -709,12 +934,25 @@ confidence it hasn't earned.
 
   A bare `opus` in a Cursor agent file does not resolve, and you get the
   inherited model with a frontmatter line claiming otherwise.
-- **Spec review cost.** `spec-adversary` runs twice per task — once on the spec,
-  once on the plan — against a document plus targeted reads, so it is far cheaper
-  than a diff review. If you want only one, drop the Phase 3 paragraph in
-  `spec-driven/SKILL.md` and keep the Phase 2 pass; the plan is the cheaper of the
-  two to get wrong. Dropping the Phase 2 pass instead defeats the point, since the
-  approval it feeds is the expensive one.
+- **Fresh reviewer per round.** Session reuse is instruction only — it lives in
+  the *Follow-up rounds* sections of both briefs, in step 1 of the block message,
+  and in `spec-driven`'s *The two reviewer sessions*. Delete those four and every
+  round spawns cold again, which buys back the unanchored second read and pays a
+  full re-read for it. The staging convention is worth keeping either way: a cold
+  reviewer told which hunks are new still reads the change faster than one that has
+  to infer it. Worth it only if you catch fixes being waved through; the
+  narrower version is to leave the default alone and spawn a fresh reviewer by
+  hand when a fix round has drifted far from the original change.
+- **Spec review cost.** `spec-adversary` runs at least twice per task — once on
+  the spec, once on the plan — against a document plus targeted reads, so it is
+  far cheaper than a diff review. Cheaper still since the second pass is the same
+  session: it has already read the spec and the code the spec makes claims about,
+  so the plan pass is a plan pass rather than another orientation. Resuming is not
+  free — each round re-sends the accumulated transcript — but a transcript is
+  smaller than the re-read it replaces. If you want only one pass, drop the Phase 3
+  paragraph in `spec-driven/SKILL.md` and keep the Phase 2 pass; the plan is the
+  cheaper of the two to get wrong. Dropping the Phase 2 pass instead defeats the
+  point, since the approval it feeds is the expensive one.
 - **Per-turn review during Execute.** Phase 4 currently suppresses the Stop gate.
   Drop the `4` from the `case` list in `review-gate.sh` for incremental review at
   incremental cost.
@@ -808,6 +1046,27 @@ confidence it hasn't earned.
   can skip the delegation and go straight to the 2→3 prompt, and the only signal
   is the missing verdict in the transcript. The prompt says to decline in that
   case, which is a reminder, not a gate.
+- **Nothing enforces session reuse, and a reused session is not visibly different
+  from a fresh one.** Both produce a verdict in the transcript; only the
+  per-finding `closed | open | not re-checked` lines the brief asks for tell you
+  which you got, and a model can write those from a cold read. The gate's path
+  delta narrows this but does not close it: it makes *where the fixes are* a fact
+  while leaving *who is judging them* a claim. The signal to watch for is a
+  second-round verdict that re-derives the whole diff, or that closes a finding
+  without saying what closed it.
+- **A resumed reviewer is anchored on its own findings, and round two hands it the
+  author's account of the fixes.** That is a deliberate trade — it is what makes
+  the round cheap — but it is the one place the unprimed rule is relaxed, and the
+  two things pushing back are instructions: *treat the list as a claim to check*
+  and *do not accept a fix because it is the one you asked for*. Neither is a
+  guarantee. The failure mode to expect is a fix waved through in round two rather
+  than a finding missed in round one, so a fix worth being careful about is worth
+  reading yourself.
+- **Trading a fresh read for a remembered one is a real trade.** A cold reviewer
+  occasionally finds something the anchored one has stopped seeing, because it is
+  no longer looking at that part of the diff. If the fix rounds have wandered a
+  long way from the original change, a deliberate fresh spawn is the cheap
+  correction — Tuning has the knob.
 - **`adversary` is not read-only.** Its frontmatter grants `Bash`, deliberately —
   the brief wants it to prove findings by running things rather than asserting
   them. "Do not modify any file" is an instruction, not a constraint. Drop `Bash`
@@ -865,6 +1124,11 @@ production code unlocked, diff reviewed, next slice. Both user approval prompts
 fire per lap, on fresh evidence each time, which is the entire point — five small
 approvals on five readable diffs rather than one on a diff nobody can hold in
 their head.
+
+Both reviewer sessions reset at each boundary, for the same reason the diffs are
+split in the first place — a reviewer carrying every previous slice has
+reassembled the large diff internally. See [One reviewer session per subject, per
+slice](#one-reviewer-session-per-subject-per-slice).
 
 ### Why 5 → 3 is denied today, and what makes it safe
 

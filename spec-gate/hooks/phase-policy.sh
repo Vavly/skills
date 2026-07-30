@@ -176,6 +176,19 @@ slice_total() {
 # fingerprint honest: `git status --porcelain` lists untracked file names but
 # never their contents, so rewriting a new file used to leave the fingerprint
 # unchanged and the fix shipped without a second review.
+#
+# Lines are "<content-hash>[x] <path>", the `x` marking an executable file. The
+# flag rides on the hash field rather than becoming a third column so that every
+# consumer's `${line#* }` still yields the path. It exists because a mode change
+# is a reviewable change with no content to hash: the review fingerprint carries
+# tracked-file mode changes from `git diff HEAD --summary`, but a *new* file's
+# mode appears there only once it is staged, and the fingerprint has to be blind
+# to staging. Without this flag, `chmod +x` on a new file was invisible.
+#
+# Changing this format invalidates the two things that compare snapshot lines
+# literally: an in-flight RED receipt goes stale once (re-run `phase.sh red`) and
+# a phase baseline written by an older version reads as "everything changed" until
+# the next phase transition re-snapshots it. Both self-heal; neither is silent.
 tree_snapshot() {
   files=$( { git diff HEAD --name-only
              git ls-files --others --exclude-standard
@@ -188,9 +201,26 @@ tree_snapshot() {
   done <<< "$files"
   [ -z "$existing" ] && return 0
 
-  # One hash-object process for the whole list, not one per file.
+  # One hash-object process for the whole list, not one per file. The exec flag
+  # is a shell builtin test, so it adds no process per file either.
   paste -d' ' <(printf '%s' "$existing" | git hash-object --stdin-paths 2>/dev/null) \
-              <(printf '%s' "$existing") 2>/dev/null
+              <(printf '%s' "$existing") 2>/dev/null \
+  | while IFS= read -r line; do
+      p=${line#* }
+      if [ -x "$p" ]; then printf '%sx %s\n' "${line%% *}" "$p"
+      else                 printf '%s\n' "$line"
+      fi
+    done
+}
+
+# The path out of a snapshot line, whatever kind of line it is: a hashed file, a
+# deletion, or a mode change. Used by the review gate to report which paths moved
+# between one review round and the next.
+snapshot_line_path() {
+  case "$1" in
+    "mode "*) printf '%s\n' "${1#mode * => * }" ;;
+    *)        printf '%s\n' "${1#* }" ;;
+  esac
 }
 
 # --- The RED receipt ---------------------------------------------------------

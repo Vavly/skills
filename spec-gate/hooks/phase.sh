@@ -211,6 +211,10 @@ case "${1:-status}" in
          echo "  -> next: 3 Plan + tests — Claude may ask you to approve it" ;;
       3) echo "  -> tests only; production code blocked"
          echo "  -> the plan goes to spec-adversary before the tests are written"
+         # Same reason as the line above it: status is the post-compaction re-read,
+         # and a lost session handle is exactly what compaction causes. Better a
+         # cold round declared than a warm one claimed.
+         echo "  -> reuse that session if you still hold it; if not, spawn fresh and say the round started cold"
          case "$(red_receipt_status)" in
            valid) echo "  -> RED verified — next: 4 Execute, Claude may ask you to approve it" ;;
            stale) echo "  -> RED receipt STALE: the tests changed since. Re-run '.claude/hooks/phase.sh red'" ;;
@@ -218,7 +222,8 @@ case "${1:-status}" in
          esac ;;
       4) echo "  -> normal permission flow; tests frozen; review gate suppressed"
          echo "  -> next: 5 Review — Claude may advance" ;;
-      5) echo "  -> delegate to the adversary subagent; review gate ARMED" ;;
+      5) echo "  -> delegate to the adversary subagent; review gate ARMED"
+         echo "  -> after a fix, go back to that same session; a new slice gets a new one" ;;
       *) echo "  -> state file is corrupt, and the gate is failing closed."
          echo "  -> recover with: .claude/hooks/phase.sh off" ;;
     esac

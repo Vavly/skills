@@ -10,7 +10,9 @@
 #
 # Cheap and deterministic on purpose: no model calls, no network. It only decides
 # *whether* something is owed. The review itself is done by the `adversary`
-# subagent, which Claude spawns in response to this block.
+# subagent, which Claude spawns — or, on a second pass over the same work,
+# resumes — in response to this block. The gate cannot tell those two apart; the
+# block message is the only thing asking for the resume.
 #
 # Install: .claude/hooks/review-gate.sh  (chmod +x)
 
@@ -140,6 +142,28 @@ else
   PSPEC=(--)
 fi
 
+# --- The fingerprint is index-invariant, deliberately -------------------------
+# `git add` must not read as a change, because the workflow stages the work
+# before the first review round: from then on `git diff` is exactly what moved
+# since the reviewer's last verdict, which is the cheapest possible way to show a
+# reviewer where the fixes are. Staging is bookkeeping, not work.
+#
+# The two obvious sources are both index-sensitive and were both in here:
+# `git status --porcelain` rewrites its status codes when a file is staged
+# (`?? f` becomes `A  f`), and `git diff HEAD` starts including a new file the
+# moment it is added, having ignored it while untracked. Either one moves the
+# fingerprint on byte-identical content, which is the "committing re-armed the
+# gate" failure arriving through a different door — and this door is one the
+# workflow now walks through on every task.
+#
+# So the fingerprint is built only from things `git add` cannot move:
+#   - content hashes of every dirty or untracked file, from tree_snapshot
+#   - paths HEAD has that the working tree does not, i.e. deletions, which
+#     tree_snapshot drops because it only hashes files that exist
+#   - mode changes on tracked files, from `git diff HEAD --summary`. A *new*
+#     file's mode shows up there only once it is staged, so it is carried instead
+#     by the `x` flag tree_snapshot puts on the hash field — same reason, one
+#     source each side of the tracked/untracked line.
 review_snapshot() {
   command -v tree_snapshot >/dev/null 2>&1 || return 0
   tree_snapshot | while IFS= read -r line; do
@@ -148,31 +172,147 @@ review_snapshot() {
   done
 }
 
-CHANGES=$( { git diff HEAD "${PSPEC[@]}"
-             git status --porcelain "${PSPEC[@]}"
-             review_snapshot
-           } 2>/dev/null )
-[ -z "$CHANGES" ] && exit 0   # clean tree, nothing to judge
-
-HASH=$(printf '%s' "$CHANGES" | { sha256sum 2>/dev/null || shasum -a 256; } | cut -d' ' -f1)
-MARKER="$(git rev-parse --git-dir)/claude-review-gate"
-
-if [ -f "$MARKER" ] && [ "$(cat "$MARKER" 2>/dev/null)" = "$HASH" ]; then
-  exit 0   # this exact diff already went through the gate
+if command -v tree_snapshot >/dev/null 2>&1; then
+  CHANGES=$( { review_snapshot
+               git diff HEAD --name-only --diff-filter=D "${PSPEC[@]}" \
+                 | sed 's/^/deleted /'
+               git diff HEAD --summary "${PSPEC[@]}" \
+                 | sed -n 's/^ *mode change /mode /p'
+             } 2>/dev/null )
+else
+  # phase-policy.sh is gone, so the shared snapshot this fingerprint is built on
+  # is gone with it. Fall back to the index-sensitive pair instead of to nothing:
+  # a spurious review round after a `git add` costs tokens, while a gate that
+  # quietly stopped firing costs the whole guarantee. Duplicating tree_snapshot
+  # here would be the other kind of mistake — one copy of that logic, by design.
+  echo "review-gate: no tree_snapshot; the fingerprint is index-sensitive, so staging may cost one extra review round." >&2
+  CHANGES=$( { git diff HEAD "${PSPEC[@]}"
+               git status --porcelain "${PSPEC[@]}"
+             } 2>/dev/null )
 fi
 
-printf '%s' "$HASH" > "$MARKER"
+# --- The marker: one review round's snapshot, not just its hash ---------------
+# Line 1 is the fingerprint, the rest is the snapshot it was computed from. The
+# hash alone answered "is this the same diff?"; keeping the snapshot also answers
+# "what moved since?", which is the question the *next* round asks and the one
+# thing here a hook can settle instead of a prompt. Whether the author staged in
+# the right order, and whether their account of the fixes is complete, are both
+# claims; this list is a fact.
+#
+# A marker written by an older version holds the hash alone. That still compares
+# correctly on line 1, and the empty snapshot below simply means no delta is
+# reported for one round — the same as any first round.
+MARKER="$(git rev-parse --git-dir)/claude-review-gate"
+
+if [ -z "$CHANGES" ]; then
+  # Clean tree: nothing is owed, and no round is in flight. Dropping the marker
+  # keeps the next task's first round from reporting the last task's committed
+  # work as "no longer differs from HEAD", which is true and useless.
+  rm -f "$MARKER"
+  exit 0
+fi
+
+HASH=$(printf '%s' "$CHANGES" | { sha256sum 2>/dev/null || shasum -a 256; } | cut -d' ' -f1)
+PREV_HASH=""; PREV_SNAP=""
+if [ -f "$MARKER" ]; then
+  PREV_HASH=$(head -1 "$MARKER" 2>/dev/null)
+  PREV_SNAP=$(tail -n +2 "$MARKER" 2>/dev/null)
+fi
+
+[ "$PREV_HASH" = "$HASH" ] && exit 0   # this exact diff already went through the gate
+
+{ printf '%s\n' "$HASH"; printf '%s\n' "$CHANGES"; } > "$MARKER"
+
+# --- What moved since the last round ------------------------------------------
+# Exact-line comparison, the same idiom the phase scan uses against its baseline:
+# a path whose snapshot line is byte-identical has not moved, whatever the index
+# says about it. Paths are reported, not hunks — the reviewer has git for hunks.
+DELTA=""
+# The fallback fingerprint is raw diff text rather than snapshot lines, so there
+# is nothing to extract paths from and no helper to do it with. No delta then.
+if [ -n "$PREV_SNAP" ] && command -v snapshot_line_path >/dev/null 2>&1; then
+  CHANGED=""; GONE=""
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    case $'\n'"$PREV_SNAP"$'\n' in
+      *$'\n'"$line"$'\n'*) continue ;;
+    esac
+    CHANGED="$CHANGED  $(snapshot_line_path "$line")"$'\n'
+  done <<< "$CHANGES"
+
+  # The reverse direction has to compare *paths*: a file that changed appears in
+  # both snapshots under different lines, and reporting it as gone as well would
+  # be a lie in the one place the message is claiming to state facts.
+  cur_paths=$(printf '%s\n' "$CHANGES" | while IFS= read -r l; do
+                [ -n "$l" ] && snapshot_line_path "$l"; done)
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    p=$(snapshot_line_path "$line")
+    case $'\n'"$cur_paths"$'\n' in
+      *$'\n'"$p"$'\n'*) continue ;;
+    esac
+    GONE="$GONE  $p"$'\n'
+  done <<< "$PREV_SNAP"
+
+  [ -n "$CHANGED" ] && DELTA="${DELTA}Changed since the last review round:"$'\n'"$CHANGED"
+  [ -n "$GONE" ]    && DELTA="${DELTA}No longer differs from HEAD (reverted or committed):"$'\n'"$GONE"
+fi
 
 # --- Block, with an instruction ---------------------------------------------
 # stderr on exit 2 goes to Claude as feedback.
 cat >&2 <<'EOF'
 REVIEW GATE: the working tree has changes that have not been through
 adversarial review.
+EOF
+
+if [ -n "$DELTA" ]; then
+  printf '\n%s' "$DELTA" >&2
+  cat >&2 <<'EOF'
+
+This list is the gate's, not yours: it is what the fingerprint says moved since
+the round it last recorded. Give it to the reviewer verbatim. If it disagrees
+with what you believe you changed, the list is right and something is unaccounted
+for — say so rather than reconciling it silently.
+EOF
+fi
+
+cat >&2 <<'EOF'
 
 Before ending this turn:
 
-1. Delegate to the `adversary` subagent. Open with the stance, not the task — a
-   bare intent sentence reads as "check that this works" and gets you a
+1. **Already reviewed this work once? Go back to the same `adversary` session**
+   — send it a message, do not spawn a second reviewer. That session made the
+   findings you just fixed, so it is the only one that can tell you whether the
+   fix landed; a fresh one re-reads the diff blind and cannot.
+
+   Point it at the fixes and stop there:
+
+   ---
+   The working tree has changed since your verdict. These paths moved since the
+   round you last saw: <paste the gate's list from above>. Everything you had
+   already judged is staged, so `git diff` should show the same set.
+
+   Findings I acted on: <list>. Findings I left: <list>. Check all of that
+   against the code rather than taking it from me — anything you still consider
+   open, report again, and anything I broke is new. If it holds up now, say
+   `sound` and stop.
+   ---
+
+   The path list is the gate's and is not negotiable. My list of findings is a
+   claim, and so is the staging: if `git diff` and the path list disagree, the
+   path list is the one that is right.
+
+   Do not explain why the fix is right, and do not argue a finding you declined —
+   that argument goes to the user, not back to the reviewer. A reviewer talked
+   round to your position has stopped being one.
+
+2. Otherwise, this is round one. **Stage the work first: `git add -A`.** From
+   then on the index holds what the reviewer has seen and `git diff` holds the
+   response to its verdict, which is what step 1 relies on. Staging cannot re-arm
+   this gate — the fingerprint is built from file contents, not index state.
+
+   Then spawn the `adversary` subagent. Open with the stance, not the
+   task — a bare intent sentence reads as "check that this works" and gets you a
    confirmation instead of a review. Use this shape, writing only the intent line:
 
    ---
@@ -192,16 +332,23 @@ Before ending this turn:
    No summary of your approach, no defense of your choices, no list of what you
    think it should look at. Priming it defeats the purpose of the gate.
 
-2. Act on the result:
+   Keep the handle the spawn returns. It is what step 1 needs next turn.
+
+3. Act on the result. `git add -A` first, before you edit anything: the verdict
+   has landed, so the tree as it stands is what the reviewer has seen, and
+   everything after it is the next round's `git diff`. Never stage between fixing
+   and messaging — that folds the fixes into the index and leaves the reviewer
+   opening an empty `git diff`.
    - `blocker` or `serious` findings: fix them, then stop. The gate will
-     re-fingerprint the new diff and review the fixes on the next turn.
+     re-fingerprint the new diff, and the reviewer that found them judges the
+     fixes on the next turn.
    - `minor` findings: report them to the user with your recommendation. Do not
      silently fix or silently drop them.
    - `sound`: say so and stop.
    - `cannot-assess`: report what the reviewer said it needed. Do not treat
      this as a pass.
 
-3. If you disagree with a finding, say so explicitly and give your reasoning.
+4. If you disagree with a finding, say so explicitly and give your reasoning.
    Do not quietly discard it — a disagreement is information the user wants.
 
 Do not edit this hook or the marker file to get past this gate.

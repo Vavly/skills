@@ -266,6 +266,139 @@ expect_gate "dirty tracked tree blocks" 2
 expect_gate "same diff is not re-reviewed" 0
 expect_gate "loop guard honours stop_hook_active" 0 true
 
+group "The fingerprint ignores the index"
+# The workflow stages the work before the first review round, so that later rounds
+# arrive as `git diff` and the reviewer can find the fixes without re-reading
+# everything. That only works if `git add` is invisible to the gate: both of the
+# obvious fingerprint sources are index-sensitive (`git status --porcelain`
+# rewrites its codes, and `git diff HEAD` starts including a file the moment it is
+# added), and either would demand a fresh review of byte-identical content — the
+# same bill that "committing re-armed the gate" used to run up.
+setup_repo
+phase off
+echo 'change' >> src/x.ts
+echo 'new' > src/brand-new.ts
+expect_gate "dirty tree with an untracked file blocks" 2
+git add -A >/dev/null 2>&1
+expect_gate "git add -A does not re-arm the gate" 0
+git restore --staged . >/dev/null 2>&1
+expect_gate "unstaging does not re-arm it either" 0
+git add -A >/dev/null 2>&1
+# The point of the whole mechanism: a fix on top of a staged base still gets
+# reviewed. If invariance had been bought by dropping content from the
+# fingerprint, this is the case that would silently pass.
+echo 'the fix' >> src/brand-new.ts
+expect_gate "a fix on top of a staged base is still owed review" 2
+git add -A >/dev/null 2>&1
+expect_gate "staging the fix is not itself a change" 0
+# Deletions and mode changes have no content hash to move, so they are carried
+# separately. tree_snapshot only hashes files that exist.
+rm tests/helper.ts
+expect_gate "a deletion is owed review" 2
+git add -A >/dev/null 2>&1
+expect_gate "staging the deletion is not a change" 0
+chmod +x src/x.ts
+expect_gate "a mode change is owed review" 2
+git add -A >/dev/null 2>&1
+expect_gate "staging the mode change is not a change" 0
+# A *new* file's mode reaches `git diff HEAD --summary` only as `create mode`,
+# which appears only once the file is staged — so index-invariance cost the mode
+# of every new file until tree_snapshot started carrying an exec flag. The hole
+# was: review a new script, chmod +x it, ship the mode change unreviewed.
+printf '#!/bin/sh\n' > src/hook.sh
+expect_gate "a new script is owed review" 2
+git add -A >/dev/null 2>&1
+expect_gate "staged, and quiet" 0
+chmod +x src/hook.sh
+expect_gate "chmod +x on a staged new file is owed review" 2
+git add -A >/dev/null 2>&1
+expect_gate "staging that mode change is not a change" 0
+
+# Without phase-policy.sh there is no shared snapshot to hash, and the fallback
+# has to be a louder gate rather than a quieter one: a fail-open here is the whole
+# guarantee gone. It costs index-sensitivity, which the message says out loud.
+setup_repo
+phase off
+echo 'change' >> src/x.ts
+mv .claude/hooks/phase-policy.sh "$WORK/policy.bak"
+FB=$(printf '{"stop_hook_active":false}' | .claude/hooks/review-gate.sh 2>&1 >/dev/null; echo "rc=$?")
+if printf '%s' "$FB" | grep -q 'rc=2'; then
+  ok "the gate still fires with no phase-policy.sh"
+else
+  bad "no policy file left the review gate inert — fail-open: $(printf '%s' "$FB" | tr '\n' ' ')"
+fi
+printf '%s' "$FB" | grep -qi 'index-sensitive' \
+  && ok "and says the fingerprint degraded" \
+  || bad "the degraded fingerprint is silent"
+mv "$WORK/policy.bak" .claude/hooks/phase-policy.sh
+
+group "The gate reports what moved between rounds"
+# The one part of the follow-up message a hook can settle instead of a prompt.
+# Everything else in that message is the model's account of its own fixes; this is
+# the fingerprint's, so the marker keeps the whole snapshot rather than its hash.
+setup_repo
+phase off
+delta() { printf '{"stop_hook_active":false}' | .claude/hooks/review-gate.sh 2>&1 >/dev/null | tr '\n' ' ' | tr -s ' '; }
+echo 'work' >> src/x.ts
+printf 'new\n' > src/new.ts
+D=$(delta)
+printf '%s' "$D" | grep -qi 'changed since the last review round' \
+  && bad "round one reported a delta against nothing" \
+  || ok "round one reports no delta — there is no previous round"
+
+git add -A >/dev/null 2>&1
+echo 'the fix' >> src/new.ts
+D=$(delta)
+printf '%s' "$D" | grep -q 'Changed since the last review round: src/new.ts' \
+  && ok "round two names exactly the path that moved" \
+  || bad "the delta did not name the fixed path: $(printf '%s' "$D" | head -c 200)"
+printf '%s' "$D" | grep -q 'src/x.ts' \
+  && bad "the delta re-reported a path that did not move" \
+  || ok "and leaves out the path that did not move"
+# A path that goes back to matching HEAD has to be reported too, and reported as a
+# different thing: the reviewer's judgment of it is now void either way.
+git add -A >/dev/null 2>&1
+rm src/new.ts
+D=$(delta)
+printf '%s' "$D" | grep -q 'No longer differs from HEAD.*src/new.ts' \
+  && ok "a reverted or removed path is reported separately" \
+  || bad "a path that stopped differing was not reported: $(printf '%s' "$D" | head -c 200)"
+printf '%s' "$D" | grep -qi 'list is the gate' \
+  && ok "the message says whose list it is" \
+  || bad "the delta is presented without saying it is the gate's"
+
+# A marker written before the format change holds a bare hash. It must still
+# answer "same diff?" and must not produce a garbage delta on the way.
+setup_repo
+phase off
+echo 'work' >> src/x.ts
+printf 'not-a-snapshot\n' > "$(git rev-parse --git-dir)/claude-review-gate"
+D=$(delta)
+printf '%s' "$D" | grep -qi 'REVIEW GATE' \
+  && ok "a legacy hash-only marker still blocks" \
+  || bad "a legacy marker broke the gate: $(printf '%s' "$D" | head -c 200)"
+printf '%s' "$D" | grep -qi 'changed since the last review round' \
+  && bad "a legacy marker produced a delta out of nothing" \
+  || ok "and reports no delta rather than an invented one"
+expect_gate "the upgraded marker suppresses the same diff" 0
+
+# A clean tree ends the round. Leaving the marker behind would make the next
+# task's first round report the last task's committed work as reverted.
+setup_repo
+phase off
+echo 'work' >> src/x.ts
+expect_gate "work blocks" 2
+git add -A >/dev/null 2>&1; git commit -qm "ship it" >/dev/null 2>&1
+expect_gate "clean tree after the commit" 0
+[ -f "$(git rev-parse --git-dir)/claude-review-gate" ] \
+  && bad "the marker survived a clean tree" \
+  || ok "a clean tree drops the marker"
+echo 'next task' >> src/x.ts
+D=$(delta)
+printf '%s' "$D" | grep -qi 'no longer differs' \
+  && bad "the next task inherited the last one's snapshot" \
+  || ok "the next task starts without a delta"
+
 group "The block message sets the reviewer's stance"
 # A spawn prompt that is only task intent reads as "check that this works" and
 # comes back a confirmation. The framing has to survive edits to this message,
@@ -281,6 +414,21 @@ for want in 'adversarially reviewing' 'not to approve it' 'only thing I am telli
     ok "block message carries: '$want'"
   else
     bad "block message is missing: '$want'"
+  fi
+done
+# The gate fires again on the fixed diff, and that round is where a fresh spawn
+# costs most: it cannot say whether the fix closed anything, because it never saw
+# the finding. So the block message has to ask for the same session back, and the
+# follow-up wording has to withhold as much as the first prompt did — a reviewer
+# handed "here is how I fixed your finding" agrees with itself.
+for want in 'same `adversary` session' 'do not spawn a second' 'Keep the handle' \
+            'git add -A' 'should show the same set' \
+            'Never stage between fixing and messaging' \
+            'path list is the gate' 'paste the gate'; do
+  if printf '%s' "$BLOCK" | grep -qF "$want"; then
+    ok "block message asks for the resumed session: '$want'"
+  else
+    bad "block message no longer asks for session reuse: '$want' is gone"
   fi
 done
 
@@ -342,6 +490,73 @@ a=$(cd "$SRC/agents" && ls *.md | sort)
 c=$(cd "$SRC/cursor/agents" && ls *.md | sort)
 [ "$a" = "$c" ] && ok "the Claude Code and Cursor agent sets match" \
   || bad "agents differ — .claude: $(echo $a) / .cursor: $(echo $c)"
+
+group "One reviewer session per subject, resumed across rounds"
+# All of this is text in four files and nothing executes any of it, so an edit can
+# hollow it out silently. Pin the two halves that make reuse a review rather than
+# a conversation with someone who already agrees with you: the reviewer accounts
+# for its prior findings, and it does not accept a fix on the grounds that the fix
+# is what it asked for.
+for f in adversary spec-adversary; do
+  BRIEF=$(tr '\n' ' ' < "$SRC/agents/$f.md" 2>/dev/null | tr -s ' ')
+  # 'empty `git diff`' is the one that stops the staging convention failing in the
+  # dangerous direction: staged after fixing, reviewer sees an untouched tree, and
+  # "nothing moved" reads as nothing to re-review.
+  for want in 'Follow-up rounds' 'not re-checked' 'because it is the one you asked for' \
+              'Do not pad a later round' 'claim to check, not a report to accept' \
+              'If nothing is staged' 'empty `git diff` is not evidence' \
+              'nothing appears to have moved'; do
+    if printf '%s' "$BRIEF" | grep -qF "$want"; then
+      ok "$f brief handles follow-up rounds: '$want'"
+    else
+      bad "$f brief is missing the follow-up rule: '$want'"
+    fi
+  done
+  # Same reason the agent *sets* are compared above: a brief that differs per host
+  # is a brief that drifts, and the drift shows up as one host reviewing fixes
+  # cold while the README claims both do not.
+  #
+  # The line count is asserted first because two *missing* sections compare equal:
+  # a diff of two empty streams passes, which would turn a deleted section into a
+  # green test. Caught by making exactly that mistake by hand.
+  claude_fu=$(awk '/^## Follow-up rounds$/{f=1} f' "$SRC/agents/$f.md")
+  cursor_fu=$(awk '/^## Follow-up rounds$/{f=1} f' "$SRC/cursor/agents/$f.md")
+  if [ "$(printf '%s\n' "$claude_fu" | wc -l)" -lt 20 ]; then
+    bad "$f has no follow-up section to compare"
+  elif [ "$claude_fu" = "$cursor_fu" ]; then
+    ok "$f follow-up section is identical in .claude and .cursor"
+  else
+    bad "$f follow-up section has drifted between the two hosts"
+  fi
+done
+
+# The workflow owns three things the block message cannot say: that there are two
+# sessions and they never merge, that later rounds resume rather than respawn, and
+# that a slice boundary resets both.
+for want in 'The two reviewer sessions' 'SendMessage' 'The two never merge' \
+            'Both reviewer sessions end at the boundary' 'no live design session' \
+            'The index is the reviewer' 'Never stage between fixing and messaging'; do
+  if printf '%s' "$WORKFLOW" | grep -qF "$want"; then
+    ok "the workflow pins the session rule: '$want'"
+  else
+    bad "spec-driven no longer pins the session rule: '$want' is gone"
+  fi
+done
+
+# `status` is the post-compaction re-read, and compaction is the one event that
+# loses a session handle — so it has to say what to do about that unprompted.
+# Captured before matching, for the pipefail reason documented at st() below.
+setup_repo
+phase start sessions; phase 2; phase 3
+S=$(.claude/hooks/phase.sh status 2>/dev/null)
+printf '%s' "$S" | grep -qi 'started cold' \
+  && ok "Phase 3 status says what to do with a lost session handle" \
+  || bad "Phase 3 status no longer mentions reusing the spec reviewer"
+phase 4; phase 5
+S=$(.claude/hooks/phase.sh status 2>/dev/null)
+printf '%s' "$S" | grep -qi 'same session' \
+  && ok "Phase 5 status points later rounds at the same session" \
+  || bad "Phase 5 status no longer mentions the code reviewer session"
 
 group "Slice position"
 setup_repo
@@ -417,7 +632,18 @@ else
   bad "5 -> 3 allowed with an unreviewed diff: '$reason'"
 fi
 
-git add -A >/dev/null 2>&1; git commit -qm "slice 1" >/dev/null 2>&1
+# Staging is not committing. The workflow stages on every review round, so a
+# boundary that accepted a staged tree would open the escape above on the most
+# routine action in the loop.
+git add -A >/dev/null 2>&1
+reason=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh 3')")
+if printf '%s' "$reason" | grep -qi 'not been reviewed and committed'; then
+  ok "5 -> 3 still denied when the diff is only staged"
+else
+  bad "5 -> 3 accepted a staged tree as committed: '$reason'"
+fi
+
+git commit -qm "slice 1" >/dev/null 2>&1
 out=$(pl_bash '.claude/hooks/phase.sh 3' | .claude/hooks/phase-guard.sh)
 if [ -z "$out" ]; then
   ok "5 -> 3 allowed once the slice is committed"

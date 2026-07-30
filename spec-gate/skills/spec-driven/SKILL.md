@@ -55,6 +55,92 @@ These hold in every phase:
   improvise a new design. Say what contradicts it and ask to return to Phase 2.
   Silent mid-execution redesign is the failure this workflow exists to prevent.
 
+## The two reviewer sessions
+
+Both reviewers are long-lived. You spawn each one **once** and every later round
+goes back to that same session with `SendMessage`, instead of spawning a second
+reviewer that has to start from nothing:
+
+| Session | Agent | Opened | Reused for |
+| --- | --- | --- | --- |
+| design | `spec-adversary` | Phase 2 on the spec — or Phase 3 on the plan, from slice 2 on | the Phase 3 plan, and every re-read after you change either |
+| code | `adversary` | Phase 5, on the diff | every re-review after you fix a finding |
+
+**The two never merge**, and neither crosses a slice boundary. A design reviewer
+that has read the diff stops judging the design; a code reviewer that has read
+the spec starts checking the code against the author's stated intent, which is
+the one thing this workflow withholds from it. Separate subjects, separate
+sessions.
+
+Keep the name or id each spawn returns — it is the only handle you have on the
+session. If you have lost it, most likely to a compaction, spawn a fresh one and
+record in the log that this round started cold: a reviewer that has forgotten its
+own findings cannot tell you whether a fix landed, and a verdict that quietly
+claims otherwise is worse than an honest re-read.
+
+**Why reuse.** The second round is where review usually goes wrong. A fresh
+reviewer re-reads everything blind, does not know that a line exists to close a
+finding it never saw, and so cannot say whether the fix worked — only what it
+thinks of the code now. The session that made the finding can.
+
+**The index is the reviewer's bookmark.** Round two has a problem round one does
+not: the reviewer has to find the fixes inside a diff it has already read. Git
+answers that for free, if you keep one invariant — **staged is what the reviewer
+has already judged, unstaged is what has moved since.**
+
+Which comes down to two `git add` calls:
+
+- **Before the first round**, stage the thing under review — `git add -A` at Phase
+  5, `git add docs/specs/<task>.md` at Phase 2. Nothing is unstaged yet, and the
+  reviewer judges `git diff HEAD` exactly as it always has.
+- **The moment a verdict lands**, stage again, *before* you touch anything in
+  response to it. Then everything you do next shows up as `git diff` and nothing
+  else does.
+
+**Never stage between fixing and messaging.** That is the one ordering that
+destroys the signal: it folds the fixes into the index, and the reviewer opens
+`git diff` on an empty tree — which looks exactly like *nothing changed since my
+verdict*. Both briefs are told to refuse a `sound` verdict reasoned that way, so
+the cost of getting the order wrong is a wasted round rather than a fix waved
+through, but it is still a wasted round.
+
+`git add -A` stages whatever else is dirty, which is the same set the review gate
+is already treating as the subject of review — not a widening of scope. If it
+picked up something you want out of the index, `git restore --staged <path>`.
+
+Staging is not a change. The review gate fingerprints file *contents*, not index
+state, so a `git add` on its own never re-arms it and never costs a review round.
+
+**What reuse costs.** A reviewer holding its own findings is inclined to accept a
+fix *because the fix is what it asked for*, and round two hands it your account of
+those fixes on top of that. Two rules push back, both in the reviewer's brief: the
+list you send is a claim to check rather than a report to accept, and a fix is
+judged as new code rather than as compliance with a request. Your half of it is to
+keep the argument out — so the follow-up message points at the change and stops:
+
+> The **&lt;spec | working tree&gt;** has changed since your verdict. Everything you
+> had already judged is staged, so `git diff` is exactly what moved.
+>
+> Findings I acted on: **&lt;list&gt;**. Findings I left: **&lt;list&gt;**. Check that
+> against the code rather than taking it from me — anything you still consider
+> open, report again, and anything I broke is new. If it holds up now, say
+> `sound` and stop.
+
+At Phase 5 the review gate has usually computed the same thing from its own
+fingerprint and printed it — *"Changed since the last review round: …"*. **Paste
+that list in verbatim and say it came from the gate.** It is the one part of the
+message that is a fact rather than a claim, it does not depend on your having
+staged in the right order, and if it disagrees with your own account of what you
+changed, it is right and something is unaccounted for. Say that rather than
+quietly reconciling the two.
+
+Naming which findings you touched is fine, and so is pointing at the diff: the
+reviewer already holds the findings, so there is no independent judgment left to
+protect, and making it hunt for your edits buys nothing. **What stays out is the
+argument.** No explanation of why the fix is right, no case for a finding you
+declined — that case goes to the user, in the evidence log, where they can weigh
+it. Telling the reviewer why you were right buys agreement, not a review.
+
 ## Phase 1 — Clarify
 
 Read the relevant code first. Ambiguity that the codebase already answers is
@@ -135,6 +221,14 @@ commitments](#standing-commitments), so stop and ask to return to Phase 2.
 written against it and code against those tests. Do this *before* you ask the
 user for anything.
 
+Stage the spec first — `git add docs/specs/<task>.md` — then delegate. From here
+on the staged copy is the version the reviewer has judged, so each revision you
+make is a `git diff` it can read instead of a document it has to re-scan. See
+[The two reviewer sessions](#the-two-reviewer-sessions).
+
+That spawn opens the design session. Keep its handle: Phase 3 sends the plan to
+this same reviewer rather than briefing a new one on the same spec twice.
+
 Same rule as Phase 5: **open with the stance, not the task.** The difference is
 what you are withholding. A spec *is* your reasoning written down, so the
 reviewer gets all of it; what you keep back is which parts you are unsure about
@@ -166,8 +260,10 @@ Then handle the verdict:
   spec if it changes an assumption. Never discard one quietly.
 - `cannot-assess` — report what it said it needed. It is not a pass.
 
-Re-run the reviewer only if the approach changed. A wording fix does not need a
-second pass, and a second pass you did not need trains you to skip the first.
+Re-read goes back to the same session, with the follow-up message from [The two
+reviewer sessions](#the-two-reviewer-sessions) — not a second spawn. Ask for one
+only if the approach changed. A wording fix does not need another pass, and a
+pass you did not need trains you to skip the one that mattered.
 
 **Exit:** the spec has been reviewed and the findings are handled, then the user
 approves it. The verdict, what you changed in response, and what you declined all
@@ -184,11 +280,20 @@ Two artifacts, in this order.
 The plan: ordered steps, each small enough to verify on its own, each naming
 the files it touches. Append it to the spec document.
 
-Then send it back to `spec-adversary` — the same preamble as Phase 2, with the
-scope narrowed to the new material:
+Then send it back to `spec-adversary` — **the session from Phase 2, by
+`SendMessage`**, not a new spawn. It has already read the spec and the code the
+spec makes claims about, so it starts on the plan instead of on the ground the
+plan stands on. It keeps the stance it was given; do not restate the preamble,
+and do not summarise the spec back to a reviewer that read it:
 
-> …judge the plan appended to `docs/specs/<task>.md` against the spec above it.
-> The spec is approved; the plan is not.
+> The spec you reviewed is approved as it stands, and I have appended a plan to
+> it. Judge the plan against the spec above it: the spec is settled, the plan is
+> not.
+
+**On slice 2 and after there is no live design session** — Phase 2 ran once, and
+each slice closes its reviewers behind it. Spawn a fresh `spec-adversary` with the
+full Phase 2 preamble, scoped to this slice's plan steps, and say which slice it
+is judging. It has to read the approved spec itself; it was not there.
 
 **Before the tests, not after.** Tests written against a plan that then gets
 restructured are paid for twice, once in writing them and once in unpicking them.
@@ -306,11 +411,28 @@ That closing sentence is not softening the brief — it is load-bearing. Push a
 reviewer to be adversarial without it and you get manufactured findings, which
 cost you the same reading time and train you to skim the real ones.
 
-Then handle findings:
+**Run `git add -A` before you send it.** That is what makes round two legible:
+from then on the index holds what the reviewer has seen and `git diff` holds the
+fixes. It is bookkeeping, not a commit, and it cannot re-arm the review gate — the
+fingerprint is built from file contents, not from index state.
 
-- `blocker` / `serious` — fix, then note that the fix itself is unreviewed.
+That spawn opens the code session for this slice, and **every round after the
+first goes back to it** with the follow-up message from [The two reviewer
+sessions](#the-two-reviewer-sessions) — including the rounds the review gate asks
+for, since fixing a finding changes the diff and a changed diff is owed review
+again. Spawning a second reviewer for round two discards the only context in the
+system that knows what round one found.
+
+Then handle findings — starting with `git add -A`, before you edit anything. The
+verdict has landed, so the tree as it stands is now *what the reviewer has seen*,
+and everything you do next is the next round's `git diff`:
+
+- `blocker` / `serious` — fix, then note that the fix itself is unreviewed until
+  the next round closes it. The reviewer that found it is the one that says so.
 - `minor` — report with your recommendation. Do not silently fix or drop.
-- Disagree with a finding? Say so with reasoning. Never discard quietly.
+- Disagree with a finding? Say so with reasoning, **to the user**. Never discard
+  quietly, and never take the argument back to the reviewer — a reviewer talked
+  round to your position has stopped being one.
 
 Complexity and performance: only problems that bite at the scale established
 in Phase 1. If Phase 1 recorded no scale, you may not make complexity claims —
@@ -320,6 +442,11 @@ Close with an evidence log: what the reviewer found, what you changed, what you
 declined and why. **"Reviewer found nothing, no changes made" is a complete and
 unremarkable entry.** Do not pad it. A log that always shows improvements is
 a log that trains the reader to skim.
+
+One entry per round, so the sequence is visible: what it found, what you changed,
+what it said about that change. The last round's verdict is not a summary of the
+review — **a finding the reviewer closed and a finding it never re-checked look
+identical in a log that only records the end**, and only one of them is done.
 
 ### If the task is sliced, this is a boundary, not the end
 
@@ -336,6 +463,19 @@ do not look for another way forward.
 Then Phase 3 again: the next slice's plan steps, its failing tests, its own RED
 check, its own `3 → 4` approval. The user re-approves every lap, on that lap's
 evidence.
+
+**Both reviewer sessions end at the boundary too.** The next slice spawns its
+own, cold, and that is the point rather than an oversight: a code reviewer still
+holding the last slice's diff re-reports work that is already committed and
+reviewed, and grades this diff on credit the previous one earned. By slice five
+it would be carrying five diffs — which is the exact condition slicing exists to
+avoid, reassembled inside the reviewer.
+
+It also keeps `adversary` ignorant of the slice structure, which it should be.
+Tell it "this is slice 2 of 5" and it starts excusing a gap as *coming later*;
+refusing to grant that is most of what it is for. `spec-adversary` is the
+opposite case — it judges plans, and *"slice 2 needs the types slice 3
+introduces"* is only findable by a reviewer that can see the ordering.
 
 Only when the last slice is reviewed does the close-out below apply.
 
