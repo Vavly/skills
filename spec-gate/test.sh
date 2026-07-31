@@ -399,31 +399,41 @@ printf '%s' "$D" | grep -qi 'no longer differs' \
   && bad "the next task inherited the last one's snapshot" \
   || ok "the next task starts without a delta"
 
-group "The block message sets the reviewer's stance"
-# A spawn prompt that is only task intent reads as "check that this works" and
-# comes back a confirmation. The framing has to survive edits to this message,
-# and so does the counterweight that stops it manufacturing findings.
+group "The block message drives the caller, not the reviewer"
+# The split: the reviewer loads its own procedure from the skill, so the spawn text
+# here is a pointer. What stays is everything a read-only subagent cannot do —
+# validate, stage, spawn, act — plus the two facts only the gate holds.
 setup_repo
 phase off
 echo 'change' >> src/x.ts
 # Flattened: the phrases wrap across lines in the heredoc, so a line-oriented
 # grep would pin the line breaks rather than the wording.
 BLOCK=$(printf '{"stop_hook_active":false}' | .claude/hooks/review-gate.sh 2>&1 >/dev/null | tr '\n' ' ' | tr -s ' ')
-for want in 'adversarially reviewing' 'not to approve it' 'only thing I am telling you' 'normal outcome'; do
+# The spawn is a pointer. 'a pointer, not a briefing' is the rule that stops this
+# message regrowing a second copy of the reviewer's brief, which is what it was.
+for want in 'Use the `adversarial-review` skill and follow it' 'a pointer, not a briefing' \
+            'no restating the skill' 'only thing I am telling you'; do
   if printf '%s' "$BLOCK" | grep -qF "$want"; then
-    ok "block message carries: '$want'"
+    ok "block message spawns with a pointer: '$want'"
   else
-    bad "block message is missing: '$want'"
+    bad "block message no longer spawns with a pointer: '$want' is gone"
+  fi
+done
+# Validate before the spawn, and stage before the reviewer sees anything. Both are
+# caller-only: the reviewer cannot fix a red suite and must not touch the index.
+for want in 'get it green' 'do not invent a list' 'VALIDATION REPORT' 'git add -A'; do
+  if printf '%s' "$BLOCK" | grep -qF "$want"; then
+    ok "block message runs validations before spawning: '$want'"
+  else
+    bad "block message dropped the pre-spawn work: '$want' is gone"
   fi
 done
 # The gate fires again on the fixed diff, and that round is where a fresh spawn
 # costs most: it cannot say whether the fix closed anything, because it never saw
 # the finding. So the block message has to ask for the same session back, and the
-# follow-up wording has to withhold as much as the first prompt did — a reviewer
-# handed "here is how I fixed your finding" agrees with itself.
+# follow-up wording has to withhold as much as the first prompt did.
 for want in 'same `adversary` session' 'do not spawn a second' 'Keep the handle' \
-            'git add -A' 'should show the same set' \
-            'Never stage between fixing and messaging' \
+            'should show the same set' 'Never stage between fixing and messaging' \
             'path list is the gate' 'paste the gate'; do
   if printf '%s' "$BLOCK" | grep -qF "$want"; then
     ok "block message asks for the resumed session: '$want'"
@@ -431,6 +441,379 @@ for want in 'same `adversary` session' 'do not spawn a second' 'Keep the handle'
     bad "block message no longer asks for session reuse: '$want' is gone"
   fi
 done
+
+group "The validation report's field labels are one contract, not three"
+# The skill tells the reviewer to read the `Not covered` line *by name*, and calls
+# it the most useful thing it is told all round. Two separate producers have to
+# emit that label: Phase 4 writes the report for the workflow path, and the block
+# message instructs it for the no-workflow path the review gate exists to cover.
+#
+# The bug this replaces: the hook described the field ("what this repo checks
+# nothing about") without ever naming it, so on the gate path the reviewer looked
+# for a label nobody had written. Both sides were pinned — but to *different*
+# strings, in two independent assertions, so both stayed green while they
+# disagreed. Same shape as the tools:/body contradiction, between two prose files.
+#
+# So this asserts the label itself across the consumer and every producer, and any
+# new producer has to be added here. One contract, one test.
+# Producers are checked for the label as an EMITTED FIELD — 'Not covered:', with
+# the colon, as it appears in the report template. Not for the bare words anywhere
+# in the file: both producers also discuss the field in prose ("`Not covered` is
+# the one you will be tempted to leave blank"), so a file-wide grep for the words
+# passes with the template field deleted. Confirmed by deleting it — 314/314 green.
+# The consumer is the mirror image: it never emits the report, it refers to the
+# label, so there the backticked prose form is the correct thing to pin.
+setup_repo
+if grep -qF '`Not covered`' "$SRC/skills/adversarial-review/SKILL.md"; then
+  ok "the consumer reads 'Not covered' by name"
+else
+  bad "the skill no longer names 'Not covered' — producers are labelling for nobody"
+fi
+for p in skills/spec-driven/SKILL.md hooks/review-gate.sh; do
+  if grep -qE '^ *Not covered:' "$SRC/$p"; then
+    ok "$p emits a 'Not covered:' field"
+  else
+    bad "$p describes the field without labelling it — the reviewer looks up by name"
+  fi
+done
+# The other three labels travel with it: a report the reviewer can parse at all
+# needs the same field names from both producers, in template position.
+for lbl in 'VALIDATION REPORT' 'Commands:' 'Source:' 'Result:'; do
+  if grep -qE "^ *$lbl" "$SRC/skills/spec-driven/SKILL.md" \
+     && grep -qE "^ *$lbl" "$SRC/hooks/review-gate.sh"; then
+    ok "both producers emit '$lbl'"
+  else
+    bad "'$lbl' is not emitted by both producers — the two report shapes diverge"
+  fi
+done
+
+group "The adversarial-review skill holds the reviewer's procedure"
+# One copy, loaded by the subagent itself. These are the phrases that make it a
+# review rather than a confirmation; every caller reaches them through the skill,
+# so losing them here loses them everywhere at once.
+setup_repo
+[ -f .claude/skills/adversarial-review/SKILL.md ] \
+  && ok "adversarial-review skill is installed" \
+  || bad "no .claude/skills/adversarial-review/SKILL.md — the agent points at nothing"
+REVIEW=$(tr '\n' ' ' < .claude/skills/adversarial-review/SKILL.md 2>/dev/null | tr -s ' ')
+for want in 'adversarial reviewer' 'find the reason it is wrong' \
+            'no reasoning from the author' 'Do not manufacture findings' \
+            'say so in one line'; do
+  if printf '%s' "$REVIEW" | grep -qF "$want"; then
+    ok "skill carries the stance: '$want'"
+  else
+    bad "skill is missing the stance: '$want'"
+  fi
+done
+for want in 'Follow-up rounds' 'not re-checked' 'because it is the one you asked for' \
+            'Do not pad a later round' 'claim to check, not a report to accept' \
+            'If nothing is staged' 'empty `git diff` is not evidence' \
+            'nothing appears to have moved'; do
+  if printf '%s' "$REVIEW" | grep -qF "$want"; then
+    ok "skill handles follow-up rounds: '$want'"
+  else
+    bad "skill is missing the follow-up rule: '$want'"
+  fi
+done
+# A clean tree does not mean nothing to review — it means the work is committed.
+# Hardcoding 'main' diffs against a ref that may not exist, and an empty diff
+# reads exactly like a change with nothing wrong in it.
+for want in 'merge-base' 'symbolic-ref' 'indistinguishable from a change with nothing wrong' \
+            'branch mode'; do
+  if printf '%s' "$REVIEW" | grep -qF "$want"; then
+    ok "skill resolves a clean tree to the branch: '$want'"
+  else
+    bad "skill cannot review a committed branch: '$want' is gone"
+  fi
+done
+# The reviewer stops paying for a suite the caller already ran — but only if the
+# procedure says so, and only if it still allows a targeted run to prove a finding.
+for want in 'Do not re-run the suite' 'Not covered' \
+            'prove a specific finding is still right' 'report is a claim'; do
+  if printf '%s' "$REVIEW" | grep -qF "$want"; then
+    ok "skill uses the validation report: '$want'"
+  else
+    bad "skill is missing the report rule: '$want'"
+  fi
+done
+# A green suite is the best cover a weakened test has: both the suite and the
+# report say 'pass'. With the reviewer no longer running tests, this is the one
+# regression the split could have introduced.
+if printf '%s' "$REVIEW" | grep -qF 'weakened to'; then
+  ok "skill treats a loosened test as a blocker"
+else
+  bad "skill no longer catches a test loosened to make a fix pass"
+fi
+
+group "The adversary agent can actually reach the skill it points at"
+# The failure this group exists for shipped once and every prose test passed over
+# it: the body said "invoke the adversarial-review skill" while `tools:` was an
+# exact allowlist that excluded Skill and no `skills:` field was set, so the
+# reviewer was told to load something it had no way to load.
+#
+# Claude Code's agent schema, verbatim from the binary:
+#   tools  — "Array of allowed tool names. If omitted, inherits all tools from
+#            parent. Note: passing 'Skill' here is deprecated — use the skills
+#            field instead."
+#   skills — "Array of skill names to preload into the agent context"
+#
+# So this asserts frontmatter, not prose. Prose is what lied last time.
+setup_repo
+for f in agents/adversary.md cursor/agents/adversary.md; do
+  FM=$(awk 'NR>1 && /^---$/{exit} NR>1{print}' "$SRC/$f")
+  if printf '%s' "$FM" | grep -qE '^skills:.*adversarial-review'; then
+    ok "$f preloads the skill via skills:"
+  else
+    bad "$f has no 'skills: adversarial-review' — the pointer in its body cannot resolve"
+  fi
+  # Preloading, not tool-granting. `Skill` in tools: is documented as deprecated,
+  # and it only makes the skill *reachable* by a reviewer that remembers to fetch
+  # it; skills: puts the procedure in context whether it remembers or not.
+  if printf '%s' "$FM" | grep -qE '^tools:.*\bSkill\b'; then
+    bad "$f grants the deprecated Skill tool instead of preloading via skills:"
+  else
+    ok "$f does not rely on the deprecated Skill tool"
+  fi
+done
+# The name in skills: has to match the directory the skill installs to, or it
+# preloads nothing and fails exactly as silently as having no field at all.
+SKILL_NAME=$(sed -n 's/^name: *//p' "$SRC/skills/adversarial-review/SKILL.md" | head -1)
+if [ "$SKILL_NAME" = "adversarial-review" ] && [ -d "$SRC/skills/adversarial-review" ]; then
+  ok "the skill's name matches what the agents preload"
+else
+  bad "skill name '$SKILL_NAME' does not match the agents' 'adversarial-review'"
+fi
+# A reviewer that cannot load its procedure must not improvise, and must not
+# return nothing either — cannot-assess is already defined as 'not a pass', so it
+# is the one verdict that fails safe.
+for f in agents/adversary.md cursor/agents/adversary.md; do
+  if grep -qF 'cannot load the skill, return `cannot-assess`' "$SRC/$f"; then
+    ok "$f fails safe when the skill is unreachable"
+  else
+    bad "$f does not say what to do when the skill cannot be loaded"
+  fi
+done
+
+group "Branch mode resolves a trunk that exists, or refuses"
+# `git merge-base HEAD main` in a master-trunk repo fails, leaves BASE empty, and
+# turns `git diff "$BASE"..HEAD` into HEAD..HEAD — exit 0, no output. The reviewer
+# reads nothing and reports sound. Every candidate has to be verified to exist.
+setup_repo
+RES=$(tr '\n' ' ' < .claude/skills/adversarial-review/SKILL.md | tr -s ' ')
+for want in 'rev-parse --verify' 'origin/main origin/master origin/develop' \
+            'no trunk resolved' 'is not in the list'; do
+  if printf '%s' "$RES" | grep -qF "$want"; then
+    ok "trunk resolution is verified: '$want'"
+  else
+    bad "trunk resolution lost its guard: '$want' is gone"
+  fi
+done
+# init.defaultBranch describes repo *creation*, not this repo's trunk. It agrees
+# often enough to look correct, which is what made it survive review the first time.
+if printf '%s' "$RES" | grep -qF 'init.defaultBranch}'; then
+  bad "trunk resolution still falls back to init.defaultBranch"
+else
+  ok "trunk resolution does not trust init.defaultBranch"
+fi
+# Live check of the documented loop against the case that used to fail silently:
+# master trunk, no remote. Extracted from the skill so the test cannot pass while
+# the documented snippet rots.
+BR="$WORK/branchmode"; rm -rf "$BR"; mkdir -p "$BR"; cd "$BR"
+git init -q -b master . && git config user.email t@e.com && git config user.name t
+echo a > f.ts && git add -A && git commit -qm i
+git checkout -q -b feature && echo b >> f.ts && git commit -qam work
+sed -n '/^TRUNK=""; BASE=""; STOP=""/,/^```$/p' "$SRC/skills/adversarial-review/SKILL.md" \
+  | sed '/^```$/d' > snip.sh
+if [ ! -s snip.sh ]; then
+  bad "could not extract the trunk-resolution snippet from the skill"
+else
+  # The block now ends in `git diff`, so its output has to go somewhere other than
+  # the capture that is reading the resolved variables out of it.
+  OUT=$(bash -c '. ./snip.sh >/dev/null 2>&1; echo "$TRUNK|$BASE"')
+  T=${OUT%%|*}; BS=${OUT##*|}
+  if [ "$T" = "master" ] && [ -n "$BS" ]; then
+    ok "the documented snippet resolves a master trunk with no remote"
+  else
+    bad "the documented snippet fails on a master trunk (trunk='$T' base='$BS')"
+  fi
+  # Not $N — that is the suite's colour-reset escape, and shadowing it prints
+  # "FAIL1" instead of a reset. Same class of bug as $B; hence both comments.
+  NFILES=$(git diff --name-only "$BS"..HEAD 2>/dev/null | wc -l | tr -d ' ')
+  [ "$NFILES" = "1" ] && ok "and produces a non-empty diff (1 file)" \
+    || bad "and produces an empty diff — the silent-sound failure is back"
+fi
+
+# The two ways this block used to produce an empty diff while looking fine. Both
+# are executed, and — this is the part the first version of these tests got wrong —
+# both assert that `git diff` **never ran**, not that it printed nothing.
+#
+# Why the distinction is the whole test: in these fixtures the unguarded diff is
+# `git diff ..HEAD`, which git reads as HEAD..HEAD and which prints nothing. The
+# emptiness *is* the bug. So an output-based check ("no ^diff --git lines") passes
+# identically on the guarded and unguarded block, and can never fire in the one
+# fixture it exists to guard. Verified by reintroducing the bug: both output
+# assertions still passed, 306/306 green.
+#
+# `bash -x` traces commands as they execute regardless of what they emit, which is
+# the property actually being asserted. Same reintroduction makes it fail.
+ran_diff() {  # $1 = fixture dir, echoes the number of times `git diff` executed
+  ( cd "$1" && bash -x "$WORK/branchmode/snip.sh" 2>&1 >/dev/null \
+      | grep -c "^+* git diff" )
+}
+
+# (A) no trunk among the candidates. The guard must suppress the diff, not merely
+#     print next to it. This is the case the output-based assertion could not see.
+rm -rf notrunk && mkdir notrunk && cd notrunk
+git init -q -b wip . && git config user.email t@e.com && git config user.name t
+echo x > f.ts && git add -A && git commit -qm i
+OUT=$(bash ../snip.sh 2>&1)
+if printf '%s' "$OUT" | grep -q '^STOP:'; then
+  ok "no trunk: the block refuses"
+else
+  bad "no trunk: the block did not print STOP (got: $(printf '%s' "$OUT" | head -1))"
+fi
+cd "$WORK/branchmode"
+T=$(ran_diff notrunk)
+if [ "$T" = "0" ]; then
+  ok "no trunk: and git diff never executes"
+else
+  bad "no trunk: it warned and ran git diff anyway ($T call(s)) — the guard does not guard"
+fi
+
+# (B) HEAD *is* the trunk. merge-base returns HEAD, so BASE is non-empty and every
+#     guard passes — quieter than (A), which printed at least a warning. This is
+#     the likely one: commit to main, then ask for a review.
+rm -rf ontrunk && mkdir ontrunk && cd ontrunk
+git init -q -b main . && git config user.email t@e.com && git config user.name t
+echo x > f.ts && git add -A && git commit -qm i && echo y >> f.ts && git commit -qam two
+OUT=$(bash ../snip.sh 2>&1)
+if printf '%s' "$OUT" | grep -q 'no branch to review'; then
+  ok "HEAD is the trunk: the block says so"
+else
+  bad "HEAD is the trunk: silently resolved to an empty diff (got: $(printf '%s' "$OUT" | head -1))"
+fi
+cd "$WORK/branchmode"
+T=$(ran_diff ontrunk)
+if [ "$T" = "0" ]; then
+  ok "HEAD is the trunk: and git diff never executes"
+else
+  bad "HEAD is the trunk: git diff ran on an empty range ($T call(s))"
+fi
+cd "$WORK"
+
+group "The README does not claim a rule lives where it does not"
+# The change that moved the code reviewer's procedure into the skill left every
+# README sentence saying "both briefs" pointing at agents/adversary.md, which no
+# longer holds any of them. Same defect the split exists to fix — one copy drifting
+# from another, silently — relocated into the doc layer, where nothing looked.
+#
+# So: for each rule, find which file really holds it, then assert the README does
+# not attribute it to a file that doesn't. This is the only test that reads the
+# README, which is why the drift survived a green suite.
+setup_repo
+RM=$(tr '\n' ' ' < "$SRC/README.md" | tr -s ' ')
+holds() { grep -qF "$2" "$SRC/$1"; }
+# 'both briefs' is banned outright: there are no longer two briefs holding the
+# reviewer rules — there is one brief (spec-adversary) and one skill.
+if printf '%s' "$RM" | grep -qiF 'both briefs'; then
+  bad "README still says 'both briefs' — the code reviewer's rules are in the skill"
+else
+  ok "README does not say 'both briefs'"
+fi
+# The rules that moved: present in the skill, absent from the agent. If one ever
+# reappears in the agent, the split has regressed and the README wording is wrong
+# in the other direction.
+for r in 'claim to check, not a report to accept' \
+         'empty `git diff` is not evidence' \
+         'because it is the one you asked for'; do
+  if holds skills/adversarial-review/SKILL.md "$r" && ! holds agents/adversary.md "$r"; then
+    ok "'$r' lives in the skill, not the agent"
+  else
+    bad "'$r' is not where the README says — check both files"
+  fi
+done
+# The loosened-test rule is the compensating control for this change's own cost,
+# and it exists in exactly one place. The README used to claim two. If it is ever
+# claimed to be in spec-adversary, that is false — a spec review has no test hunks.
+if holds skills/adversarial-review/SKILL.md 'weakened to' \
+   && ! holds agents/spec-adversary.md 'weakened to'; then
+  ok "the loosened-test control is in the skill alone"
+else
+  bad "the loosened-test control moved or spread — the README describes one location"
+fi
+if printf '%s' "$RM" | grep -qF 'one paragraph in `skills/adversarial-review/SKILL.md`'; then
+  ok "README points at the single file that holds it"
+else
+  bad "README no longer names where the loosened-test control actually lives"
+fi
+# Tuning recipes have to stay executable. 'Copy adversary.md, narrow the prompt'
+# became a no-op the moment the prompt left that file.
+if printf '%s' "$RM" | grep -qF 'Copy `adversary.md`, narrow the prompt'; then
+  bad "Tuning still says to copy adversary.md — there is no prompt left in it"
+else
+  ok "the second-reviewer recipe does not copy an empty pointer"
+fi
+
+group "Branch mode records its own starting point"
+# The reviewer was told the author supplies 'the tip they last showed you'. No
+# caller ever does: the gate and Phase 5 are working-tree-only, and the standalone
+# path's caller is a person. A contract only one side can sign fails every round.
+setup_repo
+BR=$(tr '\n' ' ' < .claude/skills/adversarial-review/SKILL.md | tr -s ' ')
+for want in 'REVIEWED:' 'read it out of your own last verdict' \
+            'no caller in this system supplies a tip'; do
+  if printf '%s' "$BR" | grep -qF "$want"; then
+    ok "branch mode is self-sufficient: '$want'"
+  else
+    bad "branch mode still depends on a tip nobody sends: '$want' is gone"
+  fi
+done
+
+group "The adversary agent is a pointer to the skill, identically on both hosts"
+# The agent file carries what a spawn config must — name, tools, the independence
+# stance — and defers the procedure. If it starts re-stating the procedure, the
+# two copies drift and the drift is silent.
+setup_repo
+for f in agents/adversary.md cursor/agents/adversary.md; do
+  # Not $B — that is the suite's blue escape, and shadowing it makes every later
+  # group() header print this file instead of a colour.
+  AB=$(tr '\n' ' ' < "$SRC/$f" 2>/dev/null | tr -s ' ')
+  for want in 'Invoke the `adversarial-review` skill and follow it' \
+              'no reasoning from the author' \
+              'Do not modify the files under review' \
+              'the spawn is a pointer'; do
+    if printf '%s' "$AB" | grep -qF "$want"; then
+      ok "$f points at the skill: '$want'"
+    else
+      bad "$f is missing the pointer rule: '$want'"
+    fi
+  done
+  # Thin means thin. A file that regrows the attack checklist is the second copy
+  # this split exists to delete, and nothing else would notice.
+  #
+  # Count the BODY, not the file. The thing being protected is "the procedure has
+  # not come back", and frontmatter comments are not procedure — the total-line
+  # version of this sat two lines from failing on a comment-only edit, which would
+  # have been a false statement about what changed. `tr -d ' '` because BSD wc pads
+  # its output and the message would otherwise read "(      61 lines)".
+  nbody=$(sed -n '/^You are an adversarial reviewer\./,$p' "$SRC/$f" | wc -l | tr -d ' ')
+  if [ "$nbody" -lt 45 ]; then
+    ok "$f body is still a pointer ($nbody lines)"
+  else
+    bad "$f body has regrown into a second brief ($nbody lines, procedure belongs in the skill)"
+  fi
+done
+# Same reason the agent sets are compared elsewhere: a brief that differs per host
+# is a brief that drifts. The bodies are identical; only frontmatter may differ.
+claude_body=$(sed -n '/^You are an adversarial reviewer\./,$p' "$SRC/agents/adversary.md")
+cursor_body=$(sed -n '/^You are an adversarial reviewer\./,$p' "$SRC/cursor/agents/adversary.md")
+if [ "$(printf '%s\n' "$claude_body" | wc -l)" -lt 10 ]; then
+  bad "adversary has no body to compare"
+elif [ "$claude_body" = "$cursor_body" ]; then
+  ok "adversary body is identical in .claude and .cursor"
+else
+  bad "adversary body has drifted between the two hosts"
+fi
 
 group "The spec is reviewed before the 2 -> 3 prompt"
 # The spec review is instructed, not enforced, so everything load-bearing about it
@@ -497,7 +880,11 @@ group "One reviewer session per subject, resumed across rounds"
 # a conversation with someone who already agrees with you: the reviewer accounts
 # for its prior findings, and it does not accept a fix on the grounds that the fix
 # is what it asked for.
-for f in adversary spec-adversary; do
+# `adversary` is not in this loop: its procedure moved into the adversarial-review
+# skill, and the group above checks the same rules there. `spec-adversary` still
+# carries its own brief inline, because a spec review has no meaning outside the
+# workflow that produces specs and so was never split out.
+for f in spec-adversary; do
   BRIEF=$(tr '\n' ' ' < "$SRC/agents/$f.md" 2>/dev/null | tr -s ' ')
   # 'empty `git diff`' is the one that stops the staging convention failing in the
   # dangerous direction: staged after fixing, reviewer sees an untouched tree, and

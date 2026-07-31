@@ -90,9 +90,9 @@ has already judged, unstaged is what has moved since.**
 
 Which comes down to two `git add` calls:
 
-- **Before the first round**, stage the thing under review — `git add -A` at Phase
-  5, `git add docs/specs/<task>.md` at Phase 2. Nothing is unstaged yet, and the
-  reviewer judges `git diff HEAD` exactly as it always has.
+- **Before the first round**, stage the thing under review — `git add
+  docs/specs/<task>.md` at Phase 2, `git add -A` at Phase 5. Nothing is unstaged
+  yet, and the reviewer judges `git diff HEAD` exactly as it always has.
 - **The moment a verdict lands**, stage again, *before* you touch anything in
   response to it. Then everything you do next shows up as `git diff` and nothing
   else does.
@@ -104,12 +104,18 @@ verdict*. Both briefs are told to refuse a `sound` verdict reasoned that way, so
 the cost of getting the order wrong is a wasted round rather than a fix waved
 through, but it is still a wasted round.
 
-`git add -A` stages whatever else is dirty, which is the same set the review gate
-is already treating as the subject of review — not a widening of scope. If it
-picked up something you want out of the index, `git restore --staged <path>`.
+`git add -A` at Phase 5 stages whatever else is dirty, which is the same set the
+review gate is already treating as the subject of review — not a widening of
+scope. If it picked up something you want out of the index,
+`git restore --staged <path>`.
 
 Staging is not a change. The review gate fingerprints file *contents*, not index
 state, so a `git add` on its own never re-arms it and never costs a review round.
+
+Both reviewers are told to read the index this way — it is in
+[adversarial-review](../adversarial-review/SKILL.md) for the code side and in
+`spec-adversary`'s brief for the design side. Keeping the invariant is yours; both
+of them can only tell you when you broke it.
 
 **What reuse costs.** A reviewer holding its own findings is inclined to accept a
 fix *because the fix is what it asked for*, and round two hands it your account of
@@ -126,10 +132,14 @@ keep the argument out — so the follow-up message points at the change and stop
 > open, report again, and anything I broke is new. If it holds up now, say
 > `sound` and stop.
 
-At Phase 5 the review gate has usually computed the same thing from its own
-fingerprint and printed it — *"Changed since the last review round: …"*. **Paste
-that list in verbatim and say it came from the gate.** It is the one part of the
-message that is a fact rather than a claim, it does not depend on your having
+At Phase 5 the message carries two more things. One is the validation delta —
+*"same commands, same result"* is a complete version of it — since the fixes are
+code the checks had not seen when you last ran them.
+
+The other is the gate's own list. When the review gate blocked the turn it printed
+*"Changed since the last review round: …"*, computed from its fingerprint.
+**Paste that in verbatim and say it came from the gate.** It is the one part of the
+message that is a fact rather than a claim: it does not depend on your having
 staged in the right order, and if it disagrees with your own account of what you
 changed, it is right and something is unaccounted for. Say that rather than
 quietly reconciling the two.
@@ -373,7 +383,24 @@ you did not touch** — a type error elsewhere that your change surfaced is your
 change's problem. If a failure genuinely predates your work, prove it rather than
 asserting it: stash the change, run the check, restore, and show both results.
 
-**Exit:** plan complete, repo validations green, output shown — then run
+Then write it down in the shape Phase 5 hands to the reviewer, so the work of
+finding this repo's checks is done once rather than twice:
+
+```
+VALIDATION REPORT
+Commands: <exactly what you ran>
+Source:   <where you got them>
+Result:   <per command: pass, plus its summary line>
+Not covered: <what this repo does not check at all>
+```
+
+`Not covered` is the line the reviewer reads first and the one you will be tempted
+to leave blank — see [adversarial-review](../adversarial-review/SKILL.md), step 2,
+for what it is for. Filling it is a Phase 4 job because Phase 4 is where you found
+out what the checks actually run.
+
+**Exit:** plan complete, repo validations green, output shown, report written —
+then run
 `.claude/hooks/phase.sh 5` **yourself**. This transition is yours: advancing
 submits your work for adversarial review, so taking it costs you nothing and
 gains you scrutiny. Do not ask the user to run it, and do not ask them to approve
@@ -382,66 +409,89 @@ it — only 2 → 3 and 3 → 4 raise prompts.
 ## Phase 5 — Adversarial review
 
 **You do not review your own work here.** Delegate to the `adversary` subagent —
-that one, not the `spec-adversary` from Phases 2 and 3. Different subject,
-different brief: this one attacks the code that got written, and it is told
-nothing about the spec it was written from.
+that one, not the `spec-adversary` from Phases 2 and 3. Different subject: this
+one attacks the code that got written, and it is told nothing about the spec it
+was written from. Do not point the design reviewer at a diff to save a spawn.
 
-**Open with the stance, not with the task.** A bare intent sentence — *"Message
-banners should appear below the header, not above it"* — reads as *check that
-this works*, and you get a confirmation instead of a review. Say what the
-reviewer is for before you say what the change was for:
+**The reviewer's procedure is not yours to write.** It lives in the
+[adversarial-review](../adversarial-review/SKILL.md) skill, which the subagent
+loads for itself. Your side is the four steps below, and the third one is a
+pointer rather than a briefing.
 
-> You are adversarially reviewing an unreviewed diff in the working tree. Assume
-> it is wrong and find where. Your job is to break this change, not to approve it.
+### 1. The validations are already green
+
+Phase 4 cannot exit without them, so you are holding the report it wrote. Nothing
+to re-run here — hand it over in step 3. From the second round on, re-run whatever
+a fix could have broken, because a fix is code the validations have not seen.
+
+### 2. `git add -A`
+
+That is what makes round two legible: from then on the index holds what the
+reviewer has seen and `git diff` holds your response to its verdict. It is
+bookkeeping, not a commit, and it cannot re-arm the review gate — the fingerprint
+is built from file contents, not from index state. If it picked up something you
+want out of the index, `git restore --staged <path>`.
+
+### 3. Spawn, with a pointer and nothing else
+
+**Name the skill first, the intent second, and stop.** The order is load-bearing:
+the reviewer reads the stance it is meant to take before it reads what the change
+was for. Lead with the intent instead and a bare sentence — *"Message banners
+should appear below the header, not above it"* — reads as *check that this works*,
+and you get a confirmation back.
+
+> Use the `adversarial-review` skill and follow it. You are reviewing the working
+> tree.
 >
 > The intent of the change, which is the only thing I am telling you:
 > **&lt;one or two sentences&gt;**
 >
-> I am deliberately not describing my approach, my reasoning, or where I think
-> you should look. Judge the diff and the surrounding code on their own terms.
-> If it holds up, say `sound` and stop — that is a normal outcome, not a failure
-> to find something.
+> The repo's validations pass on this change:
+>
+> ```
+> &lt;the Phase 4 validation report&gt;
+> ```
 
-Everything after the intent line stays fixed. **The intent line is the only part
-you write**, and it stays at one or two sentences: no summary of your approach,
-no defense of your choices, no list of what to look at. Priming it is the
-difference between a review and a rubber stamp.
+**The intent line is the only part you write.** No summary of your approach, no
+defense of your choices, no list of what to look at, and **no restating the
+skill's own instructions back at it** — a spawn message that re-explains the
+procedure is the copy that drifts. Priming it is the difference between a review
+and a rubber stamp.
 
-That closing sentence is not softening the brief — it is load-bearing. Push a
-reviewer to be adversarial without it and you get manufactured findings, which
-cost you the same reading time and train you to skim the real ones.
+**The intent line comes from Phase 1, not from the spec.** The spec is the
+reasoning behind the change, and the reviewer does not get the reasoning; pasting
+the spec's summary in is how the withholding quietly stops happening while still
+looking like it is in force.
 
-**Run `git add -A` before you send it.** That is what makes round two legible:
-from then on the index holds what the reviewer has seen and `git diff` holds the
-fixes. It is bookkeeping, not a commit, and it cannot re-arm the review gate — the
-fingerprint is built from file contents, not from index state.
+Keep the handle the spawn returns. Every round after the first goes back to that
+session — see [The two reviewer sessions](#the-two-reviewer-sessions) — including
+the rounds the review gate asks for, since fixing a finding changes the diff and a
+changed diff is owed review again. Spawning a second reviewer for round two
+discards the only context in the system that knows what round one found.
 
-That spawn opens the code session for this slice, and **every round after the
-first goes back to it** with the follow-up message from [The two reviewer
-sessions](#the-two-reviewer-sessions) — including the rounds the review gate asks
-for, since fixing a finding changes the diff and a changed diff is owed review
-again. Spawning a second reviewer for round two discards the only context in the
-system that knows what round one found.
+### 4. Act on the verdict
 
-Then handle findings — starting with `git add -A`, before you edit anything. The
-verdict has landed, so the tree as it stands is now *what the reviewer has seen*,
-and everything you do next is the next round's `git diff`:
+**`git add -A` first, before you edit anything.** The verdict has landed, so the
+tree as it stands is now *what the reviewer has seen*, and everything you do next
+is the next round's `git diff`.
 
 - `blocker` / `serious` — fix, then note that the fix itself is unreviewed until
   the next round closes it. The reviewer that found it is the one that says so.
 - `minor` — report with your recommendation. Do not silently fix or drop.
+- `sound` — say so and stop.
+- `cannot-assess` — report what it said it needed. It is not a pass.
 - Disagree with a finding? Say so with reasoning, **to the user**. Never discard
   quietly, and never take the argument back to the reviewer — a reviewer talked
   round to your position has stopped being one.
 
-Complexity and performance: only problems that bite at the scale established
-in Phase 1. If Phase 1 recorded no scale, you may not make complexity claims —
-say the scale was never established.
+Complexity and performance: only problems that bite at the scale established in
+Phase 1. If Phase 1 recorded no scale, you may not make complexity claims — say
+the scale was never established.
 
 Close with an evidence log: what the reviewer found, what you changed, what you
 declined and why. **"Reviewer found nothing, no changes made" is a complete and
-unremarkable entry.** Do not pad it. A log that always shows improvements is
-a log that trains the reader to skim.
+unremarkable entry.** Do not pad it. A log that always shows improvements is a log
+that trains the reader to skim.
 
 One entry per round, so the sequence is visible: what it found, what you changed,
 what it said about that change. The last round's verdict is not a summary of the

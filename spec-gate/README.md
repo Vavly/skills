@@ -6,7 +6,10 @@ each outcome*:
 
 1. **A review gate** — a `Stop` hook that refuses to end a turn on a diff that
    hasn't been through adversarial review, plus an `adversary` subagent that does
-   the reviewing in an isolated context.
+   the reviewing in an isolated context. What that subagent actually does is an
+   `adversarial-review` skill it loads for itself, so the spawn is a pointer and
+   not a briefing. The skill also stands alone: `/adversarial-review` on any diff,
+   workflow or no workflow.
 2. **A phase gate** — a `PreToolUse` hook enforcing a five-phase workflow
    (clarify → spec → plan + failing tests → execute → review), where production
    code is blocked *at the tool level* until a spec exists and the user has
@@ -41,10 +44,13 @@ spec-gate/
 │   ├── cursor-guard.sh              → .claude/hooks/   Cursor adapter
 │   └── cursor-stop.sh               → .claude/hooks/   Cursor adapter
 ├── agents/
-│   ├── adversary.md                 → .claude/agents/   judges the diff
+│   ├── adversary.md                 → .claude/agents/   judges the diff — a
+│   │                                   pointer; its procedure is the skill below
 │   └── spec-adversary.md            → .claude/agents/   judges the spec + plan
 ├── skills/
 │   ├── spec-driven/SKILL.md         → .claude/skills/  the workflow
+│   ├── adversarial-review/SKILL.md  → .claude/skills/  the reviewer's procedure
+│   │                                → .cursor/skills/  ...and the same file there
 │   └── spec-phase/SKILL.md          → .claude/skills/  user-only phase control
 └── cursor/                          for Cursor instead of / alongside Claude Code
     ├── hooks.json                   → .cursor/hooks.json
@@ -113,10 +119,18 @@ is just a file the agent can rewrite, and every "enforced" claim below silently
 becomes an instruction.
 
 ```bash
-mkdir -p .cursor/agents
+mkdir -p .cursor/agents .cursor/skills
 cp "$SPEC_GATE"/cursor/hooks.json .cursor/hooks.json          # MERGE if one exists
 cp "$SPEC_GATE"/cursor/agents/*.md .cursor/agents/
+cp -R "$SPEC_GATE"/skills/adversarial-review .cursor/skills/  # same file, not a fork
 ```
+
+That last line is not optional. Cursor reads `.cursor/skills/`, not
+`.claude/skills/`, and the `adversary` agent on both hosts is a pointer whose
+whole procedure is in that skill — without it the reviewer is told to load
+something that is not there, and its brief says to stop rather than improvise.
+It is copied from `skills/`, not from `cursor/`, on purpose: one source file for
+both hosts is one file that cannot drift.
 
 The hook scripts stay in `.claude/hooks/`, which `.cursor/hooks.json` points at
 by relative path. That looks odd in a Cursor-only repo, and it is deliberate: one
@@ -154,11 +168,12 @@ to `deny` rather than letting it evaporate.
 main agent messages an existing subagent by name and it picks up its transcript.
 Whether Cursor exposes an equivalent for `.cursor/agents/` subagents is
 **unverified here**, and if it does not, every round spawns cold and the reuse
-instruction is a no-op rather than a failure. The *Follow-up rounds* section stays
-in both copies of each brief regardless: it is written as "when you are asked
-again in this session", so on a host that cannot resume it simply never applies —
-and the two agent sets are kept identical on purpose, since a brief that differs
-per host is a brief that drifts.
+instruction is a no-op rather than a failure. The *Follow-up rounds* sections stay
+put regardless: they are written as "when you are asked again in this session", so
+on a host that cannot resume they simply never apply. The code reviewer's lives in
+the skill, which is one file installed to both hosts and so cannot drift at all;
+`spec-adversary`'s exists as two copies that `test.sh` compares line for line,
+since a brief that differs per host is a brief that drifts.
 
 **`readonly: false` on the Cursor adversary is deliberate.** Cursor can enforce
 read-only on a subagent, which Claude Code cannot — there it is only an
@@ -175,6 +190,28 @@ reading the repo the spec makes claims about — grep for the helper it names,
 count the callers of the contract it changes. Writes would buy it nothing and put
 it one slip from editing the document it is judging.
 
+**One skill is ported, and it has to be.** Cursor reads `.cursor/skills/`, not
+`.claude/skills/`, and supports the same `SKILL.md` format — so
+`adversarial-review` is installed to both from the one source file above. That is
+load-bearing rather than a convenience: `agents/adversary.md` is a pointer on both
+hosts, so a Cursor install without the skill leaves the reviewer with a stance and
+no procedure.
+
+**Whether a Cursor subagent actually resolves it is UNVERIFIED**, and this is the
+one Cursor claim to be most careful about, because it is the one the whole review
+path now hangs on. Two separate unknowns: that Cursor honours `skills:` in agent
+frontmatter at all, and that a *subagent* — not just the main agent — can reach a
+project skill by name. The Claude Code side is checked against that host's schema;
+nothing equivalent has been checked here. If it does not resolve, the brief makes
+the reviewer return `cannot-assess` rather than improvise, so the failure is loud
+rather than a fabricated `sound` — but a loud failure is still no review. Spawn it
+once on a real diff before relying on the Cursor side.
+
+`spec-driven` and `spec-phase` are **not** ported. Nothing structural stops it —
+they would need their `$ARGUMENTS` and slash-command assumptions checked against
+Cursor's, which is **unverified here** — but the review skill is the one the agent
+files depend on, and it is the one worth keeping in step.
+
 ## Use
 
 ```
@@ -184,7 +221,34 @@ it one slip from editing the document it is judging.
 /spec-phase red              run the Phase 3 tests, record RED if they fail
 /spec-phase <1-5>            advance — the two approval gates raise a prompt
 /spec-phase off              disarm
+
+/adversarial-review          review a diff — on its own, no workflow needed
+/adversarial-review <ref>     ...against a ref or path you name
 ```
+
+`/adversarial-review` is the reviewer's procedure, and typing it runs that
+procedure directly in the conversation instead of in a subagent. It resolves what
+to review — the working tree if anything is dirty, otherwise the branch against
+its merge-base with the trunk, since a clean tree means the work is committed
+rather than absent — then reads, attacks, and returns a verdict.
+
+The same file is what the `adversary` subagent loads when Phase 5 or the review
+gate spawns it. Those two spawn it with a pointer and a sentence of intent rather
+than a briefing:
+
+```
+Use the `adversarial-review` skill and follow it. You are reviewing the working tree.
+
+The intent of the change, which is the only thing I am telling you: <one or two sentences>
+
+The repo's validations pass on this change:
+<report>
+```
+
+Typing it yourself skips the isolated context, which is the one thing worth
+knowing about doing it that way: you will be reviewing a diff you have already
+read, holding the reasoning that produced it. Useful on someone else's branch,
+weaker on your own.
 
 Each phase widens what may be written. The rule for who may advance follows
 from that: **the user is required only for transitions that expand the model's
@@ -334,11 +398,18 @@ addressed:
 What stays out is the *case for the fix*. No explanation of why it is right, no
 argument for a finding that was declined — that argument goes to the **user**, in
 the evidence log, where they can weigh it. Arguing a reviewer round to your
-position does not resolve a finding, it removes the reviewer. Both briefs
+position does not resolve a finding, it removes the reviewer. Both reviewers
 correspondingly treat the "findings I acted on" list as a **claim to check, not a
 report to accept**, and rate a finding reported as fixed but not fixed a
 `blocker` — from that point everything downstream is being decided on the author's
 summary instead of on the code.
+
+**"Both reviewers" is deliberate wording, and it is not the same as both agent
+files.** The design reviewer's rules are in `agents/spec-adversary.md`; the code
+reviewer's are in `skills/adversarial-review/SKILL.md`, where its procedure moved.
+`agents/adversary.md` holds none of them — it is a pointer. Everywhere below that
+attributes a rule to "both", it means those two files, and `test.sh` bans the older
+phrasing outright so this cannot quietly rot back.
 
 #### The index is the bookmark
 
@@ -351,7 +422,7 @@ Staging between fixing and messaging is the one ordering that destroys the signa
 and it destroys it in the dangerous direction: the fixes go into the index, the
 reviewer opens `git diff` on what looks like an untouched tree, and *nothing moved
 since my verdict* reads as *nothing to re-review*. Both the workflow and the block
-message say not to, and because that is prose, both briefs also carry the
+message say not to, and because that is prose, both reviewers also carry the
 backstop — **an empty `git diff` is not evidence that nothing changed**, it is
 equally consistent with the convention having been broken, so re-read `git diff
 HEAD` and say which of the two you concluded. Never a `sound` verdict reasoned from
@@ -428,7 +499,7 @@ missing snapshot means one round reports no delta, exactly like any first round.
 What this does not do is verify the *session* was resumed. It verifies the paths.
 Those are different claims, and only one of them is now a fact.
 
-Both briefs carry a **Follow-up rounds** section holding the other half of the
+Both reviewers carry a **Follow-up rounds** section holding the other half of the
 bargain: read `git diff` for what moved but judge it against `git diff HEAD`,
 because a fix that reads well in isolation is the same trap as a diff that reads
 well in isolation; re-read rather than answer from memory; account for every prior
@@ -607,6 +678,7 @@ reviewing twice costs twice.
 | `review-gate.sh` — phase scan | `Stop` | per turn | *catches* phase violations the guard could not see |
 | `review-gate.sh` — review gate | `Stop` | per turn | blocks *ending a turn* on an unreviewed diff, and reports which paths moved since the last round |
 | `adversary` | subagent | on delegation, resumed per round | judges the diff |
+| `adversarial-review` | skill | loaded by `adversary`, or typed | *how* to judge it: resolve the target, attack, verdict |
 | `spec-adversary` | subagent | Phase 2 exit, Phase 3 plan, same session | judges the design before it is built |
 
 Write detection is deliberately split across two layers, because neither can do
@@ -648,8 +720,12 @@ flowchart TD
     STOP --> RG{"review-gate.sh<br/>Stop"}
     RG -->|"clean tree · phases 1-4 ·<br/>or this exact diff already reviewed"| DONE["turn ends"]
     RG -->|"unreviewed diff"| BLOCK["BLOCK · exit 2<br/>stderr instructs Claude to delegate"]
-    BLOCK --> ADV["adversary subagent<br/>separate context<br/>gets task intent only"]
-    ADV --> V["VERDICT<br/>sound / findings / cannot-assess"]
+    BLOCK --> VAL{"repo validations"}
+    VAL -->|"red"| FIXV["fix them first ·<br/>no reviewer is spawned"]
+    FIXV --> VAL
+    VAL -->|"green"| ADV["adversary subagent · separate context<br/>spawned with a pointer:<br/>task intent + validation report"]
+    ADV --> SK["loads adversarial-review skill<br/>resolve target · read context · attack"]
+    SK --> V["VERDICT<br/>sound / findings / cannot-assess"]
     V -->|"blocker / serious"| FIX["fix the finding"]
     FIX -->|"diff moved · review owed again"| RESUME["same session, resumed<br/>fixes are unstaged: git diff<br/>the case for them is not given"]
     RESUME --> ADV
@@ -764,9 +840,18 @@ approval**, not priming either reviewer, **resuming the same reviewer session fo
 later rounds and starting both fresh at a slice boundary**, maintaining the
 staging convention and passing the gate's path delta on verbatim, not padding the
 evidence log, stopping on contradiction, honoring severity levels, leaving tests
-frozen in Phase 4, running the repo's own validations before leaving Phase 4, and
-asking about the pull request before closing out. These work most of the time and
-fail *silently* when they don't.
+frozen in Phase 4, **running the repo's own validations green before any reviewer
+is spawned**, **refusing a test weakened to make a fix pass**, and asking about the
+pull request before closing out. These work most of the time and fail *silently*
+when they don't.
+
+The last two are worth separating out, because they are the same guarantee from
+opposite ends and only one has an enforced version. A red suite reaching the
+reviewer is loud — the reviewer says so. A test quietly loosened until the suite
+went green is not: it reaches the reviewer as a pass, inside a report that also
+says pass. The briefs are told to read test hunks first on a fix round for exactly
+this, and that instruction is all there is unless you add the green-suite tripwire
+under [Tuning](#tuning).
 
 The gate stops structural failures. It cannot stop a lazy Phase 1, a spec review
 that was never spawned, or a self-congratulatory Phase 5 log. For the spec review
@@ -782,7 +867,7 @@ you read it.
 
 Builds a throwaway git repo in a temp dir, installs the hooks into it, and drives
 them with synthetic hook payloads. Nothing touches the repo you run it from.
-251 cases: the phase policy, every write vector, the advance-transition matrix,
+314 cases: the phase policy, every write vector, the advance-transition matrix,
 RED verification and the receipt's staleness rules, fail-closed behavior, the
 review gate with its index-invariance and its between-rounds delta, the slice
 position and its boundary rules, and the phase scan with its baseline.
@@ -843,26 +928,49 @@ Recorded because the *reasons* generalise to anyone writing hooks:
     `Bash`. Documented honestly instead — see Caveats.
 12. A newline in a task name injected a line into the state file. `head -1` meant
     it was cosmetic rather than exploitable, but the name is sanitised now.
+13. **`adversary` could not load the skill its whole body pointed at.** When the
+    procedure moved into `adversarial-review`, the agent's `tools:` line was left
+    as `Read, Grep, Glob, Bash` — and `tools:` is an exact allowlist, so `Skill`
+    was not in it and no `skills:` field was set. The body said *invoke the
+    adversarial-review skill*; the frontmatter made that impossible. Fixed with
+    `skills: adversarial-review`, which preloads rather than grants — the
+    procedure is in context instead of merely fetchable. The whole suite was green
+    throughout, because every test grepped the agent's prose and none read its
+    frontmatter; there are now tests for the frontmatter and for the name matching
+    the installed directory.
+14. **Branch mode diffed against a trunk that need not exist.** The fallback chain
+    ended in a hardcoded `main`, so on a `master` repo `git merge-base` failed,
+    `BASE` came back empty, and `git diff "$BASE"..HEAD` became `HEAD..HEAD` —
+    exit 0, no output, and a reviewer reporting `sound` on work it never read.
+    Every candidate is now `git rev-parse --verify`'d and no trunk means stop and
+    ask. `init.defaultBranch` is out of the chain entirely: it describes repo
+    creation, not this repo, and agreeing often enough to look right is what got
+    it past review.
 
-The pattern across 1, 3, 4, 6 and 8: **each was a gate that failed open while
-looking closed.** A silent fail-open is worse than no gate, because it buys
-confidence it hasn't earned.
+The pattern across 1, 3, 4, 6, 8, 13 and 14: **each was a gate that failed open
+while looking closed.** A silent fail-open is worse than no gate, because it buys
+confidence it hasn't earned. 13 and 14 add the sharper version: **a test that only
+reads prose cannot see a contradiction between prose and configuration**, and an
+empty diff is the most convincing `sound` a reviewer will ever produce.
 
 ## Design decisions worth not re-litigating
 
-- **The reviewer gets task intent only** — no summary of the implementer's
-  approach, no defense of choices. A reviewer handed the author's reasoning
-  mostly ratifies it. This single constraint is most of the difference between a
-  gate and a rubber stamp.
+- **The reviewer gets task intent and a validation report, and nothing else** —
+  no summary of the implementer's approach, no defense of choices. A reviewer
+  handed the author's reasoning mostly ratifies it. This single constraint is most
+  of the difference between a gate and a rubber stamp. The report is not an
+  exception to it: it says what the machine checked, not what the author thinks.
 - **…but the spawn prompt opens with the stance, not the task.** "Task intent
   only" was read literally at first, and produced spawn prompts like *"Message
   banners should appear below the header, not above it."* Accurate, unprimed, and
   it reads as *check that this works* — so it came back a confirmation. The brief
-  in `adversary.md` says all the right things, but the spawn message is the most
-  proximate instruction and it was setting a neutral frame. Both places that
-  delegate now carry a fixed adversarial preamble, with the one-line intent
-  dropped into it. Unprimed is about *withholding the author's reasoning*, not
-  about withholding the reviewer's job.
+  in `adversary.md` said all the right things, but the spawn message is the most
+  proximate instruction and it was setting a neutral frame. The fix at the time
+  was a fixed adversarial preamble in both places that delegate; since the
+  procedure moved into the skill, that preamble is a *pointer to the skill* placed
+  ahead of the intent line — see the bullet below on ordering, which is the same
+  lesson surviving the split. Unprimed is about *withholding the author's
+  reasoning*, not about withholding the reviewer's job.
 - **One reviewer session per subject, resumed across rounds, reset per slice.**
   The unprimed-reviewer rule is about withholding the *author's reasoning*, not
   about withholding the reviewer's own memory. A reviewer that cannot remember
@@ -873,7 +981,8 @@ confidence it hasn't earned.
   which ones were addressed costs no independence and saves the re-read. What keeps
   it from decaying into agreement is that the list is *a claim to check*, that the
   case for the fix goes to the user rather than to the reviewer, and the anchoring
-  rule in both briefs: *do not accept a fix because it is the one you asked for.*
+  rule both reviewers carry: *do not accept a fix because it is the one you asked
+  for.*
   See [One reviewer session per subject, per
   slice](#one-reviewer-session-per-subject-per-slice).
 - **The spec is reviewed before the user is asked, not after.** Reversing those
@@ -892,10 +1001,51 @@ confidence it hasn't earned.
   makes design review survivable. Without it the reviewer proposes an alternative
   architecture every run, which is unfalsifiable, expensive to answer, and
   indistinguishable from a real objection.
-- **"No findings" must be a normal outcome.** Both `adversary.md` and the Phase 5
-  log say so explicitly. A reviewer that always finds three things trains you to
-  skim; a log formatted to presume improvements gets improvements manufactured
-  for it.
+- **The reviewer's procedure is a skill the reviewer loads, not a prompt the
+  caller writes.** It used to be written into the spawn message, in three places —
+  Phase 5, the gate's block message, and the agent brief — which is three copies
+  of one prompt, drifting quietly. A drifting copy does not fail loudly; it fails
+  as one caller reviewing to an older standard than the others, which looks
+  exactly like a review that went well.
+
+  The fix is which direction the text points. The caller now sends *"use the
+  `adversarial-review` skill; here is the intent"* and stops; the subagent loads
+  the procedure itself. That also makes the split clean along a line that was
+  always there: the skill holds what a **read-only reviewer** does — resolve the
+  target, attack it, return a verdict — while validating, staging, spawning and
+  acting on findings stay with the caller, because a reviewer cannot do any of
+  them. `agents/adversary.md` keeps only what a spawn config must carry, and
+  `test.sh` fails it at 60 lines to stop it regrowing a second brief.
+- **The spawn message names the skill before the intent.** The old lesson —
+  *open with the stance, not the task* — survives the split in a new form. A
+  message that leads with intent still reads as *check that this works*, whatever
+  the skill says once loaded, because the reviewer has read the task before it
+  reads its own brief. Pointer first, intent second.
+- **Validations run before the reviewer, not after, and have to be green.** Three
+  things follow from the order. A reviewer spawned onto a red tree spends its read
+  on breakage the author already knew about, and its findings come back tangled
+  with it. A reviewer that runs the suite itself pays a second time for an answer
+  it was about to be handed. And the report carries a `Not covered` line — what
+  this repo checks *nothing* about — which is the most useful thing the reviewer
+  is told all round, because it is the only ground where a defect will not be
+  caught by anything else either.
+
+  The cost is real and worth naming: the reviewer no longer sees tests run, so a
+  test weakened to make a fix pass now arrives looking exactly like a fix that
+  worked — the suite says pass and so does the report. The compensating control is
+  **one paragraph in `skills/adversarial-review/SKILL.md`**, under *Follow-up
+  rounds*: read test hunks before the production hunks they accompany, and treat a
+  loosened assertion as a `blocker`. It is not in either agent brief and not in
+  `spec-adversary` at all — a spec reviewer has no test hunks to read — so that
+  single paragraph is the whole of it. Harden it there or nowhere. It is also a
+  prompt standing in for something a hook used to do incidentally, which is the
+  weaker kind of guarantee; the green-suite tripwire under [Tuning](#tuning) is the
+  enforced version if you want it.
+- **"No findings" must be a normal outcome.** Said in three places, none of them
+  `adversary.md`: the skill's *Do not manufacture findings* rule, the spawn message
+  both callers send, and the Phase 5 log. A reviewer that always finds three things
+  trains you to skim; a log formatted to presume improvements gets improvements
+  manufactured for it.
 - **Complexity claims require Phase 1's scale figure.** Otherwise "optimize for
   time/space complexity" is an invitation to premature optimization.
 - **Phase 3 requires observing RED.** Writing tests then code lets the tests be
@@ -935,8 +1085,9 @@ confidence it hasn't earned.
   A bare `opus` in a Cursor agent file does not resolve, and you get the
   inherited model with a frontmatter line claiming otherwise.
 - **Fresh reviewer per round.** Session reuse is instruction only — it lives in
-  the *Follow-up rounds* sections of both briefs, in step 1 of the block message,
-  and in `spec-driven`'s *The two reviewer sessions*. Delete those four and every
+  the *Follow-up rounds* sections of `skills/adversarial-review/SKILL.md` and
+  `agents/spec-adversary.md`, in step 1 of the block message, and in
+  `spec-driven`'s *The two reviewer sessions*. Delete those four and every
   round spawns cold again, which buys back the unanchored second read and pays a
   full re-read for it. The staging convention is worth keeping either way: a cold
   reviewer told which hunks are new still reads the change faster than one that has
@@ -958,8 +1109,16 @@ confidence it hasn't earned.
   incremental cost.
 - **Second reviewer on the diff.** The Phase 5 equivalent of what
   `spec-adversary` does for the design: a second read-only subagent with a
-  *different* brief, run in parallel — one on correctness, one on security or
-  effects on callers. Copy `adversary.md`, narrow the prompt.
+  *different* procedure, run in parallel — one on correctness, one on security or
+  effects on callers.
+
+  **Copy the skill, not the agent.** `agents/adversary.md` is a pointer with no
+  procedure left in it, so a copy of it is a second agent loading the identical
+  skill and reviewing identically. Copy
+  `skills/adversarial-review/` to a new name, narrow its *Attack it* section to
+  the one axis you want, then add an agent whose `skills:` names the new skill.
+  Both halves are required: the skill without an agent has no isolated context,
+  and the agent without its own skill is the no-op above.
 - **Green-suite tripwire** in `review-gate.sh` before the block, so a broken
   suite is caught deterministically rather than by a model that may not bother.
   This is the mirror of the RED tripwire above: that one refuses to *leave*
@@ -1085,10 +1244,15 @@ confidence it hasn't earned.
   model that ignores the instruction can end the turn on its second attempt.
 - **No enforcement between Phase 4 exit and Phase 5.** If the user never advances,
   the diff is never gated. The user *is* the checkpoint by design.
-- **Hook registration, subagent delegation, and skill auto-activation are
-  unverified inside a live session.** The scripts are tested — `./test.sh`, 150
-  cases — but the integration with Claude Code is not. Take one real but small
-  task through end to end before trusting it.
+- **Hook registration, subagent delegation, and skill preloading are unverified
+  inside a live session.** The scripts are tested — `./test.sh`, 314 cases — but
+  the integration with Claude Code is not, and bug 13 is what that gap looks like
+  when it bites: an agent whose frontmatter contradicted its body, green suite
+  throughout, and nothing short of spawning it for real would have shown it. The
+  frontmatter is now asserted against the schema in Claude Code 2.1.220
+  (`tools:` is an exact allowlist; `skills:` preloads by name) — which is a
+  version-pinned fact, not a permanent one. Take one real but small task through
+  end to end before trusting it, and again after upgrading Claude Code.
 
 ## Multi-slice execution
 

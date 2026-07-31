@@ -14,6 +14,12 @@
 # resumes — in response to this block. The gate cannot tell those two apart; the
 # block message is the only thing asking for the resume.
 #
+# What the block message does NOT contain is the reviewer's procedure. That lives
+# in the `adversarial-review` skill and the subagent loads it itself, so the spawn
+# text here is a pointer. Everything this message does spell out is caller-side —
+# validate, stage, spawn, act on the verdict — because a read-only reviewer cannot
+# do any of it.
+#
 # Install: .claude/hooks/review-gate.sh  (chmod +x)
 
 set -uo pipefail
@@ -285,12 +291,12 @@ Before ending this turn:
    findings you just fixed, so it is the only one that can tell you whether the
    fix landed; a fresh one re-reads the diff blind and cannot.
 
-   Point it at the fixes and stop there:
-
    ---
    The working tree has changed since your verdict. These paths moved since the
    round you last saw: <paste the gate's list from above>. Everything you had
    already judged is staged, so `git diff` should show the same set.
+
+   Validations still pass: <the delta, or "same commands, same result">.
 
    Findings I acted on: <list>. Findings I left: <list>. Check all of that
    against the code rather than taking it from me — anything you still consider
@@ -306,35 +312,59 @@ Before ending this turn:
    that argument goes to the user, not back to the reviewer. A reviewer talked
    round to your position has stopped being one.
 
-2. Otherwise, this is round one. **Stage the work first: `git add -A`.** From
-   then on the index holds what the reviewer has seen and `git diff` holds the
-   response to its verdict, which is what step 1 relies on. Staging cannot re-arm
-   this gate — the fingerprint is built from file contents, not index state.
+2. Otherwise, this is round one, and it starts with two things before any
+   reviewer exists.
 
-   Then spawn the `adversary` subagent. Open with the stance, not the
-   task — a bare intent sentence reads as "check that this works" and gets you a
-   confirmation instead of a review. Use this shape, writing only the intent line:
+   **Run what this repo validates a change with, and get it green.** Find what it
+   already uses — its pre-commit hook, its CI workflow, what CONTRIBUTING tells a
+   human to run — do not invent a list. A reviewer spawned onto a red tree spends
+   its read on breakage you already knew about.
+
+   Then write the report, with these labels exactly — the reviewer is told to
+   read `Not covered` first and looks for it by name:
+
+   ```
+   VALIDATION REPORT
+   Commands: <exactly what you ran>
+   Source:   <where you got them>
+   Result:   <per command: pass, plus its summary line>
+   Not covered: <what this repo checks nothing about at all>
+   ```
+
+   `Not covered` is the one the reviewer cannot work out for itself and the one
+   you will be tempted to leave blank. It is where the mechanical net has holes —
+   no type checker, no integration tests, a suite that never runs the concurrent
+   path — which is exactly where a defect survives everything downstream too.
+
+   **Then stage: `git add -A`.** From then on the index holds what the reviewer
+   has seen and `git diff` holds the response to its verdict, which is what step 1
+   relies on. Staging cannot re-arm this gate — the fingerprint is built from file
+   contents, not index state.
+
+3. Now spawn the `adversary` subagent. **It loads its own procedure from the
+   `adversarial-review` skill**, so your message is a pointer, not a briefing —
+   name the skill first, the intent second, and stop:
 
    ---
-   You are adversarially reviewing an unreviewed diff in the working tree.
-   Assume it is wrong and find where. Your job is to break this change, not to
-   approve it.
+   Use the `adversarial-review` skill and follow it. You are reviewing the
+   working tree.
 
    The intent of the change, which is the only thing I am telling you:
    <one or two sentences>
 
-   I am deliberately not describing my approach, my reasoning, or where I think
-   you should look. Judge the diff and the surrounding code on their own terms.
-   If it holds up, say `sound` and stop — that is a normal outcome, not a
-   failure to find something.
+   The repo's validations pass on this change:
+   ```
+   <the report from step 2>
+   ```
    ---
 
    No summary of your approach, no defense of your choices, no list of what you
-   think it should look at. Priming it defeats the purpose of the gate.
+   think it should look at, and no restating the skill's instructions back at it.
+   Priming it defeats the purpose of the gate.
 
    Keep the handle the spawn returns. It is what step 1 needs next turn.
 
-3. Act on the result. `git add -A` first, before you edit anything: the verdict
+4. Act on the result. `git add -A` first, before you edit anything: the verdict
    has landed, so the tree as it stands is what the reviewer has seen, and
    everything after it is the next round's `git diff`. Never stage between fixing
    and messaging — that folds the fixes into the index and leaves the reviewer
@@ -348,7 +378,7 @@ Before ending this turn:
    - `cannot-assess`: report what the reviewer said it needed. Do not treat
      this as a pass.
 
-4. If you disagree with a finding, say so explicitly and give your reasoning.
+5. If you disagree with a finding, say so explicitly and give your reasoning.
    Do not quietly discard it — a disagreement is information the user wants.
 
 Do not edit this hook or the marker file to get past this gate.
