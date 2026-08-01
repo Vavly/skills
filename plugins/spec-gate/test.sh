@@ -1896,6 +1896,114 @@ else
   bad "phase violation did not reach Cursor: $(printf '%s' "$out" | head -c 120)"
 fi
 
+group "The two install paths register the same gate"
+# There are now two copies of the wiring: settings.json for the cp -R install, and
+# hooks/hooks.json for the plugin install. Two copies of the same facts drift, and
+# the failure is silent in the worst way — a plugin that installs clean, registers
+# four of five hooks, and enforces less than the README promises. Same reason the
+# two reviewer briefs are compared across hosts byte for byte.
+#
+# Only the path prefix may differ: "$CLAUDE_PROJECT_DIR"/.claude/hooks/x.sh in
+# settings.json, "${CLAUDE_PLUGIN_ROOT}/hooks/x.sh" in hooks.json. Event, matcher,
+# script and timeout must match. The count is asserted before the comparison,
+# because two empty signatures compare equal and a diff of nothing is a green test.
+WIRING=$(python3 - "$SRC/settings.json" "$SRC/hooks/hooks.json" <<'PY'
+import json, re, sys
+
+def sig(hooks):
+    # event -> sorted list of (matcher, script-or-raw-command, timeout)
+    out = {}
+    for event, entries in hooks.items():
+        rows = []
+        for entry in entries:
+            matcher = entry.get("matcher", "")
+            for h in entry.get("hooks", []):
+                cmd = h.get("command", "")
+                m = re.search(r'hooks/([A-Za-z0-9._-]+\.sh)', cmd)
+                rows.append((matcher, m.group(1) if m else cmd, h.get("timeout")))
+        out[event] = sorted(rows)
+    return out
+
+settings = json.load(open(sys.argv[1]))
+plugin = json.load(open(sys.argv[2]))
+
+a = sig(settings.get("hooks", {}))
+b = sig(plugin.get("hooks", {}))
+
+n = sum(len(v) for v in a.values())
+print("COUNT %d" % n)
+
+if set(a) == set(b):
+    print("OK  both paths register the same %d events" % len(a))
+else:
+    only_a = ", ".join(sorted(set(a) - set(b))) or "none"
+    only_b = ", ".join(sorted(set(b) - set(a))) or "none"
+    print("BAD event mismatch — only in settings.json: %s; only in hooks.json: %s" % (only_a, only_b))
+
+for event in sorted(set(a) & set(b)):
+    if a[event] == b[event]:
+        print("OK  %s matches across both install paths" % event)
+    else:
+        print("BAD %s differs: settings.json %r vs hooks.json %r" % (event, a[event], b[event]))
+
+# The plugin copy must not reach for the project dir to find its own code, and the
+# settings copy must not reach for a plugin root that a cp -R install never sets.
+#
+# Walk the parsed structure rather than regexing a re-dumped blob: these command
+# strings contain their own quotes, so json.dumps escapes them and a
+# '"command": "([^"]*)"' pattern matches nothing at all. That reads as "no
+# offenders found" and passes while checking exactly zero commands.
+def commands(hooks):
+    out = []
+    for entries in hooks.values():
+        for entry in entries:
+            for h in entry.get("hooks", []):
+                out.append(h.get("command", ""))
+    return out
+
+plugin_cmds = [c for c in commands(plugin.get("hooks", {})) if ".sh" in c]
+settings_cmds = [c for c in commands(settings.get("hooks", {})) if ".sh" in c]
+
+if not plugin_cmds or not settings_cmds:
+    print("BAD no script commands extracted (%d plugin, %d settings) — the walker broke"
+          % (len(plugin_cmds), len(settings_cmds)))
+else:
+    print("OK  extracted %d script commands to check" % (len(plugin_cmds) + len(settings_cmds)))
+
+    bad_root = [c for c in plugin_cmds if "CLAUDE_PLUGIN_ROOT" not in c]
+    if bad_root:
+        print("BAD hooks.json resolves a script outside ${CLAUDE_PLUGIN_ROOT}: %s" % bad_root[0])
+    else:
+        print("OK  all %d hooks.json scripts resolve through ${CLAUDE_PLUGIN_ROOT}" % len(plugin_cmds))
+
+    bad_proj = [c for c in settings_cmds if "CLAUDE_PROJECT_DIR" not in c]
+    if bad_proj:
+        print("BAD settings.json resolves a script outside $CLAUDE_PROJECT_DIR: %s" % bad_proj[0])
+    else:
+        print("OK  all %d settings.json scripts resolve through $CLAUDE_PROJECT_DIR" % len(settings_cmds))
+PY
+)
+while IFS= read -r line; do
+  case "$line" in
+    "OK  "*)  ok "${line#OK  }" ;;
+    BAD*)     bad "${line#BAD }" ;;
+    COUNT*)   [ "${line#COUNT }" -gt 0 ] \
+                && ok "the wiring declares ${line#COUNT } hooks to compare" \
+                || bad "no hooks found — the extractor broke, not the wiring" ;;
+  esac
+done <<< "$WIRING"
+
+# The manifest is what makes the plugin installable at all; a plugin directory the
+# marketplace does not list is a plugin nobody can reach.
+MANIFEST="$SRC/.claude-plugin/plugin.json"
+[ -f "$MANIFEST" ] && ok "the plugin ships .claude-plugin/plugin.json" \
+  || bad "no .claude-plugin/plugin.json — /plugin install cannot see this"
+if [ -f "$MANIFEST" ]; then
+  PNAME=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("name",""))' "$MANIFEST")
+  [ "$PNAME" = "spec-gate" ] && ok "and it names itself spec-gate" \
+    || bad "plugin.json name is '$PNAME', not spec-gate"
+fi
+
 ################################################################################
 printf '\n%s%d passed, %d failed%s\n' "$B" "$PASS" "$FAIL" "$N"
 [ "$FAIL" -eq 0 ] || exit 1

@@ -27,7 +27,8 @@ a separate target repo — the one whose code you want gated.
 ## Layout
 
 The directory mirrors the `.claude/` layout it installs into, so the three
-directories copy across recursively with no per-file renaming:
+directories copy across recursively with no per-file renaming — and that same
+layout is what the plugin format expects, so one tree serves both installs:
 
 ```
 spec-gate/
@@ -36,7 +37,12 @@ spec-gate/
 ├── settings.json                    → .claude/settings.json  (MERGE, see below)
 │                                    (.claude/spec-gate-test-cmd is written per
 │                                     repo at install; see RED verification)
+├── .claude-plugin/
+│   └── plugin.json                  the plugin manifest — metadata only
 ├── hooks/
+│   ├── hooks.json                   the plugin's copy of the wiring in
+│   │                                settings.json, via ${CLAUDE_PLUGIN_ROOT};
+│   │                                test.sh pins the two together
 │   ├── review-gate.sh               → .claude/hooks/   Stop hook
 │   ├── phase-guard.sh               → .claude/hooks/   PreToolUse hook
 │   ├── approval-receipt.sh          → .claude/hooks/   PostToolUse hook
@@ -105,10 +111,54 @@ and no `chmod` step is needed.
 
 ## Install
 
-Run from the root of the **target** repo:
+Two ways in. The plugin install is shorter; the manual install is the one
+`test.sh` exercises, and the one to reach for if you want to edit the hooks in
+place.
+
+### As a plugin
+
+```
+/plugin marketplace add Vavly/skills
+/plugin install spec-gate@vavly-skills
+```
+
+Then, from the root of the **target** repo:
 
 ```bash
-SPEC_GATE=~/Documents/projects/AI/Skills/spec-gate   # this directory
+mkdir -p docs/specs
+
+# Teach the RED check how to run this repo's tests. Without it the 3->4 gate
+# cannot be verified in-band and falls back to being terminal-only.
+printf 'yarn jest $SPEC_GATE_TEST_FILES\n' > .claude/spec-gate-test-cmd
+
+printf '.claude/.spec-phase\n.claude/.spec-baseline\n.claude/.spec-red\n.claude/.spec-approval*\n.claude/review-log.jsonl\n' >> .gitignore
+git add .claude .gitignore && git commit -m "add review gate + spec-driven workflow"
+```
+
+**A plugin install cannot carry `permissions.ask`**, and that is a real gap, not a
+detail. The three entries in `settings.json` are what make the agent stop and ask
+before it runs `phase.sh 3`, `4`, or `off` on its own — without them the phase is
+still enforced, but the agent can advance itself through it. There is no plugin
+equivalent, so add them to the target repo's `.claude/settings.json` by hand:
+
+```json
+{
+  "permissions": {
+    "ask": [
+      "Bash(.claude/hooks/phase.sh 3*)",
+      "Bash(.claude/hooks/phase.sh 4*)",
+      "Bash(.claude/hooks/phase.sh off*)"
+    ]
+  }
+}
+```
+
+### By hand
+
+Clone this repo somewhere, then run from the root of the **target** repo:
+
+```bash
+SPEC_GATE=/path/to/skills/plugins/spec-gate   # your clone
 
 mkdir -p .claude docs/specs
 cp -R "$SPEC_GATE"/hooks "$SPEC_GATE"/agents "$SPEC_GATE"/skills .claude/
@@ -127,14 +177,21 @@ files as reviewable** — correctly, since new files are usually the actual work
 so leaving `.claude/` uncommitted makes the gate fire on its own tooling.
 
 `settings.json` needs **merging, not copying**, if the target already has one.
-Two top-level keys are involved: the three event keys go inside the single
+Two top-level keys are involved: the five event keys go inside the single
 existing `hooks` object as siblings of whatever is there, and the `permissions.ask`
 entry goes into any existing `permissions` object. Replacing either object
 wholesale silently drops what was there.
 
-Hooks are re-read from settings by a file watcher, so no session restart is
-needed. Confirm registration with `/hooks` — all five should appear under
-`PreToolUse`, `PostToolUse`, `Stop`, `SubagentStart`, and `SubagentStop`.
+`hooks/hooks.json` is the plugin's copy of that same wiring, differing only in how
+it resolves paths — `${CLAUDE_PLUGIN_ROOT}` instead of `$CLAUDE_PROJECT_DIR`. Two
+copies of the same facts drift, so `test.sh` asserts they register the same five
+events with the same matchers, scripts and timeouts. Change one, change the other.
+
+### Either way
+
+Hooks are re-read by a file watcher, so no session restart is needed. Confirm
+registration with `/hooks` — all five should appear under `PreToolUse`,
+`PostToolUse`, `Stop`, `SubagentStart`, and `SubagentStop`.
 
 ## Running under Cursor
 
@@ -1081,12 +1138,14 @@ you read it.
 
 Builds a throwaway git repo in a temp dir, installs the hooks into it, and drives
 them with synthetic hook payloads. Nothing touches the repo you run it from.
-405 cases: the phase policy, every write vector, the advance-transition matrix,
+417 cases: the phase policy, every write vector, the advance-transition matrix,
 RED verification and the receipt's staleness rules, the approval questions and
 everything the receipt hook refuses to record, fail-closed behavior, the review
 gate with its index-invariance and its between-rounds delta, the slice position
-and its boundary rules, the phase scan with its baseline, and every internal link
-in every skill — target file and heading anchor both.
+and its boundary rules, the phase scan with its baseline, every internal link
+in every skill — target file and heading anchor both — and the two install paths,
+which must register the same five events with the same matchers, scripts and
+timeouts, since `settings.json` and `hooks/hooks.json` are two copies of one fact.
 
 The approval cases lean hard on the *negative* ones, and that is the point:
 roughly half of them drive `approval-receipt.sh` with a payload it should not

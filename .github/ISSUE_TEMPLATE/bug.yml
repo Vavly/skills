@@ -1,0 +1,84 @@
+name: Bug report
+description: A gate that did not fire, fired wrongly, or a hook that errored.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For anything security-relevant — a gate that can be made to fail open, a
+        hook that executes unvalidated input — please use the
+        [private advisory form](https://github.com/Vavly/skills/security/advisories/new)
+        instead of this issue.
+
+  - type: dropdown
+    id: plugin
+    attributes:
+      label: Plugin
+      options:
+        - spec-gate
+        - the marketplace itself
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: How is it installed?
+      description: The two paths carry separate wiring, and it matters which one broke.
+      options:
+        - Plugin (/plugin install)
+        - By hand (cp -R into .claude/)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: host
+    attributes:
+      label: Host
+      options:
+        - Claude Code
+        - Cursor
+        - Both
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What should have happened?
+      description: |
+        For a gate, say which way it should have gone — denied a write, blocked a
+        turn, asked for approval.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The phase you were in, and the tool call or turn that misbehaved.
+    validations:
+      required: true
+
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: "Output of: `bash --version | head -1`, `git --version`, and your OS."
+      render: shell
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: tests
+    attributes:
+      label: Test suite
+      options:
+        - label: "I ran the plugin's `./test.sh` and it passes (if it fails, paste the failing lines above)"

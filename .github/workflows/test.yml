@@ -1,0 +1,132 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  suite:
+    name: suite (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # macOS ships bash 3.2 and Linux runners carry 5.x. That spread is the
+      # reason both legs exist: a bash-4 construct added on Linux fails only on
+      # a Mac, which is where this is developed.
+      - name: Report toolchain
+        run: |
+          echo "default bash: $(bash --version | head -1)"
+          echo "/bin/bash:    $(/bin/bash --version | head -1)"
+          echo "git:          $(git --version)"
+          echo "python3:      $(python3 --version)"
+          echo "jq:           $(jq --version 2>/dev/null || echo 'not installed')"
+
+      - name: Ensure jq
+        run: |
+          if ! command -v jq >/dev/null 2>&1; then
+            if [ "$RUNNER_OS" = "macOS" ]; then brew install jq; else sudo apt-get update && sudo apt-get install -y jq; fi
+          fi
+
+      # On macOS the suite is run under /bin/bash on purpose. The shebang is
+      # `#!/usr/bin/env bash`, which would pick up whatever Homebrew put on PATH
+      # — testing 5.x twice and leaving the 3.2 claim unverified.
+      - name: Run plugin suites
+        run: |
+          set -uo pipefail
+          if [ "$RUNNER_OS" = "macOS" ]; then BASH_BIN=/bin/bash; else BASH_BIN=$(command -v bash); fi
+          echo "running suites with $BASH_BIN"
+
+          found=0
+          status=0
+          for suite in plugins/*/test.sh; do
+            [ -f "$suite" ] || continue
+            found=$((found + 1))
+            plugin=$(basename "$(dirname "$suite")")
+            echo "::group::$plugin"
+            ( cd "$(dirname "$suite")" && "$BASH_BIN" ./test.sh ) || status=1
+            echo "::endgroup::"
+          done
+
+          # A discovery loop that finds nothing exits 0 and reports success. That
+          # is the shape of a green build that tested no code.
+          if [ "$found" -eq 0 ]; then
+            echo "::error::no plugins/*/test.sh found — the discovery glob broke, not the plugins"
+            exit 1
+          fi
+          echo "ran $found suite(s)"
+          exit "$status"
+
+      - name: Check invoked scripts are executable
+        run: |
+          # The cp -R install does no chmod, and settings.json invokes its hooks
+          # directly, so a hook committed without the exec bit installs unrunnable.
+          #
+          # Only scripts named as a command are checked. A blanket sweep over
+          # *.sh is wrong here: phase-policy.sh is sourced, not executed, and is
+          # correctly non-executable — a check that fails on a correct repo is a
+          # check people learn to ignore.
+          python3 - <<'PY'
+          import glob, json, os, re, sys
+
+          def commands(hooks):
+              # Walk the parsed structure. These command strings contain their own
+              # quotes, so regexing a re-dumped blob matches nothing and reports a
+              # clean result having checked zero files.
+              for entries in hooks.values():
+                  for entry in entries:
+                      for h in entry.get("hooks", []):
+                          yield h.get("command", "")
+
+          bad = missing = checked = 0
+          for settings in glob.glob("plugins/*/settings.json"):
+              root = os.path.dirname(settings)
+              hooks = json.load(open(settings)).get("hooks", {})
+              for cmd in commands(hooks):
+                  m = re.search(r'\.claude/hooks/([A-Za-z0-9._-]+\.sh)', cmd)
+                  if not m:
+                      continue
+                  path = os.path.join(root, "hooks", m.group(1))
+                  checked += 1
+                  if not os.path.exists(path):
+                      print(f"::error::{settings} invokes {m.group(1)}, which does not exist at {path}")
+                      missing += 1
+                  elif not os.access(path, os.X_OK):
+                      print(f"::error file={path}::invoked by {settings} but committed without the executable bit")
+                      bad += 1
+
+          if checked == 0:
+              print("::error::no invoked scripts found — the extractor broke, not the plugins")
+              sys.exit(1)
+          print(f"checked {checked} invoked script(s)")
+          sys.exit(1 if (bad or missing) else 0)
+          PY
+
+  # Single stable check name for the branch ruleset to require. Requiring the
+  # matrix legs directly would mean editing the ruleset every time the matrix
+  # changes, and a renamed leg silently stops being required.
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    needs: suite
+    if: always()
+    steps:
+      - name: Verify all suites passed
+        run: |
+          if [ "${{ needs.suite.result }}" != "success" ]; then
+            echo "::error::one or more plugin suites failed"
+            exit 1
+          fi
+          echo "all plugin suites passed"

@@ -1,0 +1,17 @@
+# This repo is almost entirely shell behind a `#!/usr/bin/env bash` shebang.
+# A CRLF checkout makes every hook die with "bad interpreter", and the resulting
+# bug report is unreproducible for anyone on Linux or macOS. Pin LF regardless of
+# the contributor's core.autocrlf.
+*.sh    text eol=lf
+*.bash  text eol=lf
+
+# Hook and plugin manifests are read by Claude Code, not by an editor.
+*.json  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.md    text eol=lf
+
+# Files with no extension that are still shell (none today, but the install
+# writes .claude/spec-gate-test-cmd and contributors copy patterns).
+.editorconfig text eol=lf
+.gitattributes text eol=lf

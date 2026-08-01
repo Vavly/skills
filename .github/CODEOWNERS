@@ -1,0 +1,15 @@
+# Default owner for everything in the repo.
+* @ernestorodriguez
+
+# Paths below execute. A change here runs shell inside every repo that has
+# installed the plugin, so they are called out explicitly rather than relying on
+# the catch-all above — the review requirement should survive someone narrowing
+# that rule later.
+/.claude-plugin/          @ernestorodriguez
+/plugins/*/.claude-plugin/ @ernestorodriguez
+/plugins/*/hooks/         @ernestorodriguez
+/plugins/*/scripts/       @ernestorodriguez
+/plugins/*/skills/*/scripts/ @ernestorodriguez
+
+# CI runs on pull_request and can be edited by a pull request.
+/.github/workflows/       @ernestorodriguez

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "vavly-skills",
+  "description": "Skills and plugins for Claude Code, from Vavly. Tools that move oversight of AI-written code from approving each tool call to reviewing each outcome.",
+  "owner": {
+    "name": "Vavly",
+    "url": "https://github.com/Vavly"
+  },
+  "plugins": [
+    {
+      "name": "spec-gate",
+      "description": "A review gate and spec-driven workflow. A Stop hook refuses to end a turn on a diff that has not been through adversarial review; a PreToolUse hook blocks production code until a spec exists and the user has approved it.",
+      "author": {
+        "name": "Ernesto Rodriguez"
+      },
+      "source": "./plugins/spec-gate",
+      "category": "development",
+      "homepage": "https://github.com/Vavly/skills/tree/main/plugins/spec-gate"
+    }
+  ]
+}

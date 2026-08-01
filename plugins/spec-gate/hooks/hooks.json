@@ -1,0 +1,68 @@
+{
+  "description": "The spec-gate enforcement wiring. Five registrations: a PreToolUse guard that blocks writes the current phase does not allow, a Stop gate that refuses to end a turn on an unreviewed diff, a PostToolUse receipt that records the user's approval answers, and a SubagentStart/Stop bookmark that tracks what each reviewer session has already seen. Paths resolve through ${CLAUDE_PLUGIN_ROOT}; all state stays in the target repo under $CLAUDE_PROJECT_DIR/.claude/.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|NotebookEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/phase-guard.sh\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/review-gate.sh\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/approval-receipt.sh\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "matcher": "adversary|spec-adversary",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/review-bookmark.sh\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "adversary|spec-adversary",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/review-bookmark.sh\"",
+            "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "jq -c '{t: now|todate, agent: .agent_type, msg: .last_assistant_message}' >> \"$CLAUDE_PROJECT_DIR\"/.claude/review-log.jsonl"
+          }
+        ]
+      }
+    ]
+  }
+}

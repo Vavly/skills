@@ -1,0 +1,58 @@
+name: New skill proposal
+description: Propose a new plugin for this marketplace.
+labels: ["new-skill"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Proposals are welcome before the code exists — it is cheaper to break a
+        design on paper. If you have already built it, say so and link the branch.
+
+  - type: input
+    id: name
+    attributes:
+      label: Proposed name
+      description: kebab-case, unique across the marketplace.
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does it solve?
+      description: The situation it addresses, not the feature list.
+    validations:
+      required: true
+
+  - type: textarea
+    id: mechanism
+    attributes:
+      label: What is enforced, and what is merely encouraged?
+      description: |
+        The house rule is that prompts raise the average and hooks raise the
+        minimum. Say which parts of this are hooks (always happen) and which are
+        prompts (need judgment). A design where everything is a prompt is fine —
+        it just should not be described as a gate.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: components
+    attributes:
+      label: What would it ship?
+      options:
+        - label: Commands
+        - label: Agents
+        - label: Skills
+        - label: Hooks
+        - label: MCP servers
+
+  - type: textarea
+    id: testing
+    attributes:
+      label: How would it be tested?
+      description: |
+        Every plugin shipping executable code ships a `test.sh`. Sketch what the
+        suite would assert — especially the negative cases.
+    validations:
+      required: true
