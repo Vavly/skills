@@ -1,5 +1,7 @@
 # skills
 
+[![test](https://github.com/Vavly/skills/actions/workflows/test.yml/badge.svg)](https://github.com/Vavly/skills/actions/workflows/test.yml)
+
 Claude Code plugins from [Vavly](https://github.com/Vavly). One marketplace, added
 once — everything published here shows up without a second repo to track.
 
