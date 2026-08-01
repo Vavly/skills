@@ -341,11 +341,34 @@ write_review_marker() {   # $1 = fingerprint text
 # Nothing here may contain a double quote, a backslash or a tab: the strings are
 # emitted into hand-built JSON by phase.sh and split on tabs by both readers.
 # test.sh pins that.
+# Every gate name, in one place. Three consumers iterate this — phase.sh `ask`
+# validation, phase.sh `status`, and approval-receipt.sh's matcher — and a gate
+# missing from any one of them is a question whose answer nothing redeems, which
+# looks exactly like a user who was never asked. Adding a gate means adding it
+# here and nowhere else.
+gate_list() { printf 'spec red close-out skip abandon leave-review restart force\n'; }
+
+# The last five replaced a terminal. They existed as "go run this in your own
+# shell" for one stated reason: a PreToolUse hook cannot tell a Bash call the
+# model chose from one a slash command made. The receipt answers that — it does
+# not reveal who called, but it proves the *user* answered, because the answer
+# came back through the host and was recorded by a hook the model cannot write
+# to. That is the property the terminal was standing in for.
+#
+# What the terminal also bought was friction: leaving the session to type a path
+# is a moment of attention. A question has to carry that in its wording instead,
+# so each of these names what is being given up rather than just asking to
+# proceed.
 gate_header() {
   case "$1" in
-    spec)      printf 'Spec approval' ;;
-    red)       printf 'Unlock code' ;;
-    close-out) printf 'Close out' ;;
+    spec)         printf 'Spec approval' ;;
+    red)          printf 'Unlock code' ;;
+    close-out)    printf 'Close out' ;;
+    skip)         printf 'Skip ahead' ;;
+    abandon)      printf 'Abandon task' ;;
+    leave-review) printf 'Leave review' ;;
+    restart)      printf 'Discard task' ;;
+    force)        printf 'Force unlock' ;;
   esac
 }
 
@@ -354,6 +377,11 @@ gate_question() {
     spec)      printf 'Approve the spec, and move on to the plan and its failing tests?' ;;
     red)       printf 'Those tests failed. Unlock production code?' ;;
     close-out) printf 'Review is done. What happens to this work?' ;;
+    skip)         printf 'Jump forward past a phase, skipping the approvals in between?' ;;
+    abandon)      printf 'Turn the gate off before any code has been written?' ;;
+    leave-review) printf 'Leave Phase 5 with a diff that is still owed review?' ;;
+    restart)      printf 'Discard the task in progress and re-arm at Phase 1?' ;;
+    force)        printf 'Unlock production code without verified failing tests?' ;;
   esac
 }
 
@@ -374,6 +402,21 @@ gate_options() {
       'pr	Open a pull request	The PR is opened first, then the gate is disarmed. That order is load-bearing: disarming on an uncommitted tree makes the review gate fire on every turn.' \
       'continue	Keep iterating	Stay in Phase 5. Anything that changes from here gets reviewed exactly like the last round did.' \
       'disarm	Disarm and leave it	The phase gate stops and the working tree is what you are left with. The review gate goes back to firing every turn while anything is uncommitted.' ;;
+    skip) printf '%s\n' \
+      'approve	Skip the phases between	You are giving up the approvals in the phases being jumped over — spec approval, or reading the tests fail, or both. Nothing later asks for them again. Choose this only if you already know what those phases would have shown you.' \
+      'decline	Go one phase at a time	The workflow advances normally and each gate is asked in its turn.' ;;
+    abandon) printf '%s\n' \
+      'approve	Turn the gate off	Before Phase 4 the gate is what blocks production code, so turning it off here is the same as unlocking Phase 4 without a spec or a failing test. The review gate then fires on every turn while the tree is dirty.' \
+      'decline	Keep the gate on	The task stays where it is. Retreating to an earlier phase is always available and does not need this.' ;;
+    leave-review) printf '%s\n' \
+      'approve	Leave the review behind	Phases 1 to 4 suppress the review gate, so moving there parks a diff nothing will look at again — it gets folded into the next baseline as though it had been reviewed.' \
+      'decline	Stay in Phase 5	The diff keeps being owed review until it is reviewed and committed.' ;;
+    restart) printf '%s\n' \
+      'approve	Discard it and restart	The task in progress is thrown away: phase, slice position and every approval already given. The working tree is untouched, so whatever was built stays, unreviewed and no longer tracked by the gate.' \
+      'decline	Keep the current task	The task continues from where it is.' ;;
+    force) printf '%s\n' \
+      'approve	Unlock without RED	The check refused: the new tests either passed with no implementation written, or no test files changed at all. Either way nothing has been shown to fail, so Phase 4 unlocks production code on your word rather than on evidence.' \
+      'decline	Fix the tests first	Phase 3 continues. Run the RED check again once the tests fail for the reason the spec expects.' ;;
   esac
 }
 
@@ -424,7 +467,13 @@ gate_subject() {
     # The RED receipt already pins the test contents, so pinning the receipt
     # itself inherits that and costs one hash instead of a re-walk.
     red)  git hash-object "${PROJECT_DIR%/}/.claude/.spec-red" 2>/dev/null ;;
-    close-out) : ;;
+    # These pin no content, for close-out's reason: there is no document being
+    # approved, so there is nothing whose edit should void the answer. What holds
+    # them is the phase/task/slice pin every receipt carries — an answer about
+    # skipping ahead from Phase 2 is spent in Phase 2 and nowhere else — plus a
+    # re-check at the point of use, which is where `force` re-reads the RED
+    # receipt and `leave-review` re-reads what is owed.
+    close-out|skip|abandon|leave-review|restart|force) : ;;
   esac
 }
 

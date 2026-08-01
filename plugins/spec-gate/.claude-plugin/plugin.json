@@ -1,6 +1,6 @@
 {
   "name": "spec-gate",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A review gate and spec-driven workflow. A Stop hook refuses to end a turn on a diff that has not been through adversarial review; a PreToolUse hook blocks production code until a spec exists and the user has approved it.",
   "author": {
     "name": "Ernesto Rodriguez"

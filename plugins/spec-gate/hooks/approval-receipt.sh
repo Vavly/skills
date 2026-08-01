@@ -110,7 +110,7 @@ QS=$(questions)
 # canonical one is not the canonical one, and treating it as such is exactly the
 # hole this check exists to close.
 GATE=""
-for g in spec red close-out; do
+for g in $(gate_list); do
   q=$(gate_question "$g")
   [ -n "$q" ] || continue
   case $'\n'"$QS"$'\n' in
