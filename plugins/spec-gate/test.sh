@@ -1081,33 +1081,141 @@ for want in 'spec-adversary' 'You do not review your own spec' 'Before the tests
   fi
 done
 
-phase start v; phase 2
-reason=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh 3')")
-if printf '%s' "$reason" | grep -qi 'spec-adversary'; then
-  ok "the 2 -> 3 prompt names the reviewer, so a missing verdict is visible"
+group "status and off answer to /spec-driven, not only /spec-phase"
+# The escape hatches were on /spec-phase alone, which a user who typed
+# /spec-driven has no reason to know exists — so "where am I" and "stop" had no
+# reachable spelling from the command they actually used. These pin the two
+# words onto the workflow skill, and pin the one property that keeps `off` from
+# becoming a command the model can reach for.
+#
+# The two words are pinned as their dispatch ROWS, not as the bare words. Both
+# already appear all over this file — `phase.sh status`, "`off` is never yours" —
+# so `grep -F status` passes with the whole section deleted. Confirmed by
+# deleting it: 3 of these 6 cases stayed green, which is the vacuous-test failure
+# `phase.sh red` exists to catch, arriving in the suite that polices it.
+for want in 'Two of those words are not a task' \
+            '| `status` | `phase.sh status` |' \
+            '| `off` | the close-out question below |'; do
+  if printf '%s' "$WORKFLOW" | grep -qF "$want"; then
+    ok "the workflow dispatches on '$want'"
+  else
+    bad "spec-driven no longer answers to '$want' — the escape hatch is unreachable again"
+  fi
+done
+
+# `off` here is the close-out QUESTION, not `phase.sh off`. A dispatch table that
+# ran the bare command would hand the model the one transition the whole design
+# reserves to the user, through a door marked "the user typed it" — and a model
+# that auto-invoked this skill would be holding that door.
+if printf '%s' "$WORKFLOW" | grep -qF 'ask close-out' \
+   && printf '%s' "$WORKFLOW" | grep -qF '`off` is still not yours'; then
+  ok "typed 'off' routes through the close-out question, and says why"
 else
-  bad "2 -> 3 prompt does not mention the spec review: '$reason'"
+  bad "spec-driven's 'off' is not pinned to the close-out question — it can degrade to phase.sh off"
 fi
 
-# Both reviewers' verdicts are worth logging, and a matcher is exact alternation
-# rather than a substring — the same property that let NotebookEdit through [#5].
-# So 'adversary' alone would silently stop logging the spec reviews.
-if python3 -c '
-import json,sys
-d=json.load(open(".claude/settings.json"))
-ms=[h.get("matcher","") for h in d.get("hooks",{}).get("SubagentStop",[])]
-sys.exit(0 if any("spec-adversary" in m for m in ms) else 1)' 2>/dev/null; then
-  ok "the review log matcher covers spec-adversary too"
+# The split has to be stated, or the next edit adds `red` and `ask` here too and
+# the two skills quietly become one with two names.
+if printf '%s' "$WORKFLOW" | grep -qF '/spec-phase'; then
+  ok "the workflow points past its two words at the full control surface"
 else
-  bad "settings.json SubagentStop matcher does not name spec-adversary"
+  bad "spec-driven never names /spec-phase — a user wanting 'red' or a phase number is stranded"
 fi
 
-# Cursor reads .cursor/agents/, not .claude/agents/. An agent added on one side
-# only is an agent the workflow names and that host cannot spawn.
-a=$(cd "$SRC/agents" && ls *.md | sort)
-c=$(cd "$SRC/cursor/agents" && ls *.md | sort)
-[ "$a" = "$c" ] && ok "the Claude Code and Cursor agent sets match" \
-  || bad "agents differ — .claude: $(echo $a) / .cursor: $(echo $c)"
+# The frontmatter is the only part of this a user sees before they type, so a
+# dispatch the argument hint does not advertise is a dispatch nobody finds.
+if grep -qE '^argument-hint:.*status.*off' "$SRC/skills/spec-driven/SKILL.md"; then
+  ok "argument-hint advertises status and off"
+else
+  bad "argument-hint does not mention status/off — the commands exist but are undiscoverable"
+fi
+
+group "The shim: one stable path over a central install"
+# spec-gate installs centrally and is used across many projects, so there is no
+# stable path to hardcode — the plugin's own copy sits at a versioned cache path
+# that moves on every update. Under a plugin install .claude/hooks/ does not
+# exist at all, and every command both skills named died with exit 127. The shim
+# gives each project one spelling that every doc, every permissions.ask rule and
+# every hook message already uses.
+setup_repo
+SHIM_HOME="$WORK/shimhome"; rm -rf "$SHIM_HOME"
+# Two versions, and the ORDER they are written in is the whole test. 0.10.0 goes
+# down first so it is the older by mtime, and it also sorts lexically FIRST
+# ("0.1" < "0.9"). So a name-ordered lookup picks 0.10.0 and a time-ordered one
+# picks 0.9.0, and only then does the assertion below distinguish them.
+#
+# Written the other way round — 0.9.0 first — both orderings return 0.10.0 and
+# the case passes whichever is implemented, which is what it did until a mutation
+# run caught it.
+#
+# mtime is the right key rather than version order: it tracks what was installed
+# most recently, which is what Claude Code is actually running, and that includes
+# a deliberate downgrade.
+for v in 0.10.0 0.9.0; do
+  mkdir -p "$SHIM_HOME/.claude/plugins/cache/vavly-skills/spec-gate/$v"
+  cp -R "$SRC/hooks" "$SHIM_HOME/.claude/plugins/cache/vavly-skills/spec-gate/$v/hooks"
+  sleep 1
+done
+
+SHIMREPO="$WORK/shimrepo"; rm -rf "$SHIMREPO"
+mkdir -p "$SHIMREPO/.claude/hooks" "$SHIMREPO/src/deep"
+cp "$SRC/hooks/phase-shim.sh" "$SHIMREPO/.claude/hooks/phase.sh"
+( cd "$SHIMREPO" && git init -q . && git config user.email t@example.com \
+    && git config user.name test ) >/dev/null 2>&1
+
+# CLAUDE_PROJECT_DIR is unset for Bash tool calls, and setup_repo exports it —
+# leaving it set would test the one case that never reaches the shim's fallback.
+shim() { ( cd "$1" && unset CLAUDE_PROJECT_DIR && HOME="$SHIM_HOME" \
+           bash "$SHIMREPO/.claude/hooks/phase.sh" "${@:2}" 2>&1 ); }
+
+OUT=$(shim "$SHIMREPO" start demo)
+printf '%s' "$OUT" | grep -q "phase 1" \
+  && ok "the shim resolves the plugin copy and runs it" \
+  || bad "the shim did not run phase.sh under a plugin-only install: $OUT"
+
+# The split-brain case. CLAUDE_PROJECT_DIR is set for hooks but NOT for Bash tool
+# calls, so a $PWD fallback wrote a second .spec-phase wherever the caller stood
+# while every hook kept reading the one at the root. Two state files, and the one
+# being enforced is not the one being written.
+shim "$SHIMREPO/src/deep" status >/dev/null 2>&1
+NSTATE=$(find "$SHIMREPO" -name '.spec-phase' | wc -l | tr -d ' ')
+if [ "$NSTATE" = 1 ] && [ -f "$SHIMREPO/.claude/.spec-phase" ]; then
+  ok "invoked from a subdirectory, state still lands at the repo root"
+else
+  bad "subdirectory invocation forked the phase state — $NSTATE .spec-phase files found"
+fi
+
+OUT=$(cd "$SHIMREPO" && unset CLAUDE_PROJECT_DIR && HOME="$SHIM_HOME" bash -x .claude/hooks/phase.sh status 2>&1 \
+      | grep -o 'spec-gate/[0-9.]*/hooks/phase.sh' | head -1)
+case "$OUT" in
+  *0.9.0*)  ok "resolution picks the newest version by mtime, not by name" ;;
+  *0.10.0*) bad "resolution picked 0.10.0 — that is the lexically-first version, not the newest installed" ;;
+  *) bad "resolution picked nothing: '$OUT'" ;;
+esac
+
+# The shim exports CLAUDE_PROJECT_DIR before exec'ing, so the above never reaches
+# phase.sh's OWN fallback — which is the one a manual install depends on, and the
+# one that used to be a bare $PWD. Exercise it directly, the way a Bash tool call
+# would: no shim, no CLAUDE_PROJECT_DIR, standing in a subdirectory.
+DIRECT="$WORK/directrepo"; rm -rf "$DIRECT"
+mkdir -p "$DIRECT/src/deep"
+( cd "$DIRECT" && git init -q . && git config user.email t@example.com \
+    && git config user.name test ) >/dev/null 2>&1
+( cd "$DIRECT/src/deep" && unset CLAUDE_PROJECT_DIR \
+    && bash "$SRC/hooks/phase.sh" start direct ) >/dev/null 2>&1
+if [ -f "$DIRECT/.claude/.spec-phase" ] && [ ! -f "$DIRECT/src/deep/.claude/.spec-phase" ]; then
+  ok "phase.sh run directly from a subdirectory still writes state at the repo root"
+else
+  bad "phase.sh wrote state beside the caller, not at the repo root — the hooks read the other one"
+fi
+
+OUT=$(cd "$SHIMREPO" && unset CLAUDE_PROJECT_DIR && HOME="$WORK/no-such-home" bash .claude/hooks/phase.sh status 2>&1)
+RC=$?
+if [ "$RC" != 0 ] && printf '%s' "$OUT" | grep -q 'cannot find'; then
+  ok "with no plugin installed the shim fails loudly instead of exiting quiet"
+else
+  bad "the shim was silent with no plugin — a no-op reads as 'nothing is wrong': rc=$RC $OUT"
+fi
 
 group "One reviewer session per subject, resumed across rounds"
 # All of this is text in four files and nothing executes any of it, so an edit can
@@ -1732,6 +1840,82 @@ expect_b "disarm chosen: allowed"                      ALLOW '.claude/hooks/phas
 phase 2
 answer close-out 'Disarm and leave it'
 expect_b "an answer does not unlock off from phase 2"  DENY  '.claude/hooks/phase.sh off'
+
+group "The five transitions that used to need a terminal"
+# Each existed as "go run this in your own shell" for one stated reason: a
+# PreToolUse hook cannot tell a Bash call the model chose from one a slash
+# command made. The receipt answers that without a terminal — it proves the USER
+# answered, because the answer came back through the host and was written by a
+# hook the model cannot reach.
+#
+# Three cases per gate, and the middle one is the point: unasked must still deny,
+# or the whole mechanism is decoration.
+#
+#   gate           phase  command                 approve label
+gate_case() {
+  local gate="$1" ph="$2" cmd="$3" yes="$4" no="$5"
+  setup_repo; phase start v
+  [ "$ph" != 1 ] && phase "$ph"
+
+  expect_b "$gate: denied when the user has not been asked" DENY "$cmd"
+
+  answer "$gate" "$no"
+  expect_b "$gate: denied when the user declined"           DENY "$cmd"
+
+  setup_repo; phase start v; [ "$ph" != 1 ] && phase "$ph"
+  answer "$gate" "$yes"
+  expect_b "$gate: allowed once the user approved"          ALLOW "$cmd"
+}
+
+gate_case force        3 '.claude/hooks/phase.sh 4 --force'  'Unlock without RED'      'Fix the tests first'
+gate_case skip         2 '.claude/hooks/phase.sh 5'          'Skip the phases between' 'Go one phase at a time'
+gate_case abandon      2 '.claude/hooks/phase.sh off'        'Turn the gate off'       'Keep the gate on'
+gate_case leave-review 5 '.claude/hooks/phase.sh 2'          'Leave the review behind' 'Stay in Phase 5'
+gate_case restart      2 '.claude/hooks/phase.sh start other' 'Discard it and restart' 'Keep the current task'
+
+# An answer is spent where it was given. Without this a user could approve a skip
+# in Phase 2 and have it redeemed three phases later against a different jump.
+setup_repo; phase start v; phase 2
+answer skip 'Skip the phases between'
+phase 3
+expect_b "an approval does not survive the phase it was given in" DENY '.claude/hooks/phase.sh 5'
+
+group "gate_list is the only place a gate is registered"
+# The list was hardcoded in four files. A gate present in phase-policy.sh but
+# missing from approval-receipt.sh's matcher is a question whose answer nothing
+# redeems — indistinguishable, from the user's side, from never being asked.
+setup_repo
+( . "$SRC/hooks/phase-policy.sh" 2>/dev/null
+  miss=0
+  for g in $(gate_list); do
+    [ -n "$(gate_header "$g")" ] && [ -n "$(gate_question "$g")" ] \
+      && [ -n "$(gate_options "$g")" ] || { echo "$g"; miss=1; }
+  done
+  exit $miss ) > "$WORK/missing" 2>/dev/null
+if [ -s "$WORK/missing" ]; then
+  bad "gates registered but not fully defined: $(tr '\n' ' ' < "$WORK/missing")"
+else
+  ok "every gate in gate_list has a header, a question and options"
+fi
+
+for f in hooks/approval-receipt.sh hooks/phase.sh; do
+  if grep -qF 'gate_list' "$SRC/$f"; then
+    ok "$f iterates gate_list rather than its own copy"
+  else
+    bad "$f still hardcodes the gate names — a new gate will be half-registered"
+  fi
+done
+
+# Every gate must survive the JSON hand-building in phase.sh. A tab splits the
+# option fields and a quote or backslash breaks the payload outright.
+setup_repo; phase start v; phase 2
+badq=0
+for g in $(. "$SRC/hooks/phase-policy.sh" 2>/dev/null; gate_list); do
+  .claude/hooks/phase.sh ask "$g" 2>/dev/null \
+    | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null || { badq=1; echo "$g"; }
+done
+[ "$badq" = 0 ] && ok "every gate emits a valid AskUserQuestion payload" \
+                || bad "some gate emits invalid JSON (above)"
 
 group "Answering a question is not reviewable work"
 # The review gate treats untracked files as owed review, and .claude/ is

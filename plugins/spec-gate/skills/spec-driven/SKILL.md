@@ -1,15 +1,74 @@
 ---
 name: spec-driven
 description: Structured five-phase workflow for non-trivial feature work and refactors — clarify, spec, plan with failing tests, execute, adversarial review. The spec and the plan are adversarially reviewed before the user is asked to approve them. Use when the task is large enough that getting the design wrong is expensive. Skip for one-line fixes, typos, and exploration.
-argument-hint: "[short task name]"
+argument-hint: "[short task name | status | off]"
 ---
 
 # Spec-driven development
 
 Task: $ARGUMENTS
 
-**Before anything else**, run `.claude/hooks/phase.sh status`. If it reports
-inactive, run `.claude/hooks/phase.sh start <short-task-name>` to arm the gate at
+## Two of those words are not a task
+
+`$ARGUMENTS` is normally the thing to build. Two words are not, and they are the
+two a user reaches for when they want *out* rather than *onward*:
+
+| Typed | Do | Then |
+| --- | --- | --- |
+| `status` | `phase.sh status` | report it verbatim and stop |
+| `off` | the close-out question below | act on the answer and stop |
+
+Neither is a shortcut into the workflow. Report, or ask, and the turn ends there.
+
+They live here because the alternative was worse. Every other control is on
+`/spec-phase`, which a user in the middle of a task has no reason to know exists
+— so *where am I* and *stop* had to be reachable from the command they already
+typed. Anything past those two — `red`, `ask`, a phase number — is still
+`/spec-phase`, and saying so is the whole answer.
+
+If `status` reports inactive there is nothing to stop: say that and stop. `off`
+needs a task to end, and `phase.sh ask close-out` refuses without one.
+
+**`off` is still not yours.** It reaches this skill only because a user typed it.
+Arriving at it through your own reasoning is what [Closing out](#closing-out)
+forbids, and finding it in a dispatch table does not launder that.
+
+So `off` is the close-out question, never the bare command: run
+`phase.sh ask close-out`, pass it to `AskUserQuestion` unchanged,
+and do what they answer. *Keep iterating* is a live answer here and it means the
+gate stays on — a user who typed `off` is allowed to change their mind once the
+three options are in front of them, which is most of why this asks rather than
+runs. The guard holds its usual line underneath: from phases 1–3 `off` is denied
+outright and needs their terminal, because leaving at Phase 2 is Phase 4 by
+another name.
+
+Anything else in `$ARGUMENTS` is a task name. Carry on.
+
+## Find phase.sh before you call it
+
+**`phase.sh` below is never a literal path.** Where it lives depends on how
+spec-gate was installed — `.claude/hooks/` by hand, the plugin cache under a
+plugin install — and a skill that hardcodes one spelling is broken on the other.
+So resolve it first, as one command, and use the path it prints for the rest of
+the session:
+
+```bash
+P=$(ls -d .claude/hooks/phase.sh "${CLAUDE_PLUGIN_ROOT:-/nonexistent}"/hooks/phase.sh 2>/dev/null | head -1)
+[ -n "$P" ] || P=$(ls -d ~/.claude/plugins/cache/*/spec-gate/*/hooks/phase.sh 2>/dev/null | tail -1)
+[ -n "$P" ] && { echo "phase.sh: $P"; bash "$P" status; } || echo "STOP: phase.sh not found — spec-gate is not installed in this repo"
+```
+
+The repo's own copy wins over the plugin's, since that is the one its settings
+and permission rules name. Shell variables do not survive between calls, so `$P`
+is gone by your next command — **read the path out of the output and write it in
+full every time.**
+
+If it prints `STOP`, say so and stop. The gate is not installed here, and a
+five-phase workflow narrated over hooks that do not exist enforces nothing while
+looking exactly like one that does.
+
+That call has already given you `status`, which is where the workflow starts. If
+it reports inactive, run `phase.sh start <short-task-name>` to arm the gate at
 Phase 1. Arming is yours to do — Phase 1 is the most restrictive state, so there
 is no risk in it.
 
@@ -18,7 +77,7 @@ a sentence in your message hoping they answer it, and not a permission prompt on
 a shell command they never asked to see. The pattern is the same all three times:
 
 1. Say what you are asking them to decide, and put the evidence on screen.
-2. Run `.claude/hooks/phase.sh ask <gate>` — it prints the question as an
+2. Run `phase.sh ask <gate>` — it prints the question as an
    `AskUserQuestion` payload.
 3. Pass that payload to `AskUserQuestion` **unchanged**, and let them answer.
 4. Act on the answer. The transition they approved now goes through.
@@ -36,7 +95,7 @@ the guard. Everything you want to say about the decision goes in your own messag
 *above* the question, which is where it belongs anyway.
 
 **Never ask the user to run a hook.** They should not have to know that
-`.claude/hooks/phase.sh` exists. You run it; they answer questions.
+`phase.sh` exists. You run it; they answer questions.
 
 If they decline, stop — do not look for another route, and do not ask again until
 something has actually changed. Re-asking until the answer changes is not
@@ -163,7 +222,7 @@ touching. The scale figure is load-bearing later — Phase 5 cannot make
 complexity arguments without it.
 
 **Exit:** blocking unknowns answered, or none exist — then run
-`.claude/hooks/phase.sh 2` **yourself**. This transition is yours. Do not ask the
+`phase.sh 2` **yourself**. This transition is yours. Do not ask the
 user to run it.
 
 ## Phase 2 — Spec
@@ -250,8 +309,8 @@ approves it. The verdict, what you changed in response, and what you declined al
 go to them **before** you ask — they are approving the spec as it now stands, so
 say what moved. "Reviewer found nothing, spec unchanged" is a complete report.
 
-Then `.claude/hooks/phase.sh ask spec`, pass it to `AskUserQuestion`, and run
-`.claude/hooks/phase.sh 3` once they approve. *Send the spec back* means the spec
+Then `phase.sh ask spec`, pass it to `AskUserQuestion`, and run
+`phase.sh 3` once they approve. *Send the spec back* means the spec
 is not finished: ask what is wrong, revise it, and ask again — editing it is what
 clears the answer, so a spec you have not changed is one the gate still refuses.
 
@@ -290,7 +349,7 @@ Then — this is the phase's actual point — **run them and show the failure
 output.** Not a summary of the failure. The output. Use:
 
 ```
-.claude/hooks/phase.sh red
+phase.sh red
 ```
 
 It runs exactly the test files this phase changed, refuses if any of them pass,
@@ -309,8 +368,8 @@ asserts and why this failure is the expected one.** A test that fails with
 reason — it is broken, and you fix it here rather than discovering it in Phase 4.
 
 **Exit:** plan reviewed and its findings handled, every new test failing for the
-right reason, output shown and accounted for — then `.claude/hooks/phase.sh ask
-red`, and `.claude/hooks/phase.sh 4` once they accept the failures.
+right reason, output shown and accounted for — then `phase.sh ask
+red`, and `phase.sh 4` once they accept the failures.
 
 Do not ask in the same breath as `red`. Show the output, say per test what it
 asserts and why that failure is the expected one, and only then put the question.
@@ -365,7 +424,7 @@ the one you will be tempted to leave blank.
 
 **Exit:** plan complete, repo validations green, output shown, report written —
 then run
-`.claude/hooks/phase.sh 5` **yourself**. This transition is yours: advancing
+`phase.sh 5` **yourself**. This transition is yours: advancing
 submits your work for adversarial review, so taking it costs you nothing and
 gains you scrutiny. Do not ask the user to run it, and do not ask them to approve
 it — only 2 → 3 and 3 → 4 raise prompts.
@@ -462,7 +521,7 @@ identical in a log that only records the end**, and only one of them is done.
 
 At `slice n of total` with slices remaining, Phase 5 is where one increment ends
 and the next begins: commit the reviewed work, tick the slice off the checklist in
-the spec, then `.claude/hooks/phase.sh 3` opens the next one. **The commit is not
+the spec, then `phase.sh 3` opens the next one. **The commit is not
 optional and the guard enforces it** — `5 → 3` is refused while anything is owed
 review. If the transition is denied, the message names what is outstanding; commit
 that, do not look for another way forward.
@@ -477,10 +536,10 @@ slice is reviewed does the close-out below apply.
 ### Closing out
 
 The findings being handled does not end the task. Put the review log on screen,
-then **ask what happens to the work**: `.claude/hooks/phase.sh ask close-out`,
+then **ask what happens to the work**: `phase.sh ask close-out`,
 passed to `AskUserQuestion`. Three answers, three different next moves:
 
-- **Open a pull request** — open it, *then* run `.claude/hooks/phase.sh off`.
+- **Open a pull request** — open it, *then* run `phase.sh off`.
   The order is load-bearing and the gate now holds you to it: until the work is
   committed, `off` is denied on this answer, because disarming on a dirty tree
   returns the review gate to firing every turn against your own finished diff.
@@ -489,7 +548,7 @@ passed to `AskUserQuestion`. Three answers, three different next moves:
   Further changes get reviewed exactly like the last ones did, which is the point
   of still being here. `off` is denied outright on this answer; do not re-ask
   until something has actually changed.
-- **Disarm and leave it** — run `.claude/hooks/phase.sh off`. They have said the
+- **Disarm and leave it** — run `phase.sh off`. They have said the
   tree is theirs to deal with.
 
 **Never run `phase.sh off` on your own initiative**, in any phase. Ending the

@@ -1,7 +1,7 @@
 ---
 name: spec-phase
 description: Inspect or advance the spec-driven phase gate.
-argument-hint: "[status | start <task> | red | ask <gate> | 1-5 | off]"
+argument-hint: "[status | start <task> | red | ask <gate> | slices <n> | 1-5 | 4 --force | off]"
 disable-model-invocation: true
 allowed-tools: Bash
 ---
@@ -40,25 +40,28 @@ and only then advance.
 test output. Do not advance in the same turn: the user reads the failures, then
 decides.
 
-**If the transition is reserved to the user's terminal** — do not attempt it.
-Print the command for them to run and stop:
+**If the transition routes around a gate** — it is still the user's, and it is
+still a question. Five of them, each with its own gate, and none of them needs a
+terminal any more:
 
-```
-.claude/hooks/phase.sh <n>
-```
+| From → to | Gate | What the answer is accepting |
+| --- | --- | --- |
+| any forward skip (1→3, 2→4, 2→5, 3→5…) | `skip` | the approvals in the phases being jumped over, given up |
+| `off` from phases 1–3 | `abandon` | the same as unlocking Phase 4 with no spec and no failing test |
+| any move off Phase 5 except `off` | `leave-review` | a diff parked where the review gate cannot see it |
+| `start` while already armed | `restart` | the current task discarded, approvals and all |
+| `4 --force` | `force` | production code unlocked with nothing shown to fail |
 
-| From → to | Why it is the user's |
-| --- | --- |
-| any forward skip (1→3, 2→4, 2→5, 3→5…) | routes around the two approval gates |
-| `off` from phases 1–3 | equivalent to jumping to Phase 4 |
-| any move off Phase 5 except `off` | phases 1–4 suppress the review gate, so this escapes a review that is owed |
-| `start` while already armed | resets to Phase 1 and discards the current task |
-| `4 --force` | advances past the RED check on the user's assertion alone |
+Same procedure as the three above: `.claude/hooks/phase.sh ask <gate>`, pass the
+JSON to `AskUserQuestion` unchanged, act on the answer. **Say what they are giving
+up before you ask** — these five used to cost a trip to a terminal, and that trip
+was doing work: it was a moment of attention this question now has to carry on its
+own.
 
-`phase-guard.sh` denies these when they arrive as a Bash tool call, so attempting
-one only wastes a turn on a denial. It cannot tell a call you chose to make from
-one this skill told you to make — which is exactly why that checkpoint has to be
-taken outside the tool layer entirely.
+The guard denies every one of them until the receipt exists, so there is no route
+forward that skips the asking. What it can never do is tell your Bash call from
+one the user's slash command made — which is why the answer, not the call, is what
+moves anything.
 
 **Otherwise** — run `.claude/hooks/phase.sh $ARGUMENTS` and report the output
 verbatim. These are yours outright: `status`, `red`, `ask`, any retreat to a lower

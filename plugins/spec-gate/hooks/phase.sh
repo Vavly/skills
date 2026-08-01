@@ -1,18 +1,25 @@
 #!/usr/bin/env bash
 # phase.sh — read and set spec-driven phase state.
 #
-# The user's control surface. The two transitions that widen the model's write
-# access (2->3 and 3->4) are theirs: phase-guard.sh turns both into confirmation
-# prompts rather than letting the model take them silently. Forward skips, which
-# would route around either gate, are denied outright and need a real terminal.
+# The user's control surface, reached as /spec-phase rather than by path. Every
+# transition that is the user's — the two that widen write access, and the five
+# that route around them — is a question phase-guard.sh reads an answer to. None
+# of them requires leaving the session any more; what none of them accepts is the
+# model's own say-so, which is what the receipt is for.
 #
-# Install: .claude/hooks/phase.sh  (chmod +x)
+# Install: .claude/hooks/phase.sh  (chmod +x), or via the spec-gate-install skill
 # Add .claude/.spec-phase, .claude/.spec-baseline and .claude/.spec-red to
 # .gitignore
 
 set -uo pipefail
 
-PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
+# CLAUDE_PROJECT_DIR is set for hooks but NOT for Bash tool calls, so a bare
+# $PWD fallback put the state wherever the caller happened to be standing: run
+# from a subdirectory, this wrote a second .spec-phase there while every hook
+# went on reading the one at the repo root. The git toplevel is the same answer
+# the hooks get, from any depth. $PWD stays as the last resort for a non-repo,
+# where the gate is inert anyway.
+PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || printf '%s' "$PWD")}"
 STATE_DIR="$PROJECT_DIR/.claude"
 STATE="$STATE_DIR/.spec-phase"
 BASELINE="$STATE_DIR/.spec-baseline"
@@ -42,6 +49,7 @@ else
   # No policy file means no canonical wording, and a question this script made up
   # is a question approval-receipt.sh will not recognise. Refusing to print one
   # is better than printing one whose answer can never be redeemed.
+  gate_list() { :; }
   gate_header() { :; }
   gate_question() { :; }
   gate_options() { :; }
@@ -105,7 +113,7 @@ verify_red() {
     echo "  Put a command in $TEST_CMD_FILE — it runs from the project root with"
     echo "  \$SPEC_GATE_TEST_FILES set to the test files this phase changed. e.g."
     echo "      printf 'yarn jest \$SPEC_GATE_TEST_FILES\\n' > .claude/spec-gate-test-cmd"
-    echo "  Until then 3 -> 4 stays a terminal-only transition: .claude/hooks/phase.sh 4"
+    echo "  Until then 3 -> 4 needs the force gate: ask with 'phase.sh ask force'."
     return 2
   fi
 
@@ -130,7 +138,7 @@ verify_red() {
     echo "spec-driven: REFUSED — those tests PASSED."
     echo "  A test that passes before the implementation exists is testing nothing."
     echo "  Fix the tests so they fail for the reason you expect, then run"
-    echo "  .claude/hooks/phase.sh red again."
+    echo "  phase.sh red again."
     return 1
   fi
 
@@ -148,7 +156,7 @@ verify_red() {
   echo "  one before you ask them to advance."
   echo
   echo "  Receipt recorded. It is void the moment any of those test files changes,"
-  echo "  so advance before editing them further:  .claude/hooks/phase.sh 4"
+  echo "  so advance before editing them further:  phase.sh 4"
   return 0
 }
 
@@ -242,7 +250,7 @@ case "${1:-status}" in
     T=$(sed -n 's/^task=//p' "$STATE" | head -1)
     echo "spec-driven: phase $(phase_name "$P")  (task: ${T:-unnamed})"
     case "$(slice_status)" in
-      corrupt) echo "  -> slice position is CORRUPT. Recover with: .claude/hooks/phase.sh off" ;;
+      corrupt) echo "  -> slice position is CORRUPT. Recover with: phase.sh off" ;;
       # A 1/1 task is the single-pass workflow and says nothing about slices, so
       # nobody who never asked for them pays a line of output for them.
       *) [ "$(slice_total)" -gt 1 ] && echo "  -> slice $(slice_current) of $(slice_total)" ;;
@@ -250,7 +258,7 @@ case "${1:-status}" in
     # An answer already given and not yet spent. Reported because status is the
     # post-compaction re-read, and asking again a question the user has already
     # answered is precisely the friction this mechanism exists to remove.
-    for g in spec red close-out; do
+    for g in $(gate_list); do
       A=$(approval_status "$g")
       case "$A" in
         none|stale|unverifiable) ;;
@@ -265,7 +273,7 @@ case "${1:-status}" in
          # and the spec review is instructed rather than enforced — the one step
          # a forgetful model can drop without anything noticing.
          echo "  -> the spec goes to the spec-adversary subagent before you are asked"
-         echo "  -> next: 3 Plan + tests — ask with '.claude/hooks/phase.sh ask spec', then advance" ;;
+         echo "  -> next: 3 Plan + tests — ask with 'phase.sh ask spec', then advance" ;;
       3) echo "  -> tests only; production code blocked"
          echo "  -> the plan goes to spec-adversary before the tests are written"
          # Same reason as the line above it: status is the post-compaction re-read,
@@ -273,17 +281,17 @@ case "${1:-status}" in
          # cold round declared than a warm one claimed.
          echo "  -> reuse that session if you still hold it; if not, spawn fresh and say the round started cold"
          case "$(red_receipt_status)" in
-           valid) echo "  -> RED verified — next: 4 Execute, ask with '.claude/hooks/phase.sh ask red'" ;;
-           stale) echo "  -> RED receipt STALE: the tests changed since. Re-run '.claude/hooks/phase.sh red'" ;;
-           *)     echo "  -> RED not verified — next: run '.claude/hooks/phase.sh red' (Claude may do this)" ;;
+           valid) echo "  -> RED verified — next: 4 Execute, ask with 'phase.sh ask red'" ;;
+           stale) echo "  -> RED receipt STALE: the tests changed since. Re-run 'phase.sh red'" ;;
+           *)     echo "  -> RED not verified — next: run 'phase.sh red' (Claude may do this)" ;;
          esac ;;
       4) echo "  -> normal permission flow; tests frozen; review gate suppressed"
          echo "  -> next: 5 Review — Claude may advance" ;;
       5) echo "  -> delegate to the adversary subagent; review gate ARMED"
          echo "  -> after a fix, go back to that same session; a new slice gets a new one"
-         echo "  -> to close out, ask with '.claude/hooks/phase.sh ask close-out' — never disarm on your own" ;;
+         echo "  -> to close out, ask with 'phase.sh ask close-out' — never disarm on your own" ;;
       *) echo "  -> state file is corrupt, and the gate is failing closed."
-         echo "  -> recover with: .claude/hooks/phase.sh off" ;;
+         echo "  -> recover with: phase.sh off" ;;
     esac
     ;;
 
@@ -314,7 +322,7 @@ case "${1:-status}" in
     [ "$N" -ge 1 ] || { echo "spec-driven: a task lands in at least one slice."; exit 1; }
     if [ "$(slice_status)" = corrupt ]; then
       echo "spec-driven: slice position is corrupt; refusing to build on it."
-      echo "  Recover with: .claude/hooks/phase.sh off"
+      echo "  Recover with: phase.sh off"
       exit 1
     fi
     CUR=$(slice_current)
@@ -343,10 +351,9 @@ case "${1:-status}" in
   ask)
     [ -f "$STATE" ] || { echo "spec-driven: not started. Run: phase.sh start <task>" >&2; exit 1; }
     G="${2:-}"
-    case "$G" in
-      spec|red|close-out) ;;
-      *) echo "usage: phase.sh ask <spec|red|close-out>" >&2; exit 1 ;;
-    esac
+    if ! printf '%s' " $(gate_list) " | grep -q " $G "; then
+      echo "usage: phase.sh ask <$(gate_list | tr ' ' '|')>" >&2; exit 1
+    fi
     emit_question "$G" || exit 1
     {
       echo

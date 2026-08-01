@@ -71,7 +71,7 @@ STATE="$PROJECT_DIR/.claude/.spec-phase"
 [ -f "$STATE" ] || exit 0            # workflow not active: nothing to enforce
 
 if [ -z "$PARSER" ]; then
-  deny "phase-guard cannot read the tool call: neither jq nor python3 is on PATH. Failing closed. Install jq, or ask the user to run .claude/hooks/phase.sh off to disable the phase gate."
+  deny "phase-guard cannot read the tool call: neither jq nor python3 is on PATH. Failing closed. Install jq, or ask the user to run phase.sh off to disable the phase gate."
 fi
 
 if [ ! -r "$HOOK_DIR/phase-policy.sh" ]; then
@@ -86,7 +86,7 @@ fi
 PHASE=$(sed -n 's/^phase=//p' "$STATE" | head -1)
 case "$PHASE" in
   1|2|3|4|5) ;;
-  *) deny "phase-guard: .claude/.spec-phase is corrupt (phase=$PHASE). Failing closed, because a broken state file must not silently disable the gate. Ask the user to run .claude/hooks/phase.sh off in their own terminal, or to repair the file." ;;
+  *) deny "phase-guard: .claude/.spec-phase is corrupt (phase=$PHASE). Failing closed, because a broken state file must not silently disable the gate. Ask the user with 'phase.sh ask abandon', or repair the file." ;;
 esac
 
 TOOL=$(json_get tool_name)
@@ -107,11 +107,11 @@ esac
 if [ -n "$CMD" ]; then
   case "$CMD" in
     *.spec-phase*|*.spec-baseline*|*.spec-red*|*.spec-approval*)
-      deny "The phase state is not yours to edit, move or remove — .spec-red and .spec-approval included, because a receipt you could write by hand would assert RED without running anything, or record an approval the user never gave. Change phases with .claude/hooks/phase.sh <n>, verify RED with .claude/hooks/phase.sh red, ask the user with .claude/hooks/phase.sh ask <gate>, and read the current phase with .claude/hooks/phase.sh status." ;;
+      deny "The phase state is not yours to edit, move or remove — .spec-red and .spec-approval included, because a receipt you could write by hand would assert RED without running anything, or record an approval the user never gave. Change phases with phase.sh <n>, verify RED with phase.sh red, ask the user with phase.sh ask <gate>, and read the current phase with phase.sh status." ;;
   esac
 fi
 if [ -n "$PATHS" ] && is_phase_state "$PATHS"; then
-  deny "The phase state is not yours to edit. Only the user changes phases, by running .claude/hooks/phase.sh <n> in their own terminal."
+  deny "The phase state is not yours to edit. Phases change by running phase.sh <n>, and the ones that are the user's change on an answer they gave — never by writing this file."
 fi
 
 # --- Who may advance a phase -------------------------------------------------
@@ -134,22 +134,58 @@ fi
 # every way of failing to recognise an answer lands on the old behaviour.
 #
 # Everything that would route *around* those gates — forward skips, moves off
-# Phase 5, `off` from 1-3 — is still denied here and needs a terminal, since a
-# prompt for those would just be the gate asking permission to skip itself.
+# Phase 5, `off` from 1-3, re-arming, --force — reads a receipt of its own. They
+# were terminal-only for the same limitation, and they stop being terminal-only
+# for the same reason: an answer through the host is evidence the user decided,
+# which a permission prompt on a shell command never was.
 if [ -n "$CMD" ] && printf '%s' "$CMD" | grep -qE '(^|[^[:alnum:]_.+-])phase\.sh([[:space:]]|$)'; then
   ARG=$(printf '%s' "$CMD" | sed -nE 's|.*phase\.sh[[:space:]]+([^[:space:];&|]+).*|\1|p' | head -1)
   ARG=${ARG#[\"\']}; ARG=${ARG%[\"\']}
 
+  # These five used to be "go run it in your own terminal", because a PreToolUse
+  # hook cannot tell a Bash call the model chose from one a slash command made.
+  # The receipt closes that: it does not say who called, but it proves the user
+  # answered, because the answer came back through the host and was written by a
+  # hook the model has no way to reach. So each one is now a question the model
+  # may put, and the transition goes through on the answer.
+  #
+  # The fallback is the safety property and is deliberately today's behaviour: no
+  # receipt, a stale one, or an answer nothing recognised all land on a denial.
+  # What changed is what the denial tells you to do — ask, rather than leave the
+  # session. Nothing here can proceed on the model's own say-so.
+  gated_advance() {
+    # $1 = gate name, $2 = what is being attempted, for the message
+    case "$(approval_status "$1")" in
+      approve)
+        decide allow "The user was asked and approved this: $2. The answer was recorded from their reply, not from Claude." ;;
+      decline)
+        deny "The user was asked and declined this: $2. Do not look for another route, and do not ask again until something has actually changed — re-asking an answered question until the answer changes is not consent." ;;
+      expired)
+        deny "That answer was given at a different point in this task — another phase or slice — so it does not decide this one. Ask again: phase.sh ask $1" ;;
+      *)
+        deny "This needs the user, and they have not been asked yet: $2. Put the question to them — run 'phase.sh ask $1' and pass the JSON it prints to AskUserQuestion unchanged, then act on their answer. Current phase: $PHASE." ;;
+    esac
+  }
+
+  # Deliberately not one helper for every caller. The three sites that used to
+  # share advance_deny are three different decisions — skipping ahead, walking
+  # away from an owed review, and abandoning before any code exists — and one
+  # question standing for all three would be answered once and spent on whichever
+  # came up. Each names its own gate.
   advance_deny() {
-    deny "Only the user advances phases. Ask them to run:  .claude/hooks/phase.sh $1  — in their own terminal, not through Claude. A PreToolUse hook cannot distinguish your Bash call from one a slash command made, so this checkpoint has to live outside the tool layer. Current phase: $PHASE."
+    gated_advance skip "advancing from phase $PHASE to phase $1, which skips the approval gates in between"
   }
 
   # --force is the user's override for a refused RED check, and it exists
   # precisely because the check is the thing standing between the model and
   # production writes. Denied in every phase, before ARG is even considered.
+  # --force advances past the RED check on an assertion rather than on evidence,
+  # which is why it is the one flag the model may never supply on its own. It is
+  # still not the model's: what changed is that the user can now answer for it
+  # here instead of leaving the session, and the answer is what allows it.
   case "$CMD" in
     *--force*)
-      deny "--force is the user's override, not yours. It advances past the RED check on their assertion alone. If the check is refusing, fix the tests: run .claude/hooks/phase.sh red and read what it says." ;;
+      gated_advance force "advancing to Phase 4 with --force, which skips the RED check entirely and unlocks production code without anything having been shown to fail" ;;
   esac
 
   case "$ARG" in
@@ -175,10 +211,10 @@ if [ -n "$CMD" ] && printf '%s' "$CMD" | grep -qE '(^|[^[:alnum:]_.+-])phase\.sh
         ask "Change the number of slices this task lands in? It is currently slice $(slice_current) of $(slice_total), and that total is part of what you approved at 2 -> 3. Claude is asserting this is MORE WORK than estimated — not that the design is wrong. If you think the spec itself no longer holds, decline and ask it to retreat to Phase 2 for a re-approved spec. Whatever you accept, the slice checklist in docs/specs/ must be updated to match."
       fi ;;
     start)
-      deny "The phase gate is already armed at phase $PHASE. Re-arming resets to Phase 1 and is the user's call: .claude/hooks/phase.sh start <task> in their own terminal." ;;
+      gated_advance restart "re-arming at Phase 1, which discards the task currently at phase $PHASE along with every approval already given" ;;
     off)
       # `off` from phases 1-3 grants production writes: same as jumping to 4.
-      [ "$PHASE" -le 3 ] && advance_deny off
+      [ "$PHASE" -le 3 ] && gated_advance abandon "turning the gate off at phase $PHASE, before any production code has been written or any spec approved"
       # From 4 or 5 it expands nothing, which is why this used to be the model's
       # to take freely. That was wrong for a reason that has nothing to do with
       # write access: `off` ends the task, and the end of a task is the one
@@ -215,7 +251,7 @@ if [ -n "$CMD" ] && printf '%s' "$CMD" | grep -qE '(^|[^[:alnum:]_.+-])phase\.sh
         continue)
           deny "The user chose to keep iterating in Phase 5, so the gate stays on and this task is not over. Say what is still outstanding and wait for them. Do not ask again until something has actually changed — re-asking an answered question until the answer changes is not consent." ;;
         expired)
-          deny "That close-out answer was given at a different point in this task — a different phase or slice — so it does not decide this one. Ask again: .claude/hooks/phase.sh ask close-out" ;;
+          deny "That close-out answer was given at a different point in this task — a different phase or slice — so it does not decide this one. Ask again: phase.sh ask close-out" ;;
         *)
           ask "End the spec-driven workflow for this task?${OFF_SLICES} This is the close-out decision: the phase gate stops, and whatever is in the working tree is what you are left with. If the work should become a pull request, say so instead of accepting — that happens before disarming, not after. Note that turning the gate off makes the review gate fire on EVERY turn while the tree is dirty, so decline this if the diff is not committed yet." ;;
       esac ;;
@@ -238,7 +274,7 @@ if [ -n "$CMD" ] && printf '%s' "$CMD" | grep -qE '(^|[^[:alnum:]_.+-])phase\.sh
           fi
           :                               # next slice: this one is clean
         else
-          advance_deny "$ARG"
+          gated_advance leave-review "moving from Phase 5 to phase $ARG while a diff is still owed review — phases 1 to 4 suppress the review gate, so nothing looks at it again"
         fi
       elif [ "$ARG" -lt "$PHASE" ]; then
         :                               # retreat: strictly more restrictive
@@ -269,11 +305,11 @@ if [ -n "$CMD" ] && printf '%s' "$CMD" | grep -qE '(^|[^[:alnum:]_.+-])phase\.sh
           approve)
             decide allow "The user approved this spec through the gate's own question, and no spec document has changed since they answered." ;;
           decline)
-            deny "The user was asked and sent the spec back, and nothing in docs/specs/ has changed since. Revise the spec against what they said, then ask again: .claude/hooks/phase.sh ask spec" ;;
+            deny "The user was asked and sent the spec back, and nothing in docs/specs/ has changed since. Revise the spec against what they said, then ask again: phase.sh ask spec" ;;
           stale)
-            deny "The user's approval does not match what is in docs/specs/ now: either a document moved since they answered, or there was nothing there to approve when they did. Either way it does not cover the spec on disk. Show them the spec as it stands and ask again: .claude/hooks/phase.sh ask spec" ;;
+            deny "The user's approval does not match what is in docs/specs/ now: either a document moved since they answered, or there was nothing there to approve when they did. Either way it does not cover the spec on disk. Show them the spec as it stands and ask again: phase.sh ask spec" ;;
           expired)
-            deny "That approval was given at a different point in this task, so it is an answer about something else. Ask again: .claude/hooks/phase.sh ask spec" ;;
+            deny "That approval was given at a different point in this task, so it is an answer about something else. Ask again: phase.sh ask spec" ;;
           *)
             ask "Approve the spec and advance to Phase 3 (Plan + failing tests)? Approving asserts that you have read docs/specs/ and accept the approach, the types, and the out-of-scope list. The spec should have been through the spec-adversary reviewer first: if you have not seen its verdict in this conversation, decline and ask for it. Phase 3 writes tests only; production code stays blocked until Phase 4." ;;
         esac
@@ -300,18 +336,18 @@ if [ -n "$CMD" ] && printf '%s' "$CMD" | grep -qE '(^|[^[:alnum:]_.+-])phase\.sh
               approve)
                 decide allow "The user read the failures and accepted them through the gate's own question, and the RED receipt they were shown is unchanged." ;;
               decline)
-                deny "The user was asked and said one of those tests failed for the wrong reason. Fix it, re-run .claude/hooks/phase.sh red, and ask again: .claude/hooks/phase.sh ask red" ;;
+                deny "The user was asked and said one of those tests failed for the wrong reason. Fix it, re-run phase.sh red, and ask again: phase.sh ask red" ;;
               stale)
-                deny "The RED receipt has been rewritten since the user answered, so they accepted a different set of failures from the one on disk. Show the new output and ask again: .claude/hooks/phase.sh ask red" ;;
+                deny "The RED receipt has been rewritten since the user answered, so they accepted a different set of failures from the one on disk. Show the new output and ask again: phase.sh ask red" ;;
               expired)
-                deny "That answer was given at a different point in this task, so it is an answer about other failures. Re-run .claude/hooks/phase.sh red and ask again: .claude/hooks/phase.sh ask red" ;;
+                deny "That answer was given at a different point in this task, so it is an answer about other failures. Re-run phase.sh red and ask again: phase.sh ask red" ;;
               *)
                 ask "Advance to Phase 4 (Execute) and unlock production code? RED is mechanically verified: the tests this phase added were run and failed, and none of them has changed since. What that does NOT prove is that they failed for the reason the spec expects — that is the part you are approving. Read the failure output above before accepting." ;;
             esac ;;
           stale)
-            deny "The RED verification is stale: the test files have changed since they were checked. Run .claude/hooks/phase.sh red again, show the output, and then ask to advance. Current phase: $PHASE." ;;
+            deny "The RED verification is stale: the test files have changed since they were checked. Run phase.sh red again, show the output, and then ask to advance. Current phase: $PHASE." ;;
           *)
-            deny "RED has not been verified yet, so Phase 4 stays locked. Run .claude/hooks/phase.sh red — it runs the tests this phase changed and refuses if they pass. Show the failure output, say why each failure is the expected one, then advance. If this repo has no test command configured (.claude/spec-gate-test-cmd), the check cannot run and the user must advance from their own terminal: .claude/hooks/phase.sh 4" ;;
+            deny "RED has not been verified yet, so Phase 4 stays locked. Run phase.sh red — it runs the tests this phase changed and refuses if they pass. Show the failure output, say why each failure is the expected one, then advance. If this repo has no test command configured (.claude/spec-gate-test-cmd), the check cannot run and the force gate covers it: ask with 'phase.sh ask force'" ;;
         esac
       else
         advance_deny "$ARG"

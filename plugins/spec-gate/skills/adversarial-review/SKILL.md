@@ -32,9 +32,17 @@ the repo and prints the change:
 ```bash
 S=$(ls -d .claude/skills/adversarial-review/scripts \
           .cursor/skills/adversarial-review/scripts 2>/dev/null | head -1)
+[ -n "$S" ] || S=$(ls -td ~/.claude/plugins/cache/*/spec-gate/*/skills/adversarial-review/scripts 2>/dev/null | head -1)
 [ -n "$S" ] && bash "$S/resolve-review-target.sh" \
   || echo "STOP: resolve-review-target.sh not found — say so; do not improvise a diff"
 ```
+
+The third location is not optional. A plugin install puts this skill in the
+plugin cache and creates no `.claude/skills/` at all, so without it both of the
+first two miss and the review stops before it starts — a `STOP` that reads like a
+broken repo when it is only a lookup that never learned where plugins live. It is
+ordered last because a repo with its own copy should run that one, and newest
+first because several plugin versions can sit in the cache at once.
 
 It prints one of three things, and each one is your next move:
 

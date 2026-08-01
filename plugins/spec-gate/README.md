@@ -49,6 +49,8 @@ spec-gate/
 │   ├── review-bookmark.sh           → .claude/hooks/   SubagentStart/Stop hook
 │   ├── phase-policy.sh              → .claude/hooks/   shared policy, sourced
 │   ├── phase.sh                     → .claude/hooks/   phase state CLI
+│   ├── phase-shim.sh                → .claude/hooks/phase.sh on a PLUGIN install:
+│   │                                   a pointer to the central copy, no policy
 │   ├── cursor-guard.sh              → .claude/hooks/   Cursor adapter
 │   └── cursor-stop.sh               → .claude/hooks/   Cursor adapter
 ├── agents/
@@ -66,7 +68,8 @@ spec-gate/
 │   │   ├── SKILL.md                 the reviewer's procedure
 │   │   └── scripts/
 │   │       └── resolve-review-target.sh   working tree, or branch against its base
-│   └── spec-phase/SKILL.md          user-only phase control
+│   ├── spec-phase/SKILL.md          user-only phase control
+│   └── spec-gate-install/SKILL.md   user-only per-project setup
 └── cursor/                          for Cursor instead of / alongside Claude Code
     ├── hooks.json                   → .cursor/hooks.json
     └── agents/*.md                  → .cursor/agents/
@@ -115,6 +118,11 @@ Two ways in. The plugin install is shorter; the manual install is the one
 `test.sh` exercises, and the one to reach for if you want to edit the hooks in
 place.
 
+**Driving this from Cursor? Use the [manual install](#by-hand).** The plugin
+install serves Claude Code only, and layering Cursor's hooks on top of it blocks
+every tool call in the repo — see [Running under
+Cursor](#running-under-cursor).
+
 ### As a plugin
 
 ```
@@ -128,18 +136,23 @@ from by name (`vavly-skills`), and the error names only the latter. Outside an
 interactive session the same two steps are `claude plugin marketplace add …` and
 `claude plugin install …`.
 
-Then, from the root of the **target** repo:
+Then, from the root of **each** repo you want gated:
 
-```bash
-mkdir -p docs/specs
-
-# Teach the RED check how to run this repo's tests. Without it the 3->4 gate
-# cannot be verified in-band and falls back to being terminal-only.
-printf 'yarn jest $SPEC_GATE_TEST_FILES\n' > .claude/spec-gate-test-cmd
-
-printf '.claude/.spec-phase\n.claude/.spec-baseline\n.claude/.spec-red\n.claude/.spec-approval*\n.claude/review-log.jsonl\n' >> .gitignore
-git add .claude .gitignore && git commit -m "add review gate + spec-driven workflow"
 ```
+/spec-gate-install
+```
+
+**The plugin installs once; that command runs per project.** Everything the gate
+keeps — the spec, the slice position, the phase, the approvals — is per repo, so
+a central install cannot carry any of it. `spec-gate-install` writes the shim,
+creates `docs/specs/`, adds the five `.gitignore` entries, merges
+`permissions.ask` into any existing `.claude/settings.json`, and works out the
+RED test command from what the repo already has rather than asking cold. It is
+idempotent, and it is also the repair step after a plugin update.
+
+It replaces five copy-paste steps that could each be half-done — which is how a
+plugin install used to end up with phase state on disk and no `phase.sh` to read
+it.
 
 **A plugin install cannot carry `permissions.ask`**, and that is a real gap, not a
 detail. The three entries in `settings.json` are what make the agent stop and ask
@@ -158,6 +171,16 @@ equivalent, so add them to the target repo's `.claude/settings.json` by hand:
   }
 }
 ```
+
+**Those three rules match a literal path, and under a plugin install it is the
+wrong one.** A plugin install has no `.claude/hooks/`, so the skills resolve
+`phase.sh` to the plugin cache — see [Where phase.sh
+lives](#where-phasesh-lives) — and a rule written against `.claude/hooks/…` never
+fires. Copy the resolved path into the rules if you want them, or accept what
+they were always a backstop for: these exist only to cover `bypassPermissions`,
+where a hook's `ask` is not documented to survive. `phase-guard.sh` matches
+`phase.sh` with no path anchor at all, so in every normal permission mode the
+gate asks regardless of where the script was found.
 
 ### By hand
 
@@ -199,6 +222,45 @@ Hooks are re-read by a file watcher, so no session restart is needed. Confirm
 registration with `/hooks` — all five should appear under `PreToolUse`,
 `PostToolUse`, `Stop`, `SubagentStart`, and `SubagentStop`.
 
+### Central install, per-project state
+
+The plugin installs once and is used across many repos, each with its own spec,
+slices and phase. That combination has no path to hardcode, and for a while the
+toolkit hardcoded one anyway: both skills opened with `.claude/hooks/phase.sh
+status`, which exists after a manual install and nowhere else. Under a plugin
+install every command they named died with `exit 127` — so `/spec-phase status`
+reported nothing rather than reporting *that*, and the workflow was unreachable
+by the shorter of the two documented installs.
+
+`spec-gate-install` writes a **shim** to `.claude/hooks/phase.sh` in each repo. It
+holds no policy — it finds the centrally installed copy and `exec`s it — so it is
+a pointer rather than a second copy and there is nothing to drift. What that buys
+is one spelling that every doc, every `permissions.ask` rule and every hook
+message can name, and which survives plugin updates because it resolves at call
+time.
+
+Resolution reads `installed_plugins.json`, the file Claude Code itself uses,
+which records an `installPath` per project — so it answers *which version is this
+repo on* rather than *which versions exist*. The glob fallback orders by **mtime,
+not by name**: versions sort lexically and `0.10.0` sorts below `0.9.0`, so
+picking the lexical last would silently run a policy the guard does not share.
+
+The shim also fixes something that predates it. `CLAUDE_PROJECT_DIR` is set for
+hooks but **not** for Bash tool calls, and `phase.sh` fell back to `$PWD` — so
+running it from a subdirectory wrote a second `.spec-phase` there while every
+hook went on reading the one at the root. Two state files, and the one being
+enforced was not the one being written. The shim pins the project from its own
+location, and `phase.sh` now falls back to the git toplevel rather than `$PWD`,
+which closes it for manual installs too.
+
+**Enforcement never had this bug.** `phase-guard.sh` matches `phase\.sh` with no
+path anchor, so it gated the plugin cache and `.claude/hooks/` identically the
+whole time — what broke was the ability to *call* the thing, not the gate's
+ability to catch it. `test.sh` runs the shim against four fixtures — plugin-only,
+from a subdirectory, two versions present, and none — for the reason
+`resolve-review-target.sh` is executed rather than transcribed: a snippet only
+ever checked by eye drifts from the one that runs.
+
 ## Running under Cursor
 
 Cursor has its own hook system (1.7+) and does not read `.claude/`, so a
@@ -207,7 +269,24 @@ in Cursor — without `.cursor/hooks.json` there is no gate at all, the phase fi
 is just a file the agent can rewrite, and every "enforced" claim below silently
 becomes an instruction.
 
+> **Cursor requires the manual install. Do not use the plugin install for it.**
+> Cursor does not read Claude Code plugins, so `/plugin install` places nothing
+> it can see. Worse, it puts the hook scripts in the plugin cache
+> (`~/.claude/plugins/cache/…`) rather than in the repo — and `.cursor/hooks.json`
+> invokes them at the repo-relative path `./.claude/hooks/cursor-guard.sh`.
+>
+> That combination does not degrade quietly. `failClosed: true` is set on
+> `beforeShellExecution` and `preToolUse`, so a script that is not there is a hook
+> that errors, and a hook that errors **denies the action**. Copying
+> `cursor/hooks.json` on top of a plugin-only install blocks every shell command
+> and every tool call in the repo until you remove it.
+>
+> Run the [by hand](#by-hand) install first — Cursor needs those files in
+> `.claude/hooks/` regardless of which editor you drive them from.
+
 ```bash
+SPEC_GATE=/path/to/skills/plugins/spec-gate   # your clone, as above
+
 mkdir -p .cursor/agents .cursor/skills
 cp "$SPEC_GATE"/cursor/hooks.json .cursor/hooks.json          # MERGE if one exists
 cp "$SPEC_GATE"/cursor/agents/*.md .cursor/agents/
@@ -306,17 +385,58 @@ files depend on, and it is the one worth keeping in step.
 ## Use
 
 ```
-/spec-phase start <task>     arm the gate at Phase 1
+/spec-gate-install           set this repo up — once per project
+
 /spec-driven <task>          run the workflow
+/spec-driven status          where am I
+/spec-driven off             end the task — asks what happens to the work first
+
+/spec-phase start <task>     arm the gate at Phase 1
 /spec-phase status           where am I
 /spec-phase red              run the Phase 3 tests, record RED if they fail
-/spec-phase ask <gate>       put a gate's question to the user: spec | red | close-out
-/spec-phase <1-5>            advance — the three approval gates need an answer first
+/spec-phase ask <gate>       put a gate's question to the user
+/spec-phase slices <n>       set how many slices this task lands in
+/spec-phase <1-5>            advance — every gate needs an answer first
+/spec-phase 4 --force        advance without the RED check, on your answer
 /spec-phase off              disarm
 
 /adversarial-review          review a diff — on its own, no workflow needed
 /adversarial-review <ref>     ...against a ref or path you name
 ```
+
+**You never type a path.** That is the whole surface: eight gates, all answered
+in-conversation, and nothing that sends you to a shell to run a script. The same
+commands work one-shot from outside a session —
+
+```bash
+claude "/spec-phase status"
+claude "/spec-phase off"
+```
+
+— and the leading slash and the quotes both matter. `claude spec-phase off` is
+parsed as a *prompt*, not a command.
+
+Under a plugin install skills may be addressed as `/spec-gate:spec-phase`. Both
+spellings are shown here unqualified because that is what a manual install uses;
+if the bare form does not resolve for you, prefix it with the plugin name.
+
+**`status` and `off` are on both commands deliberately**, and the duplication is
+the point rather than an oversight. `/spec-phase` is the full control surface, and
+a user in the middle of a task has no reason to know it exists — they typed
+`/spec-driven`, so *where am I* and *stop* have to answer to `/spec-driven`. Those
+are the two controls somebody reaches for when they want out rather than onward,
+and making them hunt for a second command name to find either one is the failure
+this is fixing.
+
+The line is drawn at those two. `red`, `ask` and the phase numbers stay on
+`/spec-phase` alone, because they drive the workflow rather than escape it — a
+user who wants those has already read enough to know where they are.
+
+`/spec-driven off` is not a synonym for `phase.sh off`. It puts the close-out
+question first, exactly as [Closing out](#closing-out) does, so *keep iterating*
+remains a live answer for somebody who typed `off` before seeing the three
+options. From phases 1–3 it is the `abandon` gate instead, which asks a harder
+question because leaving at Phase 2 is Phase 4 by another name.
 
 `/adversarial-review` is the reviewer's procedure, and typing it runs that
 procedure directly in the conversation instead of in a subagent. It resolves what
@@ -884,14 +1004,32 @@ The full policy, enforced in `phase-guard.sh` and covered by `test.sh`:
 | 1→2 | model | phase 2 writes only `docs/specs/`; a weak Clarify surfaces at 2→3 |
 | **2→3** | **user, question** | spec approval — the model would approve its own spec |
 | **3→4, RED verified** | **user, question** | unlocks production code; you judge the failures on screen |
-| **3→4, otherwise** | **user, terminal** | nothing verified means nothing to approve |
+| **3→4, otherwise** | **user, question** (`force`) | nothing verified means nothing to approve, so the question says so |
 | 4→5 | model | self-submits to review; strictly more scrutiny |
-| **forward skips** (1→3, 2→4, 2→5, 3→5…) | **user, terminal** | route around the two gates above |
-| **any move off 5 except `off`** | **user, terminal** | phases 1–4 suppress the Stop gate, so this escapes a review that is owed |
-| **`off` from 1–3** | **user, terminal** | equivalent to jumping to Phase 4 |
-| **`off` from 4–5** | **user, question** | ends the task; the close-out decision is not the model's, and it has three answers |
-| **`start` while armed** | **user, terminal** | resets to Phase 1 and discards the current task |
-| **`4 --force`** | **user, terminal** | advances past the RED check on assertion alone |
+| **forward skips** (1→3, 2→4, 2→5, 3→5…) | **user, question** (`skip`) | route around the two gates above |
+| **any move off 5 except `off`** | **user, question** (`leave-review`) | phases 1–4 suppress the Stop gate, so this escapes a review that is owed |
+| **`off` from 1–3** | **user, question** (`abandon`) | equivalent to jumping to Phase 4 |
+| **`off` from 4–5** | **user, question** (`close-out`) | ends the task; the close-out decision is not the model's, and it has three answers |
+| **`start` while armed** | **user, question** (`restart`) | resets to Phase 1 and discards the current task |
+| **`4 --force`** | **user, question** (`force`) | advances past the RED check on assertion alone |
+
+**Every one of those said "user, terminal" until recently**, and the reason they
+stopped is worth keeping. They were terminal-only because *a PreToolUse hook
+cannot tell a Bash call the model chose from one a slash command made* — so
+"the user decides" could not be expressed as an allow, only as a denial pointing
+at a shell. The approval receipt answers exactly that question: it does not
+reveal who called, but it proves the **user** answered, because the answer came
+back through the host and was written by a hook the model cannot reach.
+
+So the terminal requirement was never the point — it was a stand-in for evidence
+that the user decided, and there is now a better one. What the terminal *also*
+bought was friction, and that has to be paid somewhere else: each of these five
+questions names what is being given up rather than just asking to proceed, which
+is why `force` says *nothing has been shown to fail* rather than *skip the check?*
+
+**The fallback is the safety property.** No receipt, a stale one, an
+unparseable payload, or a free-text answer all land on the denial these
+transitions always had. Nothing here can move on the model's own say-so.
 
 One asymmetry worth knowing: **`deny` holds in every permission mode, but a
 hook's `ask` is not documented to survive `bypassPermissions`.** An explicit
