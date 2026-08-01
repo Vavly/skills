@@ -115,6 +115,11 @@ Two ways in. The plugin install is shorter; the manual install is the one
 `test.sh` exercises, and the one to reach for if you want to edit the hooks in
 place.
 
+**Driving this from Cursor? Use the [manual install](#by-hand).** The plugin
+install serves Claude Code only, and layering Cursor's hooks on top of it blocks
+every tool call in the repo — see [Running under
+Cursor](#running-under-cursor).
+
 ### As a plugin
 
 ```
@@ -207,7 +212,24 @@ in Cursor — without `.cursor/hooks.json` there is no gate at all, the phase fi
 is just a file the agent can rewrite, and every "enforced" claim below silently
 becomes an instruction.
 
+> **Cursor requires the manual install. Do not use the plugin install for it.**
+> Cursor does not read Claude Code plugins, so `/plugin install` places nothing
+> it can see. Worse, it puts the hook scripts in the plugin cache
+> (`~/.claude/plugins/cache/…`) rather than in the repo — and `.cursor/hooks.json`
+> invokes them at the repo-relative path `./.claude/hooks/cursor-guard.sh`.
+>
+> That combination does not degrade quietly. `failClosed: true` is set on
+> `beforeShellExecution` and `preToolUse`, so a script that is not there is a hook
+> that errors, and a hook that errors **denies the action**. Copying
+> `cursor/hooks.json` on top of a plugin-only install blocks every shell command
+> and every tool call in the repo until you remove it.
+>
+> Run the [by hand](#by-hand) install first — Cursor needs those files in
+> `.claude/hooks/` regardless of which editor you drive them from.
+
 ```bash
+SPEC_GATE=/path/to/skills/plugins/spec-gate   # your clone, as above
+
 mkdir -p .cursor/agents .cursor/skills
 cp "$SPEC_GATE"/cursor/hooks.json .cursor/hooks.json          # MERGE if one exists
 cp "$SPEC_GATE"/cursor/agents/*.md .cursor/agents/

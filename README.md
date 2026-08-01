@@ -24,6 +24,14 @@ Outside an interactive session, the same two steps are
 `claude plugin marketplace add Vavly/skills` and
 `claude plugin install spec-gate@vavly-skills`.
 
+**Using Cursor?** Plugins are a Claude Code mechanism — Cursor cannot read them,
+so the commands above install nothing it can see. spec-gate ships a Cursor
+adapter, but it is installed by hand; see [Running under
+Cursor](plugins/spec-gate/README.md#running-under-cursor). Do not combine the two:
+Cursor's hooks resolve the scripts at a repo-relative path that a plugin install
+does not create, and they are configured to fail closed, so the result is every
+tool call denied rather than a gate that quietly does nothing.
+
 ## What's here
 
 | Plugin | What it does |
