@@ -138,16 +138,6 @@ case "$PHASE" in 1|2|3|4) exit 0 ;; esac
 # the code shipped keeps the gate armed forever, and committing finished work
 # re-arms it: `git diff HEAD` empties as HEAD moves, changing the fingerprint
 # even though the content is byte-identical.
-EXC=()
-while IFS= read -r e; do
-  [ -n "$e" ] && EXC+=(":(exclude)$e")
-done <<< "$(review_exclude_list 2>/dev/null || true)"
-if [ "${#EXC[@]}" -gt 0 ]; then
-  PSPEC=(-- . "${EXC[@]}")
-else
-  PSPEC=(--)
-fi
-
 # --- The fingerprint is index-invariant, deliberately -------------------------
 # `git add` must not read as a change, because the workflow stages the work
 # before the first review round: from then on `git diff` is exactly what moved
@@ -170,21 +160,12 @@ fi
 #     file's mode shows up there only once it is staged, so it is carried instead
 #     by the `x` flag tree_snapshot puts on the hash field — same reason, one
 #     source each side of the tracked/untracked line.
-review_snapshot() {
-  command -v tree_snapshot >/dev/null 2>&1 || return 0
-  tree_snapshot | while IFS= read -r line; do
-    [ -z "$line" ] && continue
-    is_review_excluded "${line#* }" || printf '%s\n' "$line"
-  done
-}
-
-if command -v tree_snapshot >/dev/null 2>&1; then
-  CHANGES=$( { review_snapshot
-               git diff HEAD --name-only --diff-filter=D "${PSPEC[@]}" \
-                 | sed 's/^/deleted /'
-               git diff HEAD --summary "${PSPEC[@]}" \
-                 | sed -n 's/^ *mode change /mode /p'
-             } 2>/dev/null )
+#
+# It is computed in phase-policy.sh, because review-bookmark.sh records a round
+# with the same function. Two copies would diverge into a delta that reports
+# nonsense while looking authoritative.
+if command -v review_fingerprint >/dev/null 2>&1; then
+  CHANGES=$(review_fingerprint)
 else
   # phase-policy.sh is gone, so the shared snapshot this fingerprint is built on
   # is gone with it. Fall back to the index-sensitive pair instead of to nothing:
@@ -192,8 +173,8 @@ else
   # quietly stopped firing costs the whole guarantee. Duplicating tree_snapshot
   # here would be the other kind of mistake — one copy of that logic, by design.
   echo "review-gate: no tree_snapshot; the fingerprint is index-sensitive, so staging may cost one extra review round." >&2
-  CHANGES=$( { git diff HEAD "${PSPEC[@]}"
-               git status --porcelain "${PSPEC[@]}"
+  CHANGES=$( { git diff HEAD
+               git status --porcelain
              } 2>/dev/null )
 fi
 
@@ -208,7 +189,14 @@ fi
 # A marker written by an older version holds the hash alone. That still compares
 # correctly on line 1, and the empty snapshot below simply means no delta is
 # reported for one round — the same as any first round.
-MARKER="$(git rev-parse --git-dir)/claude-review-gate"
+#
+# The gate is no longer the only writer. review-bookmark.sh records a round the
+# moment `adversary` returns a verdict, which is what the delta message has always
+# claimed to be measuring — the gate can only see rounds it mediated, and it never
+# mediates the first one in Phase 5, where the workflow spawns the reviewer
+# itself. Before that, the first block after a completed review round reported no
+# delta at all, correctly and uselessly.
+MARKER=$(review_marker_path 2>/dev/null) || MARKER="$(git rev-parse --git-dir)/claude-review-gate"
 
 if [ -z "$CHANGES" ]; then
   # Clean tree: nothing is owed, and no round is in flight. Dropping the marker
@@ -336,10 +324,12 @@ Before ending this turn:
    no type checker, no integration tests, a suite that never runs the concurrent
    path — which is exactly where a defect survives everything downstream too.
 
-   **Then stage: `git add -A`.** From then on the index holds what the reviewer
-   has seen and `git diff` holds the response to its verdict, which is what step 1
-   relies on. Staging cannot re-arm this gate — the fingerprint is built from file
-   contents, not index state.
+   **Do not run `git add` — the gate stages for you**, on the way into the
+   reviewer and again the moment its verdict lands. From then on the index holds
+   what the reviewer has seen and `git diff` holds your response to it, which is
+   what step 1 relies on. This used to be your job and it went wrong silently:
+   staging after fixing folds the fixes into the index and the reviewer opens
+   `git diff` on what looks like an untouched tree.
 
 3. Now spawn the `adversary` subagent. **It loads its own procedure from the
    `adversarial-review` skill**, so your message is a pointer, not a briefing —
@@ -364,11 +354,11 @@ Before ending this turn:
 
    Keep the handle the spawn returns. It is what step 1 needs next turn.
 
-4. Act on the result. `git add -A` first, before you edit anything: the verdict
-   has landed, so the tree as it stands is what the reviewer has seen, and
-   everything after it is the next round's `git diff`. Never stage between fixing
-   and messaging — that folds the fixes into the index and leaves the reviewer
-   opening an empty `git diff`.
+4. Act on the result. The staging is already done — the gate ran `git add -A` the
+   moment the verdict landed, before you could touch anything, so the tree as it
+   stands is what the reviewer has seen and everything you do from here is the
+   next round's `git diff`. Never stage between fixing and messaging; you have no
+   reason to run `git add` at all during a review round.
    - `blocker` or `serious` findings: fix them, then stop. The gate will
      re-fingerprint the new diff, and the reviewer that found them judges the
      fixes on the next turn.

@@ -1,7 +1,7 @@
 ---
 name: spec-phase
 description: Inspect or advance the spec-driven phase gate.
-argument-hint: "[status | start <task> | red | 1-5 | off]"
+argument-hint: "[status | start <task> | red | ask <gate> | 1-5 | off]"
 disable-model-invocation: true
 allowed-tools: Bash
 ---
@@ -12,18 +12,25 @@ First run `.claude/hooks/phase.sh status` to see the current phase. Then:
 
 **If the request is `status`** — report the output verbatim and stop.
 
-**If the request is `2 → 3`, `3 → 4`, or `off` from phase 4 or 5** — run it. Each
-raises a confirmation prompt, and accepting it is the user's approval: of the
-spec at 2 → 3, of the test failures at 3 → 4, of ending the task at `off`. Say
-what you are asking them to approve before you make the call, so the prompt is
-not the first they hear of it. If they decline, stop; do not look for another
-route forward.
+**If the request is `2 → 3`, `3 → 4`, or `off` from phase 4 or 5** — these are the
+three decisions that are the user's, so put the question to them rather than
+running straight at the transition. Typing `/spec-phase 3` says they want to
+advance; it does not say they have read the spec, and that is the part being
+approved.
+
+Run `.claude/hooks/phase.sh ask <spec | red | close-out>`, pass the JSON it
+prints to `AskUserQuestion` **unchanged**, and then make the transition their
+answer calls for. Say what you are asking them to decide before you ask it. If
+they decline, stop; do not look for another route forward.
+
+Reworded questions record nothing, which costs them a second prompt for a
+decision they just made.
 
 At `2 → 3`, if the spec has not been through the `spec-adversary` reviewer in this
-conversation, say so before you run it. The prompt tells them to decline in that
-case, and hearing it from you first is the difference between a choice and a
-surprise. They may still want to advance — that is theirs to decide, not yours to
-withhold.
+conversation, say so before you ask. The question's own wording tells them to
+decline in that case, and hearing it from you first is the difference between a
+choice and a surprise. They may still want to advance — that is theirs to decide,
+not yours to withhold.
 
 `3 → 4` additionally needs RED verified first — the guard denies it otherwise and
 says so. If it does, run `.claude/hooks/phase.sh red`, show its output in full,
@@ -54,8 +61,9 @@ one this skill told you to make — which is exactly why that checkpoint has to 
 taken outside the tool layer entirely.
 
 **Otherwise** — run `.claude/hooks/phase.sh $ARGUMENTS` and report the output
-verbatim. These are yours outright: `status`, `red`, any retreat to a lower phase,
-1 → 2, and 4 → 5.
+verbatim. These are yours outright: `status`, `red`, `ask`, any retreat to a lower
+phase, 1 → 2, and 4 → 5. `ask` only prints a question; the answer is what moves
+anything, and the answer is the user's.
 
 `off` is never something you reach for unasked, even here. This skill only runs
 because the user typed it, so running it is fine — but if you arrived at `off`

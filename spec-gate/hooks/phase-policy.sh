@@ -41,9 +41,13 @@ is_spec_path() {
 # for the same reason as the other two: the model runs the RED check through
 # phase.sh, which writes the receipt only when the tests actually failed. A model
 # that could write the receipt directly could assert RED without running anything.
+#
+# .spec-approval is in here for the sharpest version of that reason. It records
+# an answer the *user* gave, and a model that could write it could approve its
+# own spec — which is bug #1 from the review list arriving through a new door.
 is_phase_state() {
   case "$1" in
-    *.spec-phase|*.spec-baseline|*.spec-red) return 0 ;;
+    *.spec-phase|*.spec-baseline|*.spec-red|*.spec-approval) return 0 ;;
   esac
   return 1
 }
@@ -265,6 +269,207 @@ red_receipt_status() {
     want=$(sed -n '/^tests:$/,$p' "$r" | sed '1d')
     [ -n "$want" ] || { printf 'stale\n'; exit 0; }
     if [ "$want" = "$(changed_test_snapshot)" ]; then printf 'valid\n'; else printf 'stale\n'; fi
+  )
+}
+
+# --- The review fingerprint and its marker ------------------------------------
+# What the review gate considers "this diff", and where it records the round it
+# last saw. Both live here rather than in review-gate.sh because there are now two
+# writers: the Stop gate, and review-bookmark.sh at the moment a verdict lands. A
+# second implementation of the fingerprint would not fail loudly — it would make
+# every between-rounds delta garbage, which is the one part of the block message
+# that claims to be fact.
+#
+# Must run from the project root, inside a work tree.
+review_marker_path() {
+  d=$(git rev-parse --git-dir 2>/dev/null) || return 1
+  [ -n "$d" ] || return 1
+  printf '%s/claude-review-gate\n' "$d"
+}
+
+# Content hashes of everything dirty or untracked, minus the excluded paths.
+# Excluded paths are kept out rather than filtered afterwards, so they cannot move
+# the fingerprint at all.
+review_snapshot() {
+  command -v tree_snapshot >/dev/null 2>&1 || return 0
+  tree_snapshot | while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    is_review_excluded "${line#* }" || printf '%s\n' "$line"
+  done
+}
+
+# The full fingerprint: content hashes, plus the two things tree_snapshot cannot
+# carry — deletions (it only hashes files that exist) and tracked-file mode
+# changes. Built only from things `git add` cannot move, which is what lets the
+# workflow stage before a round without paying for a review of having staged.
+review_fingerprint() {
+  command -v tree_snapshot >/dev/null 2>&1 || return 0
+  local exc=() pspec=()
+  while IFS= read -r e; do
+    [ -n "$e" ] && exc+=(":(exclude)$e")
+  done <<< "$(review_exclude_list 2>/dev/null || true)"
+  if [ "${#exc[@]}" -gt 0 ]; then pspec=(-- . "${exc[@]}"); else pspec=(--); fi
+  { review_snapshot
+    git diff HEAD --name-only --diff-filter=D "${pspec[@]}" | sed 's/^/deleted /'
+    git diff HEAD --summary "${pspec[@]}" | sed -n 's/^ *mode change /mode /p'
+  } 2>/dev/null
+}
+
+# Line 1 is the hash, the rest is the snapshot it came from. The hash alone
+# answers "is this the same diff?"; the snapshot also answers "what moved since?",
+# which is the question the next round asks. An empty fingerprint deletes the
+# marker: a round is only in flight while something is owed.
+write_review_marker() {   # $1 = fingerprint text
+  m=$(review_marker_path) || return 0
+  if [ -z "$1" ]; then rm -f "$m" 2>/dev/null; return 0; fi
+  h=$(printf '%s' "$1" | { sha256sum 2>/dev/null || shasum -a 256; } | cut -d' ' -f1)
+  { printf '%s\n' "$h"; printf '%s\n' "$1"; } > "$m" 2>/dev/null
+}
+
+# --- The approval questions --------------------------------------------------
+# The three decisions that are the user's arrive as a real question rather than
+# as a permission prompt on a shell command. The model asks them with
+# AskUserQuestion; `phase.sh ask <gate>` hands it the wording.
+#
+# The wording lives here, in one copy, for a reason that is not tidiness.
+# approval-receipt.sh identifies which gate was answered by matching the question
+# text *verbatim*, so the model cannot ask a softball question and cash the
+# answer against a gate. If the skill carried its own copy, a drifting copy would
+# not fail loudly — it would fail as a question nobody could redeem, which looks
+# exactly like the user never being asked.
+#
+# Nothing here may contain a double quote, a backslash or a tab: the strings are
+# emitted into hand-built JSON by phase.sh and split on tabs by both readers.
+# test.sh pins that.
+gate_header() {
+  case "$1" in
+    spec)      printf 'Spec approval' ;;
+    red)       printf 'Unlock code' ;;
+    close-out) printf 'Close out' ;;
+  esac
+}
+
+gate_question() {
+  case "$1" in
+    spec)      printf 'Approve the spec, and move on to the plan and its failing tests?' ;;
+    red)       printf 'Those tests failed. Unlock production code?' ;;
+    close-out) printf 'Review is done. What happens to this work?' ;;
+  esac
+}
+
+# <verdict>\t<label>\t<description>, one choice per line.
+#
+# The label is what approval-receipt.sh looks for in the user's answer, so each
+# one has to be a distinctive phrase rather than Yes / No — a bare "Yes" would
+# match half of anything.
+gate_options() {
+  case "$1" in
+    spec) printf '%s\n' \
+      'approve	Approve the spec	You have read the spec in docs/specs/ and accept the approach, the types and the out-of-scope list. Phase 3 writes tests only; production code stays blocked until you have seen them fail.' \
+      'decline	Send the spec back	Something is wrong or missing. Say what, and it gets revised before you are asked again. Choose this if the spec-adversary verdict is not in this conversation.' ;;
+    red) printf '%s\n' \
+      'approve	Accept these failures	Each failure above is the one the spec expects, not an import error or a broken fixture. Phase 4 unlocks production code and freezes the tests.' \
+      'decline	One of them is broken	A test failed for the wrong reason. It gets fixed and RED re-verified before you are asked again.' ;;
+    close-out) printf '%s\n' \
+      'pr	Open a pull request	The PR is opened first, then the gate is disarmed. That order is load-bearing: disarming on an uncommitted tree makes the review gate fire on every turn.' \
+      'continue	Keep iterating	Stay in Phase 5. Anything that changes from here gets reviewed exactly like the last round did.' \
+      'disarm	Disarm and leave it	The phase gate stops and the working tree is what you are left with. The review gate goes back to firing every turn while anything is uncommitted.' ;;
+  esac
+}
+
+# --- The approval receipt ----------------------------------------------------
+# What the user answered, recorded where a hook can read it. Written only by
+# approval-receipt.sh from a PostToolUse payload — the answer comes from the
+# host, so the model cannot forge one, and .spec-approval is denied to it by
+# is_phase_state above.
+#
+# This is the same shape as the RED receipt and exists for the same reason: the
+# asking and the acting are separate acts, and something has to survive between
+# them without being the model's word for it.
+#
+# Two things pin a receipt to the moment it was given. Every receipt carries the
+# task, phase and slice it was answered in, so an answer cannot be spent on a
+# later question. On top of that, the two gates that approve a *document* carry a
+# content fingerprint of what was approved, so editing the thing after the answer
+# voids it — the same attack `.spec-red` exists to close.
+#
+# close-out carries no fingerprint, deliberately. The tree moves between the
+# answer and the act on the `pr` path, because opening the PR is the commit; a
+# content pin there would void every approval it was meant to carry. What guards
+# that path instead is review_pending_paths, checked at the point of use.
+approval_path() { printf '%s/.claude/.spec-approval' "${PROJECT_DIR%/}"; }
+
+# Content hashes of the spec documents, in the tree_snapshot format. Untracked
+# specs are hashed too: the first spec of a task is always untracked, and a
+# fingerprint blind to it would approve a document and then not notice it being
+# rewritten — bug #2, in a new place.
+spec_snapshot() {
+  files=$( { git ls-files -- docs/specs
+             git ls-files --others --exclude-standard -- docs/specs
+           } 2>/dev/null | sort -u )
+  [ -z "$files" ] && return 0
+  existing=""
+  while IFS= read -r f; do
+    [ -n "$f" ] && [ -f "$f" ] && existing="$existing$f"$'\n'
+  done <<< "$files"
+  [ -z "$existing" ] && return 0
+  paste -d' ' <(printf '%s' "$existing" | git hash-object --stdin-paths 2>/dev/null) \
+              <(printf '%s' "$existing") 2>/dev/null
+}
+
+# What a receipt for this gate is pinned to. Must run from the project root.
+gate_subject() {
+  case "$1" in
+    spec) spec_snapshot ;;
+    # The RED receipt already pins the test contents, so pinning the receipt
+    # itself inherits that and costs one hash instead of a re-walk.
+    red)  git hash-object "${PROJECT_DIR%/}/.claude/.spec-red" 2>/dev/null ;;
+    close-out) : ;;
+  esac
+}
+
+# <verdict> | expired | stale | none | unverifiable. The verdict *is* the status
+# when the receipt is good, the same split as red_receipt_status: a caller that
+# only wants to know whether it may proceed compares against the verdict it
+# needs, and a caller that must distinguish "not asked" from "asked and refused"
+# can.
+#
+# The two failure states are separate because they are different events and the
+# user is told which one happened. `expired` means the answer was given at a
+# different point in the task — another phase, another slice — so it is about
+# something else. `stale` means the answer was about this moment but not about
+# what is now on disk. Collapsing them was the first version, and it produced a
+# denial telling the user a spec had changed when what had actually happened was
+# that there was never a spec to approve. A gate that misreports why it refused
+# teaches people to stop reading its refusals.
+approval_status() {
+  (
+    g="$1"
+    a=$(approval_path)
+    [ -r "$a" ] || { printf 'none\n'; exit 0; }
+    [ "$(sed -n 's/^gate=//p' "$a" | head -1)" = "$g" ] || { printf 'none\n'; exit 0; }
+    v=$(sed -n 's/^verdict=//p' "$a" | head -1)
+    [ -n "$v" ] || { printf 'stale\n'; exit 0; }
+
+    s="${PROJECT_DIR%/}/.claude/.spec-phase"
+    [ -r "$s" ] || { printf 'expired\n'; exit 0; }
+    for k in phase task slice; do
+      [ "$(sed -n "s/^$k=//p" "$a" | head -1)" = "$(sed -n "s/^$k=//p" "$s" | head -1)" ] \
+        || { printf 'expired\n'; exit 0; }
+    done
+
+    cd "$PROJECT_DIR" 2>/dev/null || { printf 'unverifiable\n'; exit 0; }
+    git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { printf 'unverifiable\n'; exit 0; }
+    want=$(sed -n '/^subject:$/,$p' "$a" | sed '1d')
+    case "$g" in
+      # An empty fingerprint on a gate that approves a document means there was
+      # no document. Refusing rather than passing is the same call as an empty
+      # `tests:` block in the RED receipt: nothing was pinned, so nothing is
+      # covered, and the approval would silently cover whatever appeared later.
+      spec|red) [ -n "$want" ] || { printf 'stale\n'; exit 0; } ;;
+    esac
+    [ "$want" = "$(gate_subject "$g")" ] || { printf 'stale\n'; exit 0; }
+    printf '%s\n' "$v"
   )
 }
 

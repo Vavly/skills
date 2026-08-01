@@ -25,90 +25,75 @@ the reason you are not being asked to run the suite.
 
 ## 1. Resolve what you are reviewing
 
-If the caller named a ref, a range or a path, that is the target. Otherwise
-resolve it from the repo, in this order:
+If the caller named a ref, a range or a path, that is the target and you diff it
+directly. Otherwise run the script bundled with this skill, which resolves it from
+the repo and prints the change:
 
 ```bash
-git status --porcelain
+S=$(ls -d .claude/skills/adversarial-review/scripts \
+          .cursor/skills/adversarial-review/scripts 2>/dev/null | head -1)
+[ -n "$S" ] && bash "$S/resolve-review-target.sh" \
+  || echo "STOP: resolve-review-target.sh not found — say so; do not improvise a diff"
 ```
 
-**Anything staged, unstaged, or untracked → the working tree is the target.** The
-change is `git diff HEAD` plus the untracked files, which you read directly. If
-the author staged the work, new files are already in `git diff HEAD` and only
-unstaged strays need the direct read — see [Follow-up
-rounds](#follow-up-rounds), which is what the staging is for.
+It prints one of three things, and each one is your next move:
 
-**Nothing there → the target is the whole branch.** A clean tree means the work is
-committed, not that there is nothing to review, and the branch is the unit that
-ships. **Every candidate trunk has to be verified to exist before it is used:**
+| Output | What it means | What you do |
+| --- | --- | --- |
+| `TARGET: working tree` | something is staged, unstaged or untracked | it has printed `git status --porcelain` and `git diff HEAD`; **read any untracked file directly**, since a diff cannot show you one |
+| `TARGET: branch <trunk> @ <base>..<tip>` | clean tree, so the work is committed | it has printed the log and the diff for that range; **record the base, trunk and tip** |
+| `STOP: <reason>` | nothing resolved | say so and ask what to review. Do not fall back to `HEAD~1`, and do not review an empty diff |
 
-```bash
-TRUNK=""; BASE=""; STOP=""; HEADSHA=$(git rev-parse HEAD)
-for c in "$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null)" \
-         origin/main origin/master origin/develop main master develop trunk; do
-  [ -n "$c" ] || continue
-  git rev-parse --verify --quiet "$c^{commit}" >/dev/null || continue
-  M=$(git merge-base HEAD "$c" 2>/dev/null) || continue
-  [ -n "$M" ] || continue
-  if [ "$M" = "$HEADSHA" ]; then
-    STOP="HEAD is not ahead of $c, so there is no branch to review"; break
-  fi
-  BASE="$M"; TRUNK="$c"; break
-done
-[ -n "$BASE" ] || STOP="${STOP:-no trunk resolved among the candidates}"
+If the author staged the work, new files are already inside `git diff HEAD` and
+only unstaged strays need the direct read — that is what the staging is for, see
+[Follow-up rounds](#follow-up-rounds).
 
-if [ -n "$STOP" ]; then
-  echo "STOP: $STOP — ask which ref to review; do not diff"
-else
-  git diff "$BASE"..HEAD
-fi
-```
+**Record the base, the trunk and the tip** in branch mode. [Follow-up
+rounds](#follow-up-rounds) needs them, and re-deriving the base after a commit
+lands gives a different answer.
 
-**`git rev-parse --verify` on each candidate is the whole point of the loop, not
-a nicety.** `git merge-base HEAD main` against a repo whose trunk is `master`
-fails, leaves `BASE` empty, and turns `git diff "$BASE"..HEAD` into `git diff
-..HEAD` — which git reads as `HEAD..HEAD`. That exits 0 with no output. **A diff
-of nothing is indistinguishable from a change with nothing wrong in it**, so the
-unverified version of this fails by reporting `sound` on work it never read, which
-is the worst outcome available to a reviewer.
+If the script is missing — a partial install, or a host that put the skill
+somewhere else — say so and ask the caller for a ref rather than reconstructing
+the resolution by hand. The reasoning below is why that reconstruction is harder
+than it looks.
 
-**The diff sits inside the `else`, and that placement is the guard.** An earlier
-version of this block printed a warning and then ran `git diff` anyway on the next
-line — a bare `[ -n "$BASE" ] || { echo …; }` stops nothing. It printed *"no trunk
-resolved"* and produced the empty diff described above, in the same breath. A
-warning the code then ignores is worse than no warning, because the transcript
-shows a check that appears to have run.
+### Why the resolution is a script and not four commands
+
+**Every candidate trunk is verified to exist before it is used**, with
+`git rev-parse --verify`, and that is the whole point of the loop rather than a
+nicety. `git merge-base HEAD main` against a repo whose trunk is `master` fails,
+leaves the base empty, and turns `git diff "$BASE"..HEAD` into `git diff ..HEAD` —
+which git reads as `HEAD..HEAD`. That exits 0 with no output. **A diff of nothing
+is indistinguishable from a change with nothing wrong in it**, so the unverified
+version fails by reporting `sound` on work it never read, which is the worst
+outcome available to a reviewer.
+
+**Every refusal exits before `git diff` runs.** An earlier version printed a
+warning and then ran `git diff` anyway on the next line — a bare
+`[ -n "$BASE" ] || { echo …; }` stops nothing. It printed *"no trunk resolved"*
+and produced the empty diff described above, in the same breath. A warning the
+code then ignores is worse than no warning, because the transcript shows a check
+that appears to have run.
 
 **`HEAD` being the trunk is caught in the loop, not left to prose.** If
 `git merge-base HEAD main` returns `HEAD` itself, the branch is not ahead of
-anything: `BASE` is non-empty, every guard passes, and the diff is empty with
+anything: the base is non-empty, every guard passes, and the diff is empty with
 nothing printed at all — strictly quieter than the case above. This is also the
 *likely* one, because committing straight to the trunk and then reaching for a
-review is exactly the standalone use branch mode exists for. `[ "$M" = "$HEADSHA" ]`
-is the test; the loop breaks with a reason rather than trying the next candidate,
-since a base found against some other trunk would not be the review you wanted.
+review is exactly the standalone use branch mode exists for.
 
-Two things the candidate list gets right and an obvious version does not:
+Two things the candidate list — `origin/HEAD`, then
+`origin/main origin/master origin/develop`, then their local equivalents — gets
+right and an obvious version does not:
 
-- **`origin/HEAD` is used as-is, not stripped to a local branch name.** It is a
-  ref that is known to resolve; the local branch of the same name may not exist at
-  all, and rewriting a working ref into a possibly-missing one is how the bug
-  above gets reintroduced.
+- **`origin/HEAD` is used as-is, not stripped to a local branch name.** It comes
+  from `git symbolic-ref` and is known to resolve; the local branch of the same
+  name may not exist at all, and rewriting a working ref into a possibly-missing
+  one is how the bug above gets reintroduced.
 - **`init.defaultBranch` is not in the list.** It describes what `git init` would
   name a trunk in a repo created from now on, not what this repo's trunk is
   called. It agrees often enough to look correct and is not evidence.
 
-**If nothing resolves, stop and ask.** Do not fall back to `HEAD~1`, and do not
-review an empty diff — say no trunk could be resolved and let the caller name one.
-
-`git log --oneline "$BASE"..HEAD` tells you how the work arrived, though a change
-that is wrong is wrong regardless of which commit introduced it.
-
-**Record `BASE`, the trunk you resolved, and the current tip** — [Follow-up
-rounds](#follow-up-rounds) needs them, and re-deriving `BASE` after a commit lands
-gives a different answer.
-
-If `HEAD` is the trunk there is no branch to diff. Say so and ask what to review.
 Either way, say which target you resolved and which trunk you resolved it against,
 in one line, before you spend anything on it.
 

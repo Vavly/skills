@@ -37,7 +37,10 @@ setup_repo() {
   echo 'orig' > src/x.ts
   echo 'orig' > src/x.test.ts
   echo 'orig' > tests/helper.ts
-  printf '.claude/.spec-phase\n.claude/.spec-baseline\n.claude/.spec-red\n.claude/review-log.jsonl\n' > .gitignore
+  # Must stay identical to the install block in README.md. An untracked state
+  # file is work the review gate considers owed, so a name missing here is a gate
+  # that arms itself every time it writes its own bookkeeping.
+  printf '.claude/.spec-phase\n.claude/.spec-baseline\n.claude/.spec-red\n.claude/.spec-approval*\n.claude/review-log.jsonl\n' > .gitignore
   git add -A >/dev/null 2>&1; git commit -qm init
   export CLAUDE_PROJECT_DIR="$PWD"
   rm -f .git/claude-review-gate
@@ -399,6 +402,112 @@ printf '%s' "$D" | grep -qi 'no longer differs' \
   && bad "the next task inherited the last one's snapshot" \
   || ok "the next task starts without a delta"
 
+group "The bookmark is kept by a hook, not by the caller"
+# Both jobs here were prose that failed in real use. Staging went wrong silently
+# in the dangerous direction — staged after revising, so the reviewer opened an
+# empty `git diff` — and the gate had no record of a review round it did not
+# mediate, which is every first round in Phase 5.
+bookmark() { # <event> <agent>
+  python3 -c 'import json,sys; print(json.dumps({"hook_event_name":sys.argv[1],"agent_type":sys.argv[2],"cwd":sys.argv[3]}))' \
+    "$1" "$2" "$PWD" | .claude/hooks/review-bookmark.sh >/dev/null 2>&1
+}
+
+setup_repo; phase off
+echo 'round one work' > src/new.ts
+bookmark SubagentStart adversary
+if [ -z "$(git diff --name-only)" ] && [ -n "$(git diff --cached --name-only)" ]; then
+  ok "spawning a reviewer stages the work it is about to judge"
+else
+  bad "SubagentStart left the tree unstaged — the reviewer sees no bookmark"
+fi
+
+# The gate has never run: this is the Phase 5 shape, where the workflow spawns the
+# reviewer itself and the gate only wakes up at the end of the turn.
+rm -f .git/claude-review-gate
+bookmark SubagentStop adversary
+if [ -f .git/claude-review-gate ]; then
+  ok "a landed verdict records the round, even one the gate never mediated"
+else
+  bad "SubagentStop did not seed the marker — the next block reports no delta"
+fi
+echo 'the fix' >> src/new.ts
+D=$(printf '{"stop_hook_active":false}' | .claude/hooks/review-gate.sh 2>&1 >/dev/null)
+if printf '%s' "$D" | grep -qF 'Changed since the last review round'; then
+  ok "the first block after a workflow-driven round reports its delta"
+else
+  bad "no delta after a recorded round — the marker is not being read"
+fi
+
+# Staging on the way out is the half that kept failing. It has to land before the
+# caller can touch anything, which is what SubagentStop buys.
+setup_repo; phase off
+echo 'work' > src/new.ts
+bookmark SubagentStart adversary
+echo 'a fix made in response to the verdict' >> src/new.ts
+bookmark SubagentStop adversary
+if [ -z "$(git diff --name-only)" ]; then
+  ok "the verdict landing re-stages, so the next round's diff starts empty"
+else
+  bad "SubagentStop did not re-stage — round three would show round two's fix"
+fi
+
+# The design reviewer must not seed the code reviewer's marker. It runs at phases
+# 2-3, so a marker written from its rounds would make Phase 5's first delta list
+# every file written in phases 3 and 4.
+setup_repo; phase off
+echo 'work' > src/new.ts
+rm -f .git/claude-review-gate
+bookmark SubagentStop spec-adversary
+if [ ! -f .git/claude-review-gate ]; then
+  ok "spec-adversary stages but does not record the code reviewer's round"
+else
+  bad "a design review seeded the code review marker — wrong subject"
+fi
+if [ -n "$(git diff --cached --name-only)" ]; then
+  ok "spec-adversary still stages on the way out"
+else
+  bad "spec-adversary left the spec unstaged — its own round two loses the diff"
+fi
+
+# Any other subagent is none of this hook's business, even if a wider matcher
+# lets it through.
+setup_repo; phase off
+echo 'work' > src/new.ts
+bookmark SubagentStop Explore
+if [ -z "$(git diff --cached --name-only)" ]; then
+  ok "an unrelated subagent does not touch the index"
+else
+  bad "review-bookmark.sh staged on a subagent that is not a reviewer"
+fi
+
+# One implementation of the fingerprint, or the delta compares two different ideas
+# of what changed and reports nonsense authoritatively.
+if grep -qF 'review_fingerprint' "$SRC/hooks/review-gate.sh" \
+   && grep -qF 'review_fingerprint' "$SRC/hooks/review-bookmark.sh" \
+   && grep -qF 'review_fingerprint()' "$SRC/hooks/phase-policy.sh"; then
+  ok "both marker writers share one fingerprint implementation"
+else
+  bad "the fingerprint is implemented more than once — the delta will drift"
+fi
+if [ -x "$SRC/hooks/review-bookmark.sh" ]; then
+  ok "review-bookmark.sh is committed executable"
+else
+  bad "review-bookmark.sh is not executable — cp -R installs a hook that cannot run"
+fi
+if python3 -c '
+import json, sys
+d = json.load(open(".claude/settings.json"))
+h = d.get("hooks", {})
+def wired(ev):
+    return any("adversary" in (x.get("matcher") or "")
+               and any("review-bookmark" in c.get("command", "") for c in x.get("hooks", []))
+               for x in h.get(ev, []))
+sys.exit(0 if wired("SubagentStart") and wired("SubagentStop") else 1)' 2>/dev/null; then
+  ok "settings.json wires the bookmark hook to both ends of a review"
+else
+  bad "settings.json does not run review-bookmark.sh on both SubagentStart and SubagentStop"
+fi
+
 group "The block message drives the caller, not the reviewer"
 # The split: the reviewer loads its own procedure from the skill, so the spawn text
 # here is a pointer. What stays is everything a read-only subagent cannot do —
@@ -421,11 +530,21 @@ for want in 'Use the `adversarial-review` skill and follow it' 'a pointer, not a
 done
 # Validate before the spawn, and stage before the reviewer sees anything. Both are
 # caller-only: the reviewer cannot fix a red suite and must not touch the index.
-for want in 'get it green' 'do not invent a list' 'VALIDATION REPORT' 'git add -A'; do
+for want in 'get it green' 'do not invent a list' 'VALIDATION REPORT'; do
   if printf '%s' "$BLOCK" | grep -qF "$want"; then
     ok "block message runs validations before spawning: '$want'"
   else
     bad "block message dropped the pre-spawn work: '$want' is gone"
+  fi
+done
+# Staging moved to review-bookmark.sh because the caller kept getting it wrong.
+# The message must now tell the caller to keep its hands off the index — an
+# instruction to run `git add` is the thing that broke the bookmark.
+for want in 'the gate stages for you' 'no reason to run'; do
+  if printf '%s' "$BLOCK" | grep -qF "$want"; then
+    ok "block message hands staging to the hook: '$want'"
+  else
+    bad "block message still asks the caller to stage: '$want' is gone"
   fi
 done
 # The gate fires again on the fixed diff, and that round is where a fresh spawn
@@ -615,26 +734,34 @@ if printf '%s' "$RES" | grep -qF 'init.defaultBranch}'; then
 else
   ok "trunk resolution does not trust init.defaultBranch"
 fi
-# Live check of the documented loop against the case that used to fail silently:
-# master trunk, no remote. Extracted from the skill so the test cannot pass while
-# the documented snippet rots.
+# Live check of the resolution against the case that used to fail silently: master
+# trunk, no remote. The skill ships this as a script rather than a fenced block a
+# reviewer retypes, so the test runs the artefact itself — there is no longer an
+# extraction step that could pass while the shipped procedure rots.
 BR="$WORK/branchmode"; rm -rf "$BR"; mkdir -p "$BR"; cd "$BR"
 git init -q -b master . && git config user.email t@e.com && git config user.name t
 echo a > f.ts && git add -A && git commit -qm i
 git checkout -q -b feature && echo b >> f.ts && git commit -qam work
-sed -n '/^TRUNK=""; BASE=""; STOP=""/,/^```$/p' "$SRC/skills/adversarial-review/SKILL.md" \
-  | sed '/^```$/d' > snip.sh
-if [ ! -s snip.sh ]; then
-  bad "could not extract the trunk-resolution snippet from the skill"
+# Kept OUTSIDE the fixture repos, and that is not tidiness: the script resolves a
+# dirty tree to `TARGET: working tree` before it ever looks for a trunk, so a copy
+# living inside the fixture is an untracked file that sends every branch-mode case
+# down the working-tree path. Cost an hour the first time.
+RESOLVE="$WORK/resolve-review-target.sh"
+cp "$SRC/skills/adversarial-review/scripts/resolve-review-target.sh" "$RESOLVE" 2>/dev/null
+if [ ! -s "$RESOLVE" ]; then
+  bad "the skill ships no scripts/resolve-review-target.sh — step 1 points at nothing"
 else
-  # The block now ends in `git diff`, so its output has to go somewhere other than
-  # the capture that is reading the resolved variables out of it.
-  OUT=$(bash -c '. ./snip.sh >/dev/null 2>&1; echo "$TRUNK|$BASE"')
-  T=${OUT%%|*}; BS=${OUT##*|}
+  # The script's contract is its stdout, so the resolved trunk and base are parsed
+  # out of the TARGET: line rather than sourced as variables. That is the same
+  # thing the reviewer reads, which is the point: the test consumes the interface
+  # the skill documents, not the implementation behind it.
+  OUT=$(bash "$RESOLVE" 2>&1)
+  T=$(printf '%s\n' "$OUT" | sed -n 's/^TARGET: branch \([^ ]*\) @ .*/\1/p')
+  BS=$(printf '%s\n' "$OUT" | sed -n 's/^TARGET: branch [^ ]* @ \([^.]*\)\.\..*/\1/p')
   if [ "$T" = "master" ] && [ -n "$BS" ]; then
-    ok "the documented snippet resolves a master trunk with no remote"
+    ok "the shipped script resolves a master trunk with no remote"
   else
-    bad "the documented snippet fails on a master trunk (trunk='$T' base='$BS')"
+    bad "the shipped script fails on a master trunk (trunk='$T' base='$BS')"
   fi
   # Not $N — that is the suite's colour-reset escape, and shadowing it prints
   # "FAIL1" instead of a reset. Same class of bug as $B; hence both comments.
@@ -657,7 +784,7 @@ fi
 # `bash -x` traces commands as they execute regardless of what they emit, which is
 # the property actually being asserted. Same reintroduction makes it fail.
 ran_diff() {  # $1 = fixture dir, echoes the number of times `git diff` executed
-  ( cd "$1" && bash -x "$WORK/branchmode/snip.sh" 2>&1 >/dev/null \
+  ( cd "$1" && bash -x "$RESOLVE" 2>&1 >/dev/null \
       | grep -c "^+* git diff" )
 }
 
@@ -666,7 +793,7 @@ ran_diff() {  # $1 = fixture dir, echoes the number of times `git diff` executed
 rm -rf notrunk && mkdir notrunk && cd notrunk
 git init -q -b wip . && git config user.email t@e.com && git config user.name t
 echo x > f.ts && git add -A && git commit -qm i
-OUT=$(bash ../snip.sh 2>&1)
+OUT=$(bash "$RESOLVE" 2>&1)
 if printf '%s' "$OUT" | grep -q '^STOP:'; then
   ok "no trunk: the block refuses"
 else
@@ -686,7 +813,7 @@ fi
 rm -rf ontrunk && mkdir ontrunk && cd ontrunk
 git init -q -b main . && git config user.email t@e.com && git config user.name t
 echo x > f.ts && git add -A && git commit -qm i && echo y >> f.ts && git commit -qam two
-OUT=$(bash ../snip.sh 2>&1)
+OUT=$(bash "$RESOLVE" 2>&1)
 if printf '%s' "$OUT" | grep -q 'no branch to review'; then
   ok "HEAD is the trunk: the block says so"
 else
@@ -699,7 +826,115 @@ if [ "$T" = "0" ]; then
 else
   bad "HEAD is the trunk: git diff ran on an empty range ($T call(s))"
 fi
+
+# (C) A dirty tree short-circuits trunk resolution entirely. This path did not
+#     exist while step 1 was a fenced block — the porcelain check was prose the
+#     reviewer ran by hand — so it is the one part of the script nothing had ever
+#     executed. It is also the common case: Phase 5 and the review gate only ever
+#     review a dirty tree.
+rm -rf dirty && mkdir dirty && cd dirty
+git init -q -b main . && git config user.email t@e.com && git config user.name t
+echo x > f.ts && git add -A && git commit -qm i
+echo untracked > new.ts
+OUT=$(bash "$RESOLVE" 2>&1)
+if printf '%s' "$OUT" | grep -q '^TARGET: working tree'; then
+  ok "an untracked file alone resolves to the working tree"
+else
+  bad "a dirty tree did not resolve to the working tree (got: $(printf '%s' "$OUT" | head -1))"
+fi
+if printf '%s' "$OUT" | grep -q 'new.ts'; then
+  ok "and the untracked file is named in the output"
+else
+  bad "the working-tree target hides the untracked file the reviewer has to read"
+fi
 cd "$WORK"
+
+group "Every path a skill points at exists"
+# A SKILL.md that links a bundled file which is not there is the same failure the
+# adversary group guards against — a procedure told to load something it cannot
+# load — relocated into the skill's own filesystem, where nothing was looking. It
+# fails silently in the worst way: the model reads the pointer, finds nothing, and
+# improvises the part that was written down precisely so it would not have to.
+#
+# Anchors are checked too, not just files. Progressive disclosure only works if
+# "see references/slicing.md#the-boundary" lands on a heading that still exists;
+# a renamed heading leaves a link that resolves to the top of the file and looks
+# like it worked.
+setup_repo
+LINKCHECK=$(python3 - "$SRC/skills" <<'PY'
+import os, re, sys
+
+root = sys.argv[1]
+link = re.compile(r'\]\(([^)]+)\)')
+head = re.compile(r'^#{1,6}\s+(.*?)\s*$', re.M)
+
+def slug(t):
+    t = re.sub(r'`', '', t).lower()
+    t = re.sub(r'[^\w\s-]', '', t)
+    return re.sub(r'\s+', '-', t.strip())
+
+docs = [os.path.join(d, f) for d, _, fs in os.walk(root)
+        for f in fs if f.endswith('.md')]
+anchors = {p: {slug(h) for h in head.findall(open(p).read())} for p in docs}
+
+n = 0
+for p in docs:
+    rel = os.path.relpath(p, root)
+    for target in link.findall(open(p).read()):
+        if target.startswith(('http', 'mailto:')):
+            continue
+        path, _, frag = target.partition('#')
+        dest = os.path.normpath(os.path.join(os.path.dirname(p), path)) if path else p
+        n += 1
+        if not os.path.exists(dest):
+            print(f"BAD {rel} links {target}, which does not exist")
+        elif frag and dest.endswith('.md') and slug(frag) not in anchors.get(dest, set()):
+            print(f"BAD {rel} links {target}, but no heading there has that anchor")
+        else:
+            print(f"OK  {rel} -> {target}")
+print(f"COUNT {n}")
+PY
+)
+while IFS= read -r line; do
+  case "$line" in
+    "OK  "*)  ok "${line#OK  }" ;;
+    BAD*)     bad "${line#BAD }" ;;
+    COUNT*)   [ "${line#COUNT }" -gt 0 ] \
+                && ok "the skills carry ${line#COUNT } internal links" \
+                || bad "no links found — the extractor broke, not the skills" ;;
+  esac
+done <<< "$LINKCHECK"
+
+group "The reviewer's resolution ships as a script, not as prose to retype"
+# The block used to be a fenced snippet the reviewer transcribed. A procedure that
+# has to be retyped to run is a procedure that drifts from the one that was tested,
+# and this suite could only ever check the copy in the markdown. Now there is one
+# artefact and the tests above execute it.
+setup_repo
+RS=skills/adversarial-review/scripts/resolve-review-target.sh
+[ -f "$SRC/$RS" ] && ok "the skill bundles $RS" \
+  || bad "no $RS — SKILL.md step 1 points at a file that is not shipped"
+# cp -R preserves the exec bit and the install does no chmod, so a script committed
+# without it installs unrunnable. Same reason the hooks carry theirs.
+[ -x "$SRC/$RS" ] && ok "and it is committed executable, as cp -R install requires" \
+  || bad "$RS is not executable — cp -R installs it unrunnable"
+[ -x ".claude/$RS" ] && ok "and it survives the install as executable" \
+  || bad "$RS lost its exec bit on install"
+# The skill has to name the file, or the script is shipped and never reached.
+if grep -qF 'resolve-review-target.sh' "$SRC/skills/adversarial-review/SKILL.md"; then
+  ok "SKILL.md names the script it ships"
+else
+  bad "SKILL.md does not name resolve-review-target.sh — the bundle is unreachable"
+fi
+# Both install roots, because the agent that loads this skill runs on both hosts
+# and the skill is copied to .cursor/skills/ as the same file.
+for host in .claude .cursor; do
+  if grep -qF "$host/skills/adversarial-review/scripts" "$SRC/skills/adversarial-review/SKILL.md"; then
+    ok "the lookup covers the $host install root"
+  else
+    bad "the lookup misses $host — the skill is installed there and would not find its own script"
+  fi
+done
 
 group "The README does not claim a rule lives where it does not"
 # The change that moved the code reviewer's procedure into the skill left every
@@ -922,11 +1157,26 @@ done
 # that a slice boundary resets both.
 for want in 'The two reviewer sessions' 'SendMessage' 'The two never merge' \
             'Both reviewer sessions end at the boundary' 'no live design session' \
-            'The index is the reviewer' 'Never stage between fixing and messaging'; do
+            'The index is the reviewer'; do
   if printf '%s' "$WORKFLOW" | grep -qF "$want"; then
     ok "the workflow pins the session rule: '$want'"
   else
     bad "spec-driven no longer pins the session rule: '$want' is gone"
+  fi
+done
+
+# This replaced 'Never stage between fixing and messaging', and it is the stronger
+# rule rather than a weaker one: that phrasing forbade one ordering, this forbids
+# the caller touching the index at all. Every ordering that breaks the bookmark
+# starts with a `git add` the hook did not make, so the superset is the right ban —
+# and the earlier, narrower version is what shipped while the convention was
+# breaking three times in a week.
+for want in 'do not run `git add` during a review round, at all' \
+            'review-bookmark.sh'; do
+  if printf '%s' "$WORKFLOW" | grep -qF "$want"; then
+    ok "the workflow hands staging to the hook: '$want'"
+  else
+    bad "spec-driven no longer keeps the caller out of the index: '$want' is gone"
   fi
 done
 
@@ -1253,6 +1503,286 @@ printf 'a new test\n' > src/feature.test.ts
 .claude/hooks/phase.sh red >/dev/null 2>&1
 phase 2; phase 3
 expect_b "a phase change discards the receipt" DENY '.claude/hooks/phase.sh 4'
+
+group "The gates are asked as questions, and the answer is a receipt"
+# The three decisions that are the user's arrive as an AskUserQuestion rather
+# than as a permission prompt on a shell command. What makes that a gate and not
+# decoration is that the ANSWER comes back through the host: approval-receipt.sh
+# sees it, phase-guard.sh reads the receipt, and the model is nowhere in that
+# path except as the thing that asked.
+#
+# Every case below that expects ASK is pinning the fallback. AskUserQuestion's
+# result shape is not a documented contract, so the design requirement is that
+# failing to recognise an answer costs the confirmation prompt this gate always
+# raised — never a block.
+
+gate_q() {
+  .claude/hooks/phase.sh ask "$1" 2>/dev/null \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["questions"][0]["question"])' 2>/dev/null
+}
+
+# answer <gate> <what-the-user-picked> [question-actually-asked]
+answer() {
+  local q; q="${3:-$(gate_q "$1")}"
+  python3 -c '
+import json, sys
+print(json.dumps({"tool_name": "AskUserQuestion", "cwd": sys.argv[1],
+                  "tool_input": {"questions": [{"question": sys.argv[2]}]},
+                  "tool_response": {"answers": {"a": sys.argv[3]}}}))' \
+    "$PWD" "$q" "$2" | .claude/hooks/approval-receipt.sh >/dev/null 2>&1
+}
+
+raw_answer() { printf '%s' "$1" | .claude/hooks/approval-receipt.sh >/dev/null 2>&1; }
+
+setup_repo; phase start v; phase 2
+printf 'the spec\n' > docs/specs/demo.md
+
+for g in spec red close-out; do
+  if .claude/hooks/phase.sh ask "$g" 2>/dev/null | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+    ok "phase.sh ask $g emits a valid AskUserQuestion payload"
+  else
+    bad "phase.sh ask $g did not emit valid JSON"
+  fi
+done
+# The strings are interpolated into hand-built JSON by phase.sh, exactly like the
+# guard's ask reasons. A raw quote in one of them is the malformed-output bug [#6]
+# arriving through a file nobody thinks of as a hook.
+if .claude/hooks/phase.sh ask close-out 2>/dev/null | grep -q '\\'; then
+  bad "an emitted question contains a backslash — would break hand-built JSON"
+else
+  ok "emitted questions are JSON-safe"
+fi
+expect_b "asking is allowed in every phase" ALLOW '.claude/hooks/phase.sh ask spec'
+phase 5
+expect_b "asking is allowed at phase 5 too"  ALLOW '.claude/hooks/phase.sh ask close-out'
+
+# One copy of the wording. approval-receipt.sh identifies a gate by matching the
+# question verbatim against phase-policy.sh, so a second copy in the skill would
+# not drift into a wrong answer — it would drift into an answer nothing accepts,
+# which looks exactly like a user who was never asked.
+phase 2
+Q=$(gate_q spec)
+if [ -n "$Q" ] && ! grep -qF "$Q" "$SRC/skills/spec-driven/SKILL.md"; then
+  ok "the skill points at phase.sh ask instead of copying the question"
+else
+  bad "the canonical question is duplicated in spec-driven/SKILL.md — it will drift"
+fi
+if grep -qF 'phase.sh ask' "$SRC/skills/spec-driven/SKILL.md"; then
+  ok "the workflow tells the model where to get the question"
+else
+  bad "spec-driven/SKILL.md never mentions phase.sh ask"
+fi
+
+group "The spec gate: 2 -> 3 on an answer"
+setup_repo; phase start v; phase 2
+printf 'the spec\n' > docs/specs/demo.md
+expect_b "unasked, the old prompt still stands"  ASK   '.claude/hooks/phase.sh 3'
+answer spec 'Approve the spec'
+expect_b "approved: no second prompt"            ALLOW '.claude/hooks/phase.sh 3'
+
+answer spec 'Send the spec back'
+expect_b "sent back: denied, not re-prompted"    DENY  '.claude/hooks/phase.sh 3'
+
+# The attack the fingerprint exists for: get the answer, then change what was
+# answered about. Same shape as editing a test after RED.
+setup_repo; phase start v; phase 2
+printf 'the spec\n' > docs/specs/demo.md
+answer spec 'Approve the spec'
+printf 'and one more requirement nobody approved\n' >> docs/specs/demo.md
+expect_b "editing the spec after approval voids it" DENY '.claude/hooks/phase.sh 3'
+# A brand-new spec document is the same event, and it is the one a fingerprint
+# built from tracked files would miss [#2].
+setup_repo; phase start v; phase 2
+printf 'the spec\n' > docs/specs/demo.md
+answer spec 'Approve the spec'
+printf 'a whole second document\n' > docs/specs/extra.md
+expect_b "a new spec document after approval voids it" DENY '.claude/hooks/phase.sh 3'
+
+# Approving with nothing on disk to approve. An empty fingerprint must read as
+# stale, or the answer silently covers whatever gets written next.
+setup_repo; phase start v; phase 2
+answer spec 'Approve the spec'
+expect_b "an approval with no spec on disk is not honoured" DENY '.claude/hooks/phase.sh 3'
+reason=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh 3')")
+# The first version reported this as "a spec document has changed", which was a
+# lie: nothing changed, there was never a spec. A gate that misreports why it
+# refused teaches people to stop reading its refusals.
+if printf '%s' "$reason" | grep -qi 'nothing there to approve'; then
+  ok "the refusal does not claim a document changed when none existed"
+else
+  bad "the empty-spec refusal misdescribes what happened: '$reason'"
+fi
+
+group "What the receipt hook refuses to record"
+setup_repo; phase start v; phase 2
+printf 'the spec\n' > docs/specs/demo.md
+
+answer spec 'let me think about it'
+expect_b "free-text Other records nothing"       ASK '.claude/hooks/phase.sh 3'
+
+# The model may not ask an easier question and redeem the answer against a gate.
+answer spec 'Approve the spec' 'Shall we press on?'
+expect_b "a reworded question records nothing"   ASK '.claude/hooks/phase.sh 3'
+
+# A response that echoes the options back is not a selection, and guessing which
+# one was meant is exactly the kind of near-enough that turns a gate into a
+# rubber stamp.
+raw_answer "$(python3 -c '
+import json, sys
+print(json.dumps({"tool_name": "AskUserQuestion", "cwd": sys.argv[1],
+                  "tool_input": {"questions": [{"question": sys.argv[2]}]},
+                  "tool_response": {"options": ["Approve the spec", "Send the spec back"]}}))' \
+  "$PWD" "$(gate_q spec)")"
+expect_b "an echoed option list records nothing"  ASK '.claude/hooks/phase.sh 3'
+
+raw_answer '{"tool_name":"AskUserQuestion","tool_input":{"shape":"changed"}}'
+expect_b "an unrecognised payload records nothing" ASK '.claude/hooks/phase.sh 3'
+raw_answer 'not json at all'
+expect_b "unparseable input records nothing"       ASK '.claude/hooks/phase.sh 3'
+
+# An answer to one gate is not an answer to another.
+answer close-out 'Disarm and leave it'
+expect_b "a close-out answer does not open 2 -> 3" ASK '.claude/hooks/phase.sh 3'
+
+# The receipt is the file that says the user said yes, so it is the one the model
+# must never be able to write. Every vector, the same as the other state files.
+expect_w "the approval receipt is not writable"    DENY .claude/.spec-approval
+expect_b "echo into the receipt denied"            DENY 'echo verdict=approve > .claude/.spec-approval'
+expect_b "cp onto the receipt denied"              DENY 'cp /tmp/x .claude/.spec-approval'
+expect_b "rm of the receipt denied"                DENY 'rm .claude/.spec-approval'
+expect_b "naming it at all is denied"              DENY 'cat .claude/.spec-approval'
+
+# Answering while the workflow is off must not leave a receipt lying around for
+# the next task to spend.
+phase off
+answer spec 'Approve the spec'
+if [ ! -e .claude/.spec-approval ]; then
+  ok "no receipt is written while the gate is disarmed"
+else
+  bad "a receipt was written with no phase file"
+fi
+
+group "An answer is spent where it was given"
+setup_repo; phase start v; phase 2
+printf 'the spec\n' > docs/specs/demo.md
+answer spec 'Approve the spec'
+phase 1; phase 2
+expect_b "a phase change discards the answer" ASK '.claude/hooks/phase.sh 3'
+
+setup_repo; phase start v; phase 2
+printf 'the spec\n' > docs/specs/demo.md
+answer spec 'Approve the spec'
+.claude/hooks/phase.sh slices 3 >/dev/null 2>&1
+expect_b "changing the slice count discards the answer" DENY '.claude/hooks/phase.sh 3'
+reason=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh 3')")
+if printf '%s' "$reason" | grep -qi 'different point in this task'; then
+  ok "an expired answer is reported as expired, not as a changed spec"
+else
+  bad "the expired-answer refusal misdescribes what happened: '$reason'"
+fi
+
+group "The RED gate needs both receipts"
+setup_repo; phase start v; phase 3
+printf 'exit 1\n' > .claude/spec-gate-test-cmd
+printf 'a new test\n' > src/feature.test.ts
+answer red 'Accept these failures'
+expect_b "accepting failures nobody ran is not enough" DENY '.claude/hooks/phase.sh 4'
+.claude/hooks/phase.sh red >/dev/null 2>&1
+expect_b "RED alone still prompts"                     ASK  '.claude/hooks/phase.sh 4'
+answer red 'Accept these failures'
+expect_b "RED plus an answer: no second prompt"        ALLOW '.claude/hooks/phase.sh 4'
+answer red 'One of them is broken'
+expect_b "a rejected failure denies the advance"       DENY  '.claude/hooks/phase.sh 4'
+
+setup_repo; phase start v; phase 3
+printf 'exit 1\n' > .claude/spec-gate-test-cmd
+printf 'a new test\n' > src/feature.test.ts
+.claude/hooks/phase.sh red >/dev/null 2>&1
+answer red 'Accept these failures'
+printf 'quietly rewritten\n' > src/feature.test.ts
+expect_b "editing a test after the answer voids it"    DENY  '.claude/hooks/phase.sh 4'
+
+group "Close-out is three answers, not yes and no"
+setup_repo; phase start v; phase 5
+printf 'work\n' > src/thing.ts
+expect_b "unasked, the old prompt still stands" ASK  '.claude/hooks/phase.sh off'
+
+answer close-out 'Keep iterating'
+expect_b "keep iterating is a refusal, not a declined prompt" DENY '.claude/hooks/phase.sh off'
+
+# The ordering the old prompt could only ask for in prose. "Open a PR" means the
+# PR comes first, and a tree with work still in it is the observable form of a PR
+# that does not exist yet.
+answer close-out 'Open a pull request'
+expect_b "PR chosen with the work uncommitted: denied" DENY '.claude/hooks/phase.sh off'
+reason=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh off')")
+if printf '%s' "$reason" | grep -qF 'src/thing.ts'; then
+  ok "the denial names what is still uncommitted"
+else
+  bad "the PR-ordering denial does not say what is outstanding: '$reason'"
+fi
+git add -A >/dev/null 2>&1; git commit -qm work
+answer close-out 'Open a pull request'
+expect_b "PR chosen and the work committed: allowed"   ALLOW '.claude/hooks/phase.sh off'
+
+answer close-out 'Disarm and leave it'
+expect_b "disarm chosen: allowed"                      ALLOW '.claude/hooks/phase.sh off'
+
+# `off` from 1-3 is equivalent to jumping to Phase 4, and no answer changes that.
+phase 2
+answer close-out 'Disarm and leave it'
+expect_b "an answer does not unlock off from phase 2"  DENY  '.claude/hooks/phase.sh off'
+
+group "Answering a question is not reviewable work"
+# The review gate treats untracked files as owed review, and .claude/ is
+# deliberately NOT on the exclude list. So a state file the gate writes for its
+# own bookkeeping must be ignored by git, or every answer arms the review gate
+# against the gate's own paperwork — the "a leftover doc kept it armed" failure,
+# arriving from a file the user never touched.
+setup_repo; phase start v; phase 2
+printf 'the spec\n' > docs/specs/demo.md
+git add -A >/dev/null 2>&1; git commit -qm spec
+answer spec 'Approve the spec'
+if [ -e .claude/.spec-approval ]; then
+  ok "the receipt was actually written (the check below means something)"
+else
+  bad "no receipt written — the arming check below would pass vacuously"
+fi
+pending=$(cd "$PWD" && .claude/hooks/phase.sh status 2>&1)
+if printf '%s' "$pending" | grep -q '.spec-approval'; then
+  bad "the approval receipt shows up as work owed review — add it to .gitignore"
+else
+  ok "the approval receipt does not arm the review gate"
+fi
+# The install block in the README is the only thing that puts it there, so the
+# fixture and the docs have to agree or this test proves nothing about a real
+# install.
+for n in .spec-phase .spec-baseline .spec-red .spec-approval; do
+  if grep -qF "$n" .gitignore && grep -qF "$n" "$SRC/README.md"; then
+    ok "$n is gitignored by the documented install"
+  else
+    bad "$n is missing from .gitignore or from the README install block"
+  fi
+done
+
+group "The receipt hook is registered"
+if python3 -c '
+import json, sys
+d = json.load(open(".claude/settings.json"))
+hooks = d.get("hooks", {}).get("PostToolUse", [])
+sys.exit(0 if any("AskUserQuestion" in (h.get("matcher") or "")
+                  and any("approval-receipt" in c.get("command", "")
+                          for c in h.get("hooks", []))
+                  for h in hooks) else 1)' 2>/dev/null; then
+  ok "settings.json runs approval-receipt.sh on AskUserQuestion"
+else
+  bad "settings.json has no PostToolUse hook for AskUserQuestion — nothing records an answer"
+fi
+if [ -x "$SRC/hooks/approval-receipt.sh" ]; then
+  ok "approval-receipt.sh is committed executable"
+else
+  bad "approval-receipt.sh is not executable — cp -R would install a hook that cannot run"
+fi
 
 group "phase.sh 4 in a terminal"
 tw() { # <label> <expect-phase> <expect-substring> [--force]

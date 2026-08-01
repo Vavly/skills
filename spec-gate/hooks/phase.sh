@@ -17,6 +17,7 @@ STATE_DIR="$PROJECT_DIR/.claude"
 STATE="$STATE_DIR/.spec-phase"
 BASELINE="$STATE_DIR/.spec-baseline"
 RECEIPT="$STATE_DIR/.spec-red"
+APPROVAL="$STATE_DIR/.spec-approval"
 TEST_CMD_FILE="$STATE_DIR/spec-gate-test-cmd"
 
 # tree_snapshot comes from phase-policy.sh, shared with review-gate.sh so the
@@ -38,6 +39,13 @@ else
   slice_status() { printf 'absent\n'; }
   slice_current() { printf '1\n'; }
   slice_total() { printf '1\n'; }
+  # No policy file means no canonical wording, and a question this script made up
+  # is a question approval-receipt.sh will not recognise. Refusing to print one
+  # is better than printing one whose answer can never be redeemed.
+  gate_header() { :; }
+  gate_question() { :; }
+  gate_options() { :; }
+  approval_status() { printf 'unverifiable\n'; }
 fi
 
 # The state file is written from exactly one place, so a field cannot be dropped
@@ -174,6 +182,45 @@ red_tripwire() {
 # this system is that turning the phase gate OFF makes review fire *more* often,
 # not less: with no phase file the Stop gate runs every turn.
 
+# --- Asking the user ----------------------------------------------------------
+# The three decisions that are the user's are questions, not permission prompts
+# on a shell command. `phase.sh ask <gate>` prints the question as an
+# AskUserQuestion payload; the model passes it through verbatim and the user
+# picks an option. approval-receipt.sh records the answer, and phase-guard.sh
+# reads that instead of raising a prompt of its own.
+#
+# Emitting it here rather than writing it into the skill is the point. The
+# receipt hook recognises a gate by matching the question text against
+# phase-policy.sh, so a second copy in a SKILL.md would not drift into a wrong
+# answer — it would drift into an answer nothing accepts, and a gate that
+# silently stopped being redeemable looks exactly like a user who was never
+# asked.
+#
+# stdout is JSON and nothing else, so it can be handed straight to the tool.
+# Everything a human needs to read goes to stderr.
+json_str() { printf '%s' "$1" | tr -d '"\\' | tr '\n\r\t' '   '; }
+
+emit_question() {
+  g="$1"
+  q=$(gate_question "$g")
+  if [ -z "$q" ]; then
+    echo "spec-driven: no question is defined for gate '$g'." >&2
+    return 1
+  fi
+  printf '{"questions":[{"header":"%s","question":"%s","multiSelect":false,"options":[' \
+    "$(json_str "$(gate_header "$g")")" "$(json_str "$q")"
+  first=1
+  while IFS=$'\t' read -r _v l d; do
+    [ -n "$l" ] || continue
+    [ "$first" = 1 ] || printf ','
+    first=0
+    printf '{"label":"%s","description":"%s"}' "$(json_str "$l")" "$(json_str "$d")"
+  done <<< "$(gate_options "$g")"
+  printf ']}]}\n'
+  [ "$first" = 0 ] || return 1
+  return 0
+}
+
 report_review_state() {
   pending=$(review_pending_paths)
   if [ -z "$pending" ]; then
@@ -200,6 +247,16 @@ case "${1:-status}" in
       # nobody who never asked for them pays a line of output for them.
       *) [ "$(slice_total)" -gt 1 ] && echo "  -> slice $(slice_current) of $(slice_total)" ;;
     esac
+    # An answer already given and not yet spent. Reported because status is the
+    # post-compaction re-read, and asking again a question the user has already
+    # answered is precisely the friction this mechanism exists to remove.
+    for g in spec red close-out; do
+      A=$(approval_status "$g")
+      case "$A" in
+        none|stale|unverifiable) ;;
+        *) echo "  -> the user has already answered the '$g' gate: $A" ;;
+      esac
+    done
     case "$P" in
       1) echo "  -> no files may be written"
          echo "  -> next: 2 Spec — Claude may advance" ;;
@@ -208,7 +265,7 @@ case "${1:-status}" in
          # and the spec review is instructed rather than enforced — the one step
          # a forgetful model can drop without anything noticing.
          echo "  -> the spec goes to the spec-adversary subagent before you are asked"
-         echo "  -> next: 3 Plan + tests — Claude may ask you to approve it" ;;
+         echo "  -> next: 3 Plan + tests — ask with '.claude/hooks/phase.sh ask spec', then advance" ;;
       3) echo "  -> tests only; production code blocked"
          echo "  -> the plan goes to spec-adversary before the tests are written"
          # Same reason as the line above it: status is the post-compaction re-read,
@@ -216,14 +273,15 @@ case "${1:-status}" in
          # cold round declared than a warm one claimed.
          echo "  -> reuse that session if you still hold it; if not, spawn fresh and say the round started cold"
          case "$(red_receipt_status)" in
-           valid) echo "  -> RED verified — next: 4 Execute, Claude may ask you to approve it" ;;
+           valid) echo "  -> RED verified — next: 4 Execute, ask with '.claude/hooks/phase.sh ask red'" ;;
            stale) echo "  -> RED receipt STALE: the tests changed since. Re-run '.claude/hooks/phase.sh red'" ;;
            *)     echo "  -> RED not verified — next: run '.claude/hooks/phase.sh red' (Claude may do this)" ;;
          esac ;;
       4) echo "  -> normal permission flow; tests frozen; review gate suppressed"
          echo "  -> next: 5 Review — Claude may advance" ;;
       5) echo "  -> delegate to the adversary subagent; review gate ARMED"
-         echo "  -> after a fix, go back to that same session; a new slice gets a new one" ;;
+         echo "  -> after a fix, go back to that same session; a new slice gets a new one"
+         echo "  -> to close out, ask with '.claude/hooks/phase.sh ask close-out' — never disarm on your own" ;;
       *) echo "  -> state file is corrupt, and the gate is failing closed."
          echo "  -> recover with: .claude/hooks/phase.sh off" ;;
     esac
@@ -234,7 +292,7 @@ case "${1:-status}" in
     # A newline in the task name would inject extra lines into the state file.
     T=$(printf '%s' "${2:-unnamed}" | tr -d '\n\r')
     write_state 1 "$T" "1/1"
-    rm -f "$RECEIPT"
+    rm -f "$RECEIPT" "$APPROVAL"
     snapshot_baseline
     echo "spec-driven: started '${T}' at phase 1 (Clarify)"
     ;;
@@ -278,6 +336,28 @@ case "${1:-status}" in
     fi
     ;;
 
+  # Hand the model the question for a gate. Read-only: it prints wording and
+  # changes nothing, which is why phase-guard.sh lets it through in every phase.
+  # Asking is not approving — the answer is what moves anything, and the answer
+  # arrives through the host.
+  ask)
+    [ -f "$STATE" ] || { echo "spec-driven: not started. Run: phase.sh start <task>" >&2; exit 1; }
+    G="${2:-}"
+    case "$G" in
+      spec|red|close-out) ;;
+      *) echo "usage: phase.sh ask <spec|red|close-out>" >&2; exit 1 ;;
+    esac
+    emit_question "$G" || exit 1
+    {
+      echo
+      echo "spec-driven: pass the JSON above to AskUserQuestion unchanged."
+      echo "  The question text is what identifies this gate to the receipt hook."
+      echo "  Reword it and the answer records nothing, so you would be asking twice."
+      echo "  Everything you want to say about the decision goes in your own message"
+      echo "  above the question, where it belongs — not in the question."
+    } >&2
+    ;;
+
   red)
     [ -f "$STATE" ] || { echo "spec-driven: not started. Run: phase.sh start <task>"; exit 1; }
     P=$(sed -n 's/^phase=//p' "$STATE" | head -1)
@@ -319,7 +399,12 @@ case "${1:-status}" in
     # The receipt describes one Phase 3, and every phase change ends that Phase 3
     # — including a retreat back into it to fix the tests, which must be
     # re-verified rather than riding the old check.
-    rm -f "$RECEIPT"
+    #
+    # The approval receipt goes for the mirror reason: an answer is given about
+    # one phase and spent in it. It is also pinned to the phase it was answered
+    # in, so this delete is the second of two locks — cheap, and the kind of
+    # redundancy worth having on the file that says the user said yes.
+    rm -f "$RECEIPT" "$APPROVAL"
     snapshot_baseline
     echo "spec-driven: -> $(phase_name "$1")"
     if [ "$ADVANCED" = 1 ]; then
@@ -328,7 +413,7 @@ case "${1:-status}" in
     ;;
 
   off)
-    rm -f "$STATE" "$BASELINE" "$RECEIPT"
+    rm -f "$STATE" "$BASELINE" "$RECEIPT" "$APPROVAL"
     echo "spec-driven: phase gate off"
     echo "  This ends the phase workflow. It does not stop review — with no phase"
     echo "  file the Stop gate returns to its default and runs EVERY turn."
@@ -336,7 +421,9 @@ case "${1:-status}" in
     ;;
 
   *)
-    echo "usage: phase.sh [status | start <task> | red | slices <n> | 1..5 | off]"
+    echo "usage: phase.sh [status | start <task> | ask <gate> | red | slices <n> | 1..5 | off]"
+    echo "       phase.sh ask <gate>  print the question for a gate as an"
+    echo "                            AskUserQuestion payload: spec | red | close-out"
     echo "       phase.sh red         run the Phase 3 tests and record RED if they fail"
     echo "       phase.sh slices <n>  set how many slices this task lands in"
     echo "       phase.sh 4 --force   advance without the RED check"

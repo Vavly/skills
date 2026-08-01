@@ -106,8 +106,8 @@ esac
 # phase state through `phase.sh status`, never through the file.
 if [ -n "$CMD" ]; then
   case "$CMD" in
-    *.spec-phase*|*.spec-baseline*|*.spec-red*)
-      deny "The phase state is not yours to edit, move or remove — .spec-red included, because a receipt you could write by hand would assert RED without running anything. Change phases with .claude/hooks/phase.sh <n>, verify RED with .claude/hooks/phase.sh red, and read the current phase with .claude/hooks/phase.sh status." ;;
+    *.spec-phase*|*.spec-baseline*|*.spec-red*|*.spec-approval*)
+      deny "The phase state is not yours to edit, move or remove — .spec-red and .spec-approval included, because a receipt you could write by hand would assert RED without running anything, or record an approval the user never gave. Change phases with .claude/hooks/phase.sh <n>, verify RED with .claude/hooks/phase.sh red, ask the user with .claude/hooks/phase.sh ask <gate>, and read the current phase with .claude/hooks/phase.sh status." ;;
   esac
 fi
 if [ -n "$PATHS" ] && is_phase_state "$PATHS"; then
@@ -120,12 +120,22 @@ fi
 # restricts it or increases scrutiny.
 #
 # A PreToolUse hook cannot tell a Bash call the model chose to make from one a
-# user's slash command told it to make — both arrive identically. So "the user
-# decides" cannot be expressed as an allow; it has to be an `ask`, or a denial
-# pointing at a terminal. The two approval gates use `ask`. Everything that would
-# route around them — forward skips, moves off Phase 5, `off` from 1-3 — is
-# denied here and needs a terminal, since a prompt for those would just be the
-# gate asking permission to skip itself.
+# user's slash command told it to make — both arrive identically. That used to
+# mean "the user decides" could not be expressed as an allow at all: it had to be
+# an `ask`, or a denial pointing at a terminal.
+#
+# The approval receipt changes what this hook can know. It cannot see who made
+# the call, but it can see whether the user answered the gate's question, because
+# that answer came back through the host and was recorded by a PostToolUse hook
+# the model has no way to write to. So the three approval gates now read a
+# receipt first and allow on it, and fall back to the `ask` they always raised
+# when there is no receipt to read. The fallback is not a leftover — it is what
+# makes it safe to build on AskUserQuestion's undocumented result shape, since
+# every way of failing to recognise an answer lands on the old behaviour.
+#
+# Everything that would route *around* those gates — forward skips, moves off
+# Phase 5, `off` from 1-3 — is still denied here and needs a terminal, since a
+# prompt for those would just be the gate asking permission to skip itself.
 if [ -n "$CMD" ] && printf '%s' "$CMD" | grep -qE '(^|[^[:alnum:]_.+-])phase\.sh([[:space:]]|$)'; then
   ARG=$(printf '%s' "$CMD" | sed -nE 's|.*phase\.sh[[:space:]]+([^[:space:];&|]+).*|\1|p' | head -1)
   ARG=${ARG#[\"\']}; ARG=${ARG%[\"\']}
@@ -145,6 +155,11 @@ if [ -n "$CMD" ] && printf '%s' "$CMD" | grep -qE '(^|[^[:alnum:]_.+-])phase\.sh
   case "$ARG" in
     status|"") ;;                       # read-only, always fine
     red) ;;                             # verification, not advancement — see below
+    # Printing a question changes nothing, in any phase. Asking is not
+    # approving: the answer arrives through the host, and only an answer moves a
+    # gate. Allowing this freely is what makes the question the normal way to
+    # reach a checkpoint rather than a step worth skipping.
+    ask) ;;
     slices)
       # Before the spec is approved the count is not approved either: the seams
       # are declared in the spec and the 2 -> 3 prompt covers them, so asking
@@ -178,7 +193,32 @@ if [ -n "$CMD" ] && printf '%s' "$CMD" | grep -qE '(^|[^[:alnum:]_.+-])phase\.sh
       if [ "$(slice_current)" -lt "$(slice_total)" ]; then
         OFF_SLICES=" You are on slice $(slice_current) of $(slice_total), so $(( $(slice_total) - $(slice_current) )) more are unimplemented — ending now leaves the task half-built, and nothing afterwards remembers that it was sliced."
       fi
-      ask "End the spec-driven workflow for this task?${OFF_SLICES} This is the close-out decision: the phase gate stops, and whatever is in the working tree is what you are left with. If the work should become a pull request, say so instead of accepting — that happens before disarming, not after. Note that turning the gate off makes the review gate fire on EVERY turn while the tree is dirty, so decline this if the diff is not committed yet." ;;
+      # This is the gate the question buys the most on, because the decision was
+      # never binary. A confirmation prompt can only offer yes or no, so the old
+      # reason string had to ask in prose for a third answer — "if the work should
+      # become a pull request, say so instead of accepting" — and hope. Three
+      # options make each outcome something the guard can act on, and `continue`
+      # becomes a refusal rather than a prompt the user declined for reasons
+      # nothing recorded.
+      case "$(approval_status close-out)" in
+        pr)
+          # Chosen "open a PR", so the PR comes first and disarming follows it.
+          # Committing is how the review gate goes quiet, which makes a clean
+          # tree the observable half of "the PR exists" — the same test the slice
+          # boundary already uses, rather than a second idea of done.
+          if [ -n "$(review_pending_paths)" ]; then
+            deny "The user chose to open a pull request, and this work is not committed yet: $(review_pending_paths | tr '\n' ' '). Open the PR first, then disarm — that order is the whole point of the answer they gave. Disarming now would arm the review gate on every turn against this same diff."
+          fi
+          decide allow "The user chose to open a pull request and nothing is left uncommitted, so the work has shipped. Disarming is what they asked for next." ;;
+        disarm)
+          decide allow "The user chose to disarm and keep the working tree as it stands. They were told the review gate returns to firing every turn while anything is uncommitted." ;;
+        continue)
+          deny "The user chose to keep iterating in Phase 5, so the gate stays on and this task is not over. Say what is still outstanding and wait for them. Do not ask again until something has actually changed — re-asking an answered question until the answer changes is not consent." ;;
+        expired)
+          deny "That close-out answer was given at a different point in this task — a different phase or slice — so it does not decide this one. Ask again: .claude/hooks/phase.sh ask close-out" ;;
+        *)
+          ask "End the spec-driven workflow for this task?${OFF_SLICES} This is the close-out decision: the phase gate stops, and whatever is in the working tree is what you are left with. If the work should become a pull request, say so instead of accepting — that happens before disarming, not after. Note that turning the gate off makes the review gate fire on EVERY turn while the tree is dirty, so decline this if the diff is not committed yet." ;;
+      esac ;;
     "$PHASE") ;;                        # no-op
     1|2|3|4|5)
       if [ "$PHASE" = 5 ]; then
@@ -216,7 +256,27 @@ if [ -n "$CMD" ] && printf '%s' "$CMD" | grep -qE '(^|[^[:alnum:]_.+-])phase\.sh
         # block whenever that payload shape changed. So the prompt does the one
         # thing it can — tell the user what should already be on screen, and
         # what its absence means.
-        ask "Approve the spec and advance to Phase 3 (Plan + failing tests)? Approving asserts that you have read docs/specs/ and accept the approach, the types, and the out-of-scope list. The spec should have been through the spec-adversary reviewer first: if you have not seen its verdict in this conversation, decline and ask for it. Phase 3 writes tests only; production code stays blocked until Phase 4."
+        #
+        # The prompt is now the fallback rather than the asking. If the model put
+        # the question to the user properly, an approval receipt exists and this
+        # transition is already decided — raising a second confirmation for a
+        # decision made seconds ago is how a checkpoint becomes a reflex.
+        #
+        # Every unrecognised receipt state lands on that fallback, which is the
+        # whole safety argument for building on an undocumented payload shape:
+        # the worst case is the prompt this gate has always raised.
+        case "$(approval_status spec)" in
+          approve)
+            decide allow "The user approved this spec through the gate's own question, and no spec document has changed since they answered." ;;
+          decline)
+            deny "The user was asked and sent the spec back, and nothing in docs/specs/ has changed since. Revise the spec against what they said, then ask again: .claude/hooks/phase.sh ask spec" ;;
+          stale)
+            deny "The user's approval does not match what is in docs/specs/ now: either a document moved since they answered, or there was nothing there to approve when they did. Either way it does not cover the spec on disk. Show them the spec as it stands and ask again: .claude/hooks/phase.sh ask spec" ;;
+          expired)
+            deny "That approval was given at a different point in this task, so it is an answer about something else. Ask again: .claude/hooks/phase.sh ask spec" ;;
+          *)
+            ask "Approve the spec and advance to Phase 3 (Plan + failing tests)? Approving asserts that you have read docs/specs/ and accept the approach, the types, and the out-of-scope list. The spec should have been through the spec-adversary reviewer first: if you have not seen its verdict in this conversation, decline and ask for it. Phase 3 writes tests only; production code stays blocked until Phase 4." ;;
+        esac
       elif [ "$PHASE" = 3 ] && [ "$ARG" = 4 ]; then
         # Unlocking production code. This used to be terminal-only, on the
         # grounds that a permission prompt is a low-attention action and the RED
@@ -230,9 +290,24 @@ if [ -n "$CMD" ] && printf '%s' "$CMD" | grep -qE '(^|[^[:alnum:]_.+-])phase\.sh
         #
         # Without a valid receipt this stays a denial. The prompt is only worth
         # offering when there is something on screen to approve.
+        # Two receipts, and both are required. The RED receipt says the machine
+        # checked something; the approval receipt says the user judged it. Neither
+        # substitutes for the other, and the order is fixed — there is nothing to
+        # ask about until the failures are on screen.
         case "$(red_receipt_status)" in
           valid)
-            ask "Advance to Phase 4 (Execute) and unlock production code? RED is mechanically verified: the tests this phase added were run and failed, and none of them has changed since. What that does NOT prove is that they failed for the reason the spec expects — that is the part you are approving. Read the failure output above before accepting." ;;
+            case "$(approval_status red)" in
+              approve)
+                decide allow "The user read the failures and accepted them through the gate's own question, and the RED receipt they were shown is unchanged." ;;
+              decline)
+                deny "The user was asked and said one of those tests failed for the wrong reason. Fix it, re-run .claude/hooks/phase.sh red, and ask again: .claude/hooks/phase.sh ask red" ;;
+              stale)
+                deny "The RED receipt has been rewritten since the user answered, so they accepted a different set of failures from the one on disk. Show the new output and ask again: .claude/hooks/phase.sh ask red" ;;
+              expired)
+                deny "That answer was given at a different point in this task, so it is an answer about other failures. Re-run .claude/hooks/phase.sh red and ask again: .claude/hooks/phase.sh ask red" ;;
+              *)
+                ask "Advance to Phase 4 (Execute) and unlock production code? RED is mechanically verified: the tests this phase added were run and failed, and none of them has changed since. What that does NOT prove is that they failed for the reason the spec expects — that is the part you are approving. Read the failure output above before accepting." ;;
+            esac ;;
           stale)
             deny "The RED verification is stale: the test files have changed since they were checked. Run .claude/hooks/phase.sh red again, show the output, and then ask to advance. Current phase: $PHASE." ;;
           *)

@@ -39,6 +39,8 @@ spec-gate/
 ├── hooks/
 │   ├── review-gate.sh               → .claude/hooks/   Stop hook
 │   ├── phase-guard.sh               → .claude/hooks/   PreToolUse hook
+│   ├── approval-receipt.sh          → .claude/hooks/   PostToolUse hook
+│   ├── review-bookmark.sh           → .claude/hooks/   SubagentStart/Stop hook
 │   ├── phase-policy.sh              → .claude/hooks/   shared policy, sourced
 │   ├── phase.sh                     → .claude/hooks/   phase state CLI
 │   ├── cursor-guard.sh              → .claude/hooks/   Cursor adapter
@@ -47,15 +49,39 @@ spec-gate/
 │   ├── adversary.md                 → .claude/agents/   judges the diff — a
 │   │                                   pointer; its procedure is the skill below
 │   └── spec-adversary.md            → .claude/agents/   judges the spec + plan
-├── skills/
-│   ├── spec-driven/SKILL.md         → .claude/skills/  the workflow
-│   ├── adversarial-review/SKILL.md  → .claude/skills/  the reviewer's procedure
-│   │                                → .cursor/skills/  ...and the same file there
-│   └── spec-phase/SKILL.md          → .claude/skills/  user-only phase control
+├── skills/                          → .claude/skills/  (and .cursor/skills/, in part)
+│   ├── spec-driven/
+│   │   ├── SKILL.md                 the workflow
+│   │   └── references/              read on demand, not on every run
+│   │       ├── reviewer-sessions.md why reuse, and the bookmark's failure history
+│   │       ├── slicing.md           only when a task is too big for one review
+│   │       └── validation.md        how to find what a repo gates on
+│   ├── adversarial-review/
+│   │   ├── SKILL.md                 the reviewer's procedure
+│   │   └── scripts/
+│   │       └── resolve-review-target.sh   working tree, or branch against its base
+│   └── spec-phase/SKILL.md          user-only phase control
 └── cursor/                          for Cursor instead of / alongside Claude Code
     ├── hooks.json                   → .cursor/hooks.json
     └── agents/*.md                  → .cursor/agents/
 ```
+
+The skills follow the standard skill layout — `SKILL.md` for what is needed every
+run, `references/` for what is needed sometimes, `scripts/` for what should be
+executed rather than transcribed. Two of those directories earn their place for
+reasons specific to this toolkit:
+
+- **`spec-driven/references/`** exists because the workflow's *rules* are short and
+  its *reasons* are long, and the reasons are what stop a rule being routed around.
+  Keeping both inline put the file past the point where the parts that run on every
+  task compete with the parts that run occasionally. Each pointer says when to read
+  it, and `test.sh` checks that every one of them resolves — file **and** anchor,
+  since a renamed heading leaves a link that silently lands at the top of a page.
+- **`adversarial-review/scripts/`** exists because trunk resolution was a fenced
+  block the reviewer retyped, and a procedure that has to be retyped to run is one
+  that drifts from the version the tests cover. The suite now executes the shipped
+  file. The prose that survives in `SKILL.md` explains *why* each guard is there,
+  which is the part a reviewer needs and a script cannot carry.
 
 `phase-policy.sh` is sourced by both hooks rather than executed. It holds the
 one copy of what each phase permits and how the working tree is fingerprinted.
@@ -92,7 +118,7 @@ cp -R "$SPEC_GATE"/hooks "$SPEC_GATE"/agents "$SPEC_GATE"/skills .claude/
 # cannot be verified in-band and falls back to being terminal-only.
 printf 'yarn jest $SPEC_GATE_TEST_FILES\n' > .claude/spec-gate-test-cmd
 
-printf '.claude/.spec-phase\n.claude/.spec-baseline\n.claude/.spec-red\n.claude/review-log.jsonl\n' >> .gitignore
+printf '.claude/.spec-phase\n.claude/.spec-baseline\n.claude/.spec-red\n.claude/.spec-approval*\n.claude/review-log.jsonl\n' >> .gitignore
 git add .claude .gitignore && git commit -m "add review gate + spec-driven workflow"
 ```
 
@@ -107,8 +133,8 @@ entry goes into any existing `permissions` object. Replacing either object
 wholesale silently drops what was there.
 
 Hooks are re-read from settings by a file watcher, so no session restart is
-needed. Confirm registration with `/hooks` — all three should appear under
-`PreToolUse`, `Stop`, and `SubagentStop`.
+needed. Confirm registration with `/hooks` — all five should appear under
+`PreToolUse`, `PostToolUse`, `Stop`, `SubagentStart`, and `SubagentStop`.
 
 ## Running under Cursor
 
@@ -141,6 +167,8 @@ copy of the policy, referenced by both hosts. Two copies would drift.
 | phase-advance gate | `PreToolUse` deny/ask | `beforeShellExecution` — same `allow`/`deny`/`ask` |
 | production-write block | `PreToolUse` on Edit/Write | `preToolUse` — deny only, no `ask` |
 | phase scan + review gate | `Stop`, exit 2 | `stop` → `followup_message` |
+| approval questions | `AskUserQuestion` + `PostToolUse` receipt | **not ported** — falls back to the confirmation prompt |
+| index bookmark + round marker | `SubagentStart` / `SubagentStop` | **not ported** — no equivalent event; staging is the caller's again |
 | review log | `SubagentStop` | not ported — payload field names unverified |
 
 `cursor-guard.sh` and `cursor-stop.sh` are adapters: they translate Cursor's
@@ -219,7 +247,8 @@ files depend on, and it is the one worth keeping in step.
 /spec-driven <task>          run the workflow
 /spec-phase status           where am I
 /spec-phase red              run the Phase 3 tests, record RED if they fail
-/spec-phase <1-5>            advance — the two approval gates raise a prompt
+/spec-phase ask <gate>       put a gate's question to the user: spec | red | close-out
+/spec-phase <1-5>            advance — the three approval gates need an answer first
 /spec-phase off              disarm
 
 /adversarial-review          review a diff — on its own, no workflow needed
@@ -276,7 +305,9 @@ flowchart TD
 
 The thick edges are the decisions a hook cannot make for you: **spec approval**,
 **observing RED**, and **what happens to the finished work**. All three arrive as
-a confirmation prompt naming what accepting asserts.
+a **question with named options** — see [The gates are questions](#the-gates-are-questions-and-the-answer-is-a-receipt).
+If nobody asked, each one still falls back to the confirmation prompt it always
+raised.
 
 **2→3 asks, always.** You are reading the spec in the conversation anyway, so
 approving in the same place is proportionate.
@@ -418,6 +449,34 @@ invariant: **staged is what the reviewer has already judged, unstaged is what ha
 moved since.** Two `git add` calls maintain it — one before the first round, one
 the moment each verdict lands and *before* anything is touched in response.
 
+**Both are now made by a hook, and that is a fix rather than a polish.**
+`review-bookmark.sh` runs on `SubagentStart` and `SubagentStop` for the two
+reviewers, which are exactly those two moments. It was the caller's job first,
+stated in `spec-driven`, in the block message, and in what both reviewers are told
+about reading the index — four copies of one instruction — and it broke three
+times in the first week of real use, always the same way and always silently:
+
+> `git diff` was empty — the spec is staged as a whole new file, so the index
+> holds the *revision*, not the version I judged — `spec-adversary`
+>
+> the index is stale, so the diff wasn't usable as a bookmark — `spec-adversary`
+
+Nothing shipped wrong, because both reviewers refuse a `sound` verdict reasoned from
+an empty diff and re-read `git diff HEAD` instead. But that is the failure being
+*survived*, not avoided: every one of those rounds paid the full re-read the
+convention exists to save. This is the project's own premise turned on itself —
+**anything that must always happen is a hook**, and four copies of an instruction
+is what it looks like when that call was made wrongly.
+
+So the workflow now tells the caller the opposite of what it used to: **do not run
+`git add` during a review round, at all.** Every ordering that breaks the bookmark
+begins with a `git add` the hook did not make, so the ban is the superset rather
+than the one bad ordering. `git restore --staged <path>` is still fine and still
+documented — pulling something back out of the index breaks nothing.
+
+The reviewers keep their backstop regardless, because the hook can be absent: a
+partial install, no `jq` or `python3`, or Cursor, which has no equivalent event.
+
 Staging between fixing and messaging is the one ordering that destroys the signal,
 and it destroys it in the dangerous direction: the fixes go into the index, the
 reviewer opens `git diff` on what looks like an untouched tree, and *nothing moved
@@ -469,6 +528,21 @@ Everything else in a follow-up message is the author's account of its own fixes.
 One part is not: the marker file now holds **the snapshot** rather than just its
 hash, so the next round can be diffed against the last one and the block message
 states the result as fact.
+
+**The marker is written when a verdict lands, not only when the gate blocks.**
+That distinction was invisible until the workflow hit it. The gate is suppressed
+for phases 1–4, so in Phase 5 — where `spec-driven` spawns `adversary` itself —
+a complete review round finishes before the gate has run at all. Its first block
+then had nothing to diff against and reported no delta, which reads as *nothing
+moved since the last round* when the truth was *I have no record of a round that
+did happen*. `review-bookmark.sh` records it on `SubagentStop`, so the message now
+means what it says: **changed since the last review round**, rather than since the
+last time the gate blocked.
+
+Only `adversary` seeds it. `spec-adversary` runs at phases 2 and 3 against the
+design, and a marker written from its rounds would make Phase 5's first delta list
+every file written in phases 3 and 4 — true, and useless. One marker, one subject,
+the same rule that keeps the two reviewer sessions apart.
 
 ```
 Changed since the last review round:
@@ -598,6 +672,109 @@ Override any refusal with `phase.sh 4 --force`, which says plainly that it is
 running on your assertion instead. The model cannot use it — the guard denies any
 `phase.sh` command containing `--force`, in every phase.
 
+### The gates are questions, and the answer is a receipt
+
+The three decisions above used to be asked twice: once by the model, in prose,
+and once by the host, as a permission prompt on `.claude/hooks/phase.sh 3`. That
+is a bad conversation in both halves. The prose ask leaked plumbing at you —
+*ready to run `.claude/hooks/phase.sh 3`?* — as though the checkpoint were about
+a shell command. And the prompt behind it is structurally a yes/no, which is the
+wrong shape for at least two of the three: close-out has three answers and the
+old prompt had to beg for the third one in prose (*"if the work should become a
+pull request, say so instead of accepting"*), and RED is a per-test judgment
+squeezed into a single click.
+
+So the asking moved to `AskUserQuestion`, and the answer became a receipt:
+
+```
+phase.sh ask spec   ->  the question, as an AskUserQuestion payload
+   [the user picks an option]
+approval-receipt.sh ->  PostToolUse on AskUserQuestion, writes .spec-approval
+phase.sh 3          ->  phase-guard.sh reads the receipt and allows
+```
+
+**The receipt is the same device as `.spec-red`, pointed at a different claim.**
+RED splits *verifying* from *approving* because they are separate acts by
+separate parties; this splits *asking* from *acting* for the same reason, and
+both leave behind a file that survives the gap without being the model's word for
+what happened.
+
+Three properties make it a gate rather than decoration:
+
+- **The answer comes from the host.** The model authors the question; it cannot
+  author the response. `.spec-approval` is phase state, denied to Edit, Write and
+  every Bash command that names it — the same lock as the other three state
+  files, for the sharpest version of the same reason. A model that could write
+  this one could approve its own spec, which is [bug #1](#fixed-in-review)
+  arriving through a new door.
+- **The question is matched verbatim.** `approval-receipt.sh` identifies which
+  gate was answered by comparing the question text against `phase-policy.sh`. Ask
+  a softer question and the answer redeems nothing. This is why the wording lives
+  in the policy file and `phase.sh ask` prints it, rather than being copied into
+  a SKILL.md: a drifting copy here would not fail loudly, it would fail as a
+  question whose answer nothing accepts, which looks exactly like a user who was
+  never asked.
+- **Every failure falls back to the old prompt.** `AskUserQuestion`'s
+  `tool_response` shape is **not a documented contract**, and this is the one
+  claim in this section to hold loosely. So the hook is built to notice when it
+  stops recognising one: unparseable payload, unfamiliar shape, free-text
+  *Other*, a response that echoes the options instead of reporting a choice —
+  every one of them writes nothing, and no receipt means the guard raises the
+  confirmation prompt it raised before any of this existed.
+
+That last property is the whole reason this is allowed to exist. The README
+argues elsewhere that gating 2→3 on a `SubagentStop` receipt would be wrong
+because *"that would put a hard block on the workflow the day that payload shape
+changes."* Same exposure here, opposite blast radius: the fallback is not a
+block, it is today's behaviour. A payload change costs a keystroke.
+
+What an answer is pinned to, and what voids it:
+
+| Gate | Answers | Voided by |
+| --- | --- | --- |
+| `spec` | approve · send back | any change under `docs/specs/`, including a new untracked document |
+| `red` | accept · one is broken | the RED receipt being rewritten — so, any change to a test |
+| `close-out` | PR · keep iterating · disarm | nothing on disk; the `pr` path is checked against `review_pending_paths` instead |
+
+Every receipt additionally carries the task, phase and slice it was answered in,
+and any phase transition deletes it. An answer is spent where it was given.
+
+`close-out` carries no content fingerprint **deliberately**, and this is the one
+place the pattern had to bend. The tree moves between the answer and the act on
+the `pr` path — opening the PR *is* the commit — so a content pin would void
+every approval it was meant to carry. What guards that path instead is the check
+at the point of use: choose *open a pull request* while anything is still
+uncommitted and `off` is denied, naming the paths. The ordering the old prompt
+could only ask for in prose is now the thing the gate checks.
+
+Two refusal states, not one, because they are different events and you are told
+which: `expired` means the answer was given at a different point in the task,
+`stale` means it was about a different version of what is on disk. The first
+implementation collapsed them and produced a denial claiming a spec had changed
+when what had actually happened was that there was never a spec to approve. A
+gate that misreports why it refused teaches you to stop reading its refusals.
+
+**What this does not establish.** That the paragraph the model wrote above the
+question was honest; that the spec review happened; that anyone read anything.
+The model still authors the framing and the option descriptions are fixed but the
+context around them is not. This buys a decision that is *recorded and shaped*,
+not one that is *informed* — the informed part was never enforceable and still
+is not.
+
+**One thing to check on install.** `settings.json` carries `permissions.ask`
+rules for `phase.sh 3`, `4` and `off`, and ask rules beat allow rules. Whether a
+*hook's* allow beats an explicit ask rule in settings is not documented, so it is
+possible the prompt still appears after you have answered the question. If it
+does, the fix is to drop the matching line from `permissions.ask` — those rules
+exist only to cover `bypassPermissions`, where a hook's `ask` is not documented
+to survive. Answering the question is strictly better evidence than the prompt
+either way; the question is only whether you pay a keystroke for it.
+
+Not ported to Cursor, and not portable as written: it needs `AskUserQuestion` and
+a `PostToolUse`-equivalent event carrying both the tool input and its response.
+Under Cursor all three gates fall back to the confirmation prompt, which is what
+they did before — the fallback is load-bearing there rather than theoretical.
+
 ### Closing out
 
 Phase 5 ends when the findings are handled — the *task* ends when you say what
@@ -608,21 +785,30 @@ it was never asked.
 
 So the workflow now ends with a question, and `off` is gated behind it:
 
-> Review is done and the log is above. Open a pull request?
-
-- **Yes** — the PR is opened, *then* the gate is disarmed.
-- **No** — the gate stays on and Phase 5 continues. Further changes get reviewed
-  exactly like the last ones did.
+> Review is done. What happens to this work?
+>
+> - **Open a pull request** — the PR is opened, *then* the gate is disarmed.
+> - **Keep iterating** — the gate stays on and Phase 5 continues. Further changes
+>   get reviewed exactly like the last ones did.
+> - **Disarm and leave it** — the gate stops and the tree is yours to deal with.
 
 **The ordering is load-bearing, not etiquette.** `off` returns the review gate to
 its default of firing every turn, and a dirty tree means review is owed — so
 disarming before the work is committed leaves you tripping the gate on your own
 finished diff, every turn, until you commit. Ship first, disarm second.
 
-The prompt on `off` is the backstop; the question above is the actual mechanism.
-A gate can stop the model from ending your task silently. It cannot make the
-model ask you a good question first — that part is in `spec-driven`'s Phase 5,
-under *instructed only*.
+This is the gate the question mechanism buys the most on, because the decision
+was never binary. The old prompt could offer only yes or no, so the third answer
+had to be asked for in prose — *"if the work should become a pull request, say so
+instead of accepting"* — and then trusted. Now each answer is something the guard
+acts on: `pr` holds you to the ordering above and denies `off` while anything is
+uncommitted, `continue` is a refusal rather than a declined prompt that recorded
+nothing, and `disarm` is the only one that ends the task.
+
+The prompt on `off` is still the backstop, for a model that reaches `off` without
+having asked. A gate can stop the model from ending your task silently. It cannot
+make the model ask you a good question first — that part is in `spec-driven`'s
+Phase 5, under *instructed only*.
 
 The full policy, enforced in `phase-guard.sh` and covered by `test.sh`:
 
@@ -630,16 +816,17 @@ The full policy, enforced in `phase-guard.sh` and covered by `test.sh`:
 | --- | --- | --- |
 | `start` (→1) | model | most restrictive state; the workflow arms itself |
 | `red` | model | verifies, advances nothing; running it is how the evidence reaches you |
+| `ask <gate>` | model | prints a question, changes nothing; asking is not approving |
 | any `n` ≤ current | model | retreat, including the 4→2 contradiction path |
 | 1→2 | model | phase 2 writes only `docs/specs/`; a weak Clarify surfaces at 2→3 |
-| **2→3** | **user, prompt** | spec approval — the model would approve its own spec |
-| **3→4, RED verified** | **user, prompt** | unlocks production code; you judge the failures on screen |
+| **2→3** | **user, question** | spec approval — the model would approve its own spec |
+| **3→4, RED verified** | **user, question** | unlocks production code; you judge the failures on screen |
 | **3→4, otherwise** | **user, terminal** | nothing verified means nothing to approve |
 | 4→5 | model | self-submits to review; strictly more scrutiny |
 | **forward skips** (1→3, 2→4, 2→5, 3→5…) | **user, terminal** | route around the two gates above |
 | **any move off 5 except `off`** | **user, terminal** | phases 1–4 suppress the Stop gate, so this escapes a review that is owed |
 | **`off` from 1–3** | **user, terminal** | equivalent to jumping to Phase 4 |
-| **`off` from 4–5** | **user, prompt** | ends the task; the close-out decision is not the model's |
+| **`off` from 4–5** | **user, question** | ends the task; the close-out decision is not the model's, and it has three answers |
 | **`start` while armed** | **user, terminal** | resets to Phase 1 and discards the current task |
 | **`4 --force`** | **user, terminal** | advances past the RED check on assertion alone |
 
@@ -662,10 +849,11 @@ the residual hole — stated rather than papered over, since the 3→4 gate has 
 equivalent gap.
 
 Phase state is never writable by the model in any phase: the guard denies every
-Bash command that so much as names `.spec-phase`, `.spec-baseline` or
-`.spec-red`, so `rm`, `mv` and redirects are all covered. Nothing legitimate
-breaks, because the model reads phase state through `phase.sh status`, writes the
-RED receipt through `phase.sh red`, and never touches either file directly.
+Bash command that so much as names `.spec-phase`, `.spec-baseline`, `.spec-red`
+or `.spec-approval`, so `rm`, `mv` and redirects are all covered. Nothing
+legitimate breaks, because the model reads phase state through `phase.sh status`,
+writes the RED receipt through `phase.sh red`, causes the approval receipt to be
+written by asking the user a question, and never touches any of them directly.
 
 With **no** phase file the Stop gate runs every turn — the intended default for
 ordinary work outside the workflow. When a phase file exists, phases 1–4 suppress
@@ -675,6 +863,8 @@ reviewing twice costs twice.
 | Layer | Event | Fires | Job |
 | --- | --- | --- | --- |
 | `phase-guard.sh` | `PreToolUse` | per tool call | *prevents* the wrong kind of work for the phase |
+| `approval-receipt.sh` | `PostToolUse` | per `AskUserQuestion` | records what the user answered, so a gate can read it |
+| `review-bookmark.sh` | `SubagentStart` / `SubagentStop` | per reviewer | stages the index bookmark, and records the round a verdict just closed |
 | `review-gate.sh` — phase scan | `Stop` | per turn | *catches* phase violations the guard could not see |
 | `review-gate.sh` — review gate | `Stop` | per turn | blocks *ending a turn* on an unreviewed diff, and reports which paths moved since the last round |
 | `adversary` | subagent | on delegation, resumed per round | judges the diff |
@@ -793,18 +983,40 @@ covered by a case in `test.sh`:
 - **No production code before Phase 4, and tests only in Phase 3.** Prevented
   per-call for `Edit`/`Write`/`NotebookEdit` and for the Bash write forms whose
   target can be parsed; caught per-turn by the phase scan for everything else.
-- **The model cannot advance its own phase** past the two approval gates, and
-  cannot touch any phase state file by any means — including the RED receipt.
-  The transitions it may make either restrict it or increase scrutiny.
+- **The model cannot advance its own phase** past the three approval gates, and
+  cannot touch any phase state file by any means — including the RED receipt and
+  the approval receipt. The transitions it may make either restrict it or
+  increase scrutiny.
+- **An approval is an answer the user gave, not a claim the model makes.** The
+  three gates allow on a receipt written by a `PostToolUse` hook from an
+  `AskUserQuestion` response — a value that reaches the hook from the host, which
+  the model has no way to author or to write to disk. The question is matched
+  verbatim against `phase-policy.sh`, so a softer question redeems nothing.
+  Every way of failing to recognise an answer falls back to the confirmation
+  prompt, which makes the worst case the old behaviour rather than a block.
+- **An answer is spent where it was given.** Each receipt pins the task, phase
+  and slice it was answered in, and any phase transition deletes it. The two
+  gates that approve a document additionally pin its contents: editing the spec
+  after approval, or a test after the failures were accepted, puts the transition
+  back behind a denial — the `.spec-red` guarantee, extended to the answer.
+- **`off` on the "open a pull request" answer is denied while anything is
+  uncommitted.** The ordering the old prompt could only request in prose is
+  checked, against the same `review_pending_paths` the slice boundary uses.
 - **A turn cannot end on an unreviewed diff**, including one that exists only in
   untracked files, and including a *fix* to an untracked file. Staging changes
   nothing about that: `git add` moves no part of the fingerprint, and a fix on top
   of a staged base is still owed review.
 - **Which paths moved between two review rounds is computed, not reported.** The
-  gate diffs the current snapshot against the one it recorded last round, so the
-  list handed to the reviewer does not depend on the model's memory of what it
-  edited or on its having staged in the right order. *Using* the list is
-  instructed; the list itself is a fact.
+  gate diffs the current snapshot against the one recorded when the last verdict
+  landed, so the list handed to the reviewer does not depend on the model's memory
+  of what it edited or on its having staged in the right order. *Using* the list
+  is instructed; the list itself is a fact.
+- **The index bookmark is maintained by a hook, not by the model.**
+  `review-bookmark.sh` stages when a reviewer is spawned and again the moment its
+  verdict lands, so a reviewer's `git diff` shows what moved since it last looked
+  regardless of what the caller remembered to do. Not enforced: nothing stops the
+  model staging on top of that, which is why the instruction is now *never run
+  `git add` during a review round* rather than *run it at these two moments*.
 - **Phase 3 cannot be left on passing tests.** `phase.sh red` runs the tests the
   phase changed and refuses if they pass; `phase.sh 4` is denied until that
   check has passed. Not a full verification of "failing for the right reason" —
@@ -837,13 +1049,15 @@ Two limits worth stating plainly, since both look like enforcement and are not:
 message: showing real failure output, saying why each failure is the *expected*
 one, **sending the spec and the plan to `spec-adversary` before asking for
 approval**, not priming either reviewer, **resuming the same reviewer session for
-later rounds and starting both fresh at a slice boundary**, maintaining the
-staging convention and passing the gate's path delta on verbatim, not padding the
+later rounds and starting both fresh at a slice boundary**, passing the gate's path delta on verbatim, not padding the
 evidence log, stopping on contradiction, honoring severity levels, leaving tests
 frozen in Phase 4, **running the repo's own validations green before any reviewer
-is spawned**, **refusing a test weakened to make a fix pass**, and asking about the
-pull request before closing out. These work most of the time and fail *silently*
-when they don't.
+is spawned**, **refusing a test weakened to make a fix pass**, and **putting each
+gate's question to the user at all** — the receipt proves what was answered, never
+that anything was asked, and a model that skips straight to the transition simply
+meets the confirmation prompt. So is everything the model writes *around* the
+question: the option text is fixed, the paragraph above it is not. These work most
+of the time and fail *silently* when they don't.
 
 The last two are worth separating out, because they are the same guarantee from
 opposite ends and only one has an enforced version. A red suite reaching the
@@ -867,10 +1081,20 @@ you read it.
 
 Builds a throwaway git repo in a temp dir, installs the hooks into it, and drives
 them with synthetic hook payloads. Nothing touches the repo you run it from.
-314 cases: the phase policy, every write vector, the advance-transition matrix,
-RED verification and the receipt's staleness rules, fail-closed behavior, the
-review gate with its index-invariance and its between-rounds delta, the slice
-position and its boundary rules, and the phase scan with its baseline.
+405 cases: the phase policy, every write vector, the advance-transition matrix,
+RED verification and the receipt's staleness rules, the approval questions and
+everything the receipt hook refuses to record, fail-closed behavior, the review
+gate with its index-invariance and its between-rounds delta, the slice position
+and its boundary rules, the phase scan with its baseline, and every internal link
+in every skill — target file and heading anchor both.
+
+The approval cases lean hard on the *negative* ones, and that is the point:
+roughly half of them drive `approval-receipt.sh` with a payload it should not
+accept — a reworded question, a free-text answer, an echoed option list, an
+unfamiliar shape, unparseable input — and assert that the guard came back with
+the old confirmation prompt. Those are the cases that keep the fallback real. A
+suite that only proved the happy path would go green on a version of this that
+had quietly become a rubber stamp.
 
 A couple of dozen assert *text* rather than behavior — the two reviewers' briefs
 including their follow-up rules, the spawn framing and the resume instruction in
@@ -1055,6 +1279,27 @@ empty diff is the most convincing `sound` a reviewer will ever produce.
   had the user run it in a terminal, which put the failure output where the model
   could not see it — Phase 3's whole artifact, produced and then discarded. Split
   in two, each party does the half it is actually able to do.
+- **A checkpoint is a question, and the permission prompt is its backstop.** The
+  two were the wrong way round for a long time: the prompt was the mechanism and
+  the model's prose was supposed to prepare you for it. That leaked plumbing into
+  the conversation — *ready to run `.claude/hooks/phase.sh 3`?* — and forced
+  every decision through a yes/no whether or not it had two answers. What made
+  the inversion safe rather than cosmetic is that the answer is *evidence*: it
+  arrives from the host, so it can back a receipt the model cannot forge, which
+  is the only reason a hook is allowed to trust it. Skinning the prompt would
+  have bought nothing.
+- **The wording of each question is policy, not prose.** It lives in
+  `phase-policy.sh` and is printed by `phase.sh ask`, because the receipt hook
+  identifies a gate by matching it verbatim. A copy in a SKILL.md would drift
+  into a question whose answer nothing accepts — which presents as the user never
+  having been asked, the quietest possible failure for this mechanism.
+- **Never build on an undocumented payload without a fallback that is the status
+  quo.** `AskUserQuestion`'s result shape is not a contract. That is fine here
+  and would not be fine anywhere the failure mode was a block: every
+  unrecognised answer lands on the confirmation prompt the gate raised before any
+  of this existed, so a shape change costs a keystroke. The same reasoning
+  rejected gating 2→3 on a `SubagentStop` receipt, where the failure would have
+  been a hard stop.
 - **Phase state on disk, not in context** — compaction eats context, and the
   model would slide from Phase 1 to Phase 4 without noticing.
 - **The guard lives in `settings.json`, not skill frontmatter.** Frontmatter

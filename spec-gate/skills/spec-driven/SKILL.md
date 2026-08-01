@@ -13,16 +13,34 @@ inactive, run `.claude/hooks/phase.sh start <short-task-name>` to arm the gate a
 Phase 1. Arming is yours to do — Phase 1 is the most restrictive state, so there
 is no risk in it.
 
-**The two approval gates are the user's.** You run both commands; each raises a
-confirmation prompt, and the user accepting it *is* the approval. Say what you
-are asking them to approve **before** you make the call, so the prompt is never
-the first they hear of it. If they decline, stop — do not look for another route.
+**Three decisions are the user's, and each one is a question you ask them.** Not
+a sentence in your message hoping they answer it, and not a permission prompt on
+a shell command they never asked to see. The pattern is the same all three times:
 
-- `2 → 3` — `.claude/hooks/phase.sh 3`. They are approving the spec — which by
-  then has been through `spec-adversary`, not just through you.
-- `3 → 4` — `.claude/hooks/phase.sh red` first, then `.claude/hooks/phase.sh 4`.
-  The guard refuses the second until the first has passed, so this is two calls,
-  not one, and the failure output belongs between them.
+1. Say what you are asking them to decide, and put the evidence on screen.
+2. Run `.claude/hooks/phase.sh ask <gate>` — it prints the question as an
+   `AskUserQuestion` payload.
+3. Pass that payload to `AskUserQuestion` **unchanged**, and let them answer.
+4. Act on the answer. The transition they approved now goes through.
+
+| Gate | Ask this | Then |
+| --- | --- | --- |
+| `2 → 3` | `phase.sh ask spec` | `phase.sh 3` |
+| `3 → 4` | `phase.sh red`, show the failures, `phase.sh ask red` | `phase.sh 4` |
+| close-out | `phase.sh ask close-out` | what they chose — see [Closing out](#closing-out) |
+
+**Do not reword the question.** The gate recognises its own wording, and that is
+what lets your answer stand in for the confirmation prompt. Reword it and the
+answer records nothing, so the user gets asked twice — once by you and once by
+the guard. Everything you want to say about the decision goes in your own message
+*above* the question, which is where it belongs anyway.
+
+**Never ask the user to run a hook.** They should not have to know that
+`.claude/hooks/phase.sh` exists. You run it; they answer questions.
+
+If they decline, stop — do not look for another route, and do not ask again until
+something has actually changed. Re-asking until the answer changes is not
+consent.
 
 When a phase's exit criteria are met, **state that, say what you need from the
 user, and stop.** Do not carry on into the next phase's work.
@@ -78,51 +96,28 @@ record in the log that this round started cold: a reviewer that has forgotten it
 own findings cannot tell you whether a fix landed, and a verdict that quietly
 claims otherwise is worse than an honest re-read.
 
-**Why reuse.** The second round is where review usually goes wrong. A fresh
-reviewer re-reads everything blind, does not know that a line exists to close a
-finding it never saw, and so cannot say whether the fix worked — only what it
-thinks of the code now. The session that made the finding can.
+**The index is the reviewer's bookmark**, and you do not maintain it.
+`review-bookmark.sh` runs `git add -A` when either reviewer is spawned and again
+the moment its verdict lands, which keeps one invariant true: **staged is what the
+reviewer has already judged, unstaged is what has moved since.**
 
-**The index is the reviewer's bookmark.** Round two has a problem round one does
-not: the reviewer has to find the fixes inside a diff it has already read. Git
-answers that for free, if you keep one invariant — **staged is what the reviewer
-has already judged, unstaged is what has moved since.**
+So: **do not run `git add` during a review round, at all.** Not before spawning,
+not after a verdict, not to "make sure". Every ordering that breaks the bookmark
+requires you to have staged something, and the one that breaks it silently is the
+one you would reach for. `git restore --staged <path>` is fine if the hook picked
+up something you want out of the index.
 
-Which comes down to two `git add` calls:
+Staging is not a change — the review gate fingerprints file *contents*, not index
+state, so a `git add` never re-arms it and never costs a review round.
 
-- **Before the first round**, stage the thing under review — `git add
-  docs/specs/<task>.md` at Phase 2, `git add -A` at Phase 5. Nothing is unstaged
-  yet, and the reviewer judges `git diff HEAD` exactly as it always has.
-- **The moment a verdict lands**, stage again, *before* you touch anything in
-  response to it. Then everything you do next shows up as `git diff` and nothing
-  else does.
+**Read [references/reviewer-sessions.md](references/reviewer-sessions.md) when any
+of this looks like overhead**, or before you decide a round can skip it. It holds
+why reuse beats respawning, why the two sessions must not meet, the three times
+the bookmark broke in real use and what that bought, and what reuse costs you in
+reviewer independence.
 
-**Never stage between fixing and messaging.** That is the one ordering that
-destroys the signal: it folds the fixes into the index, and the reviewer opens
-`git diff` on an empty tree — which looks exactly like *nothing changed since my
-verdict*. Both briefs are told to refuse a `sound` verdict reasoned that way, so
-the cost of getting the order wrong is a wasted round rather than a fix waved
-through, but it is still a wasted round.
-
-`git add -A` at Phase 5 stages whatever else is dirty, which is the same set the
-review gate is already treating as the subject of review — not a widening of
-scope. If it picked up something you want out of the index,
-`git restore --staged <path>`.
-
-Staging is not a change. The review gate fingerprints file *contents*, not index
-state, so a `git add` on its own never re-arms it and never costs a review round.
-
-Both reviewers are told to read the index this way — it is in
-[adversarial-review](../adversarial-review/SKILL.md) for the code side and in
-`spec-adversary`'s brief for the design side. Keeping the invariant is yours; both
-of them can only tell you when you broke it.
-
-**What reuse costs.** A reviewer holding its own findings is inclined to accept a
-fix *because the fix is what it asked for*, and round two hands it your account of
-those fixes on top of that. Two rules push back, both in the reviewer's brief: the
-list you send is a claim to check rather than a report to accept, and a fix is
-judged as new code rather than as compliance with a request. Your half of it is to
-keep the argument out — so the follow-up message points at the change and stops:
+That last one has a half you own: **keep the argument out.** The follow-up message
+points at the change and stops.
 
 > The **&lt;spec | working tree&gt;** has changed since your verdict. Everything you
 > had already judged is staged, so `git diff` is exactly what moved.
@@ -144,12 +139,10 @@ staged in the right order, and if it disagrees with your own account of what you
 changed, it is right and something is unaccounted for. Say that rather than
 quietly reconciling the two.
 
-Naming which findings you touched is fine, and so is pointing at the diff: the
-reviewer already holds the findings, so there is no independent judgment left to
-protect, and making it hunt for your edits buys nothing. **What stays out is the
-argument.** No explanation of why the fix is right, no case for a finding you
-declined — that case goes to the user, in the evidence log, where they can weigh
-it. Telling the reviewer why you were right buys agreement, not a review.
+Naming which findings you touched is fine, and so is pointing at the diff. **What
+stays out is the argument** — no explanation of why the fix is right, no case for
+a finding you declined. That case goes to the user, in the evidence log, where
+they can weigh it.
 
 ## Phase 1 — Clarify
 
@@ -191,38 +184,18 @@ phase.
 
 ### Slicing a long task
 
-If Execute would produce a diff too large to review in one pass, the task lands
-in slices — each one separately tested, approved and reviewed. Judge this on
-diff size, not on how complicated the task feels: a three-step plan is not
-sliced, and slicing costs one adversarial review per slice.
+**Ask once, here: would Execute produce a diff too large to review in one pass?**
+Judge it on diff size, not on how complicated the task feels. If yes, the task
+lands in slices — each separately tested, approved and reviewed — and the spec has
+to declare the seams before the user approves it, because a sliced `2 → 3`
+approval accepts N review cycles and a repo that sits half-built in between.
 
-When it applies, the spec declares the seams, because the user's `2 → 3`
-approval means something different for a sliced task — they are accepting N
-review cycles, N commits, and a repo that sits half-built in between. Give the
-spec a checklist and set the count:
+Read [references/slicing.md](references/slicing.md) and follow it. It covers the
+checklist, `phase.sh slices <n>`, what Phase 3 does from slice 2 on, and how a
+slice boundary closes at Phase 5.
 
-```markdown
-## Slices
-
-- [ ] 1 — Extract the banner position into a layout prop
-- [ ] 2 — Move the existing call sites onto it
-- [ ] 3 — Delete the old absolute-positioning path
-```
-
-```
-.claude/hooks/phase.sh slices 3
-```
-
-Setting it here is silent — the count is part of the spec they are about to
-approve. Changing it later raises a prompt, because by then they have approved
-it. **Keep the checklist and the count in step**: the count lives in the state
-file and the seams live in the spec, and after a compaction whichever is read
-first is believed.
-
-If the estimate turns out low mid-task, `phase.sh slices <n>` again. Running it
-asserts *more work than expected*. If instead the design turned out wrong, that
-is not a slice change — it is the contradiction rule in [Standing
-commitments](#standing-commitments), so stop and ask to return to Phase 2.
+If the answer is no, skip it — slicing costs one adversarial review per slice, and
+a three-step plan is not sliced.
 
 ### Have it reviewed before you ask
 
@@ -231,13 +204,10 @@ commitments](#standing-commitments), so stop and ask to return to Phase 2.
 written against it and code against those tests. Do this *before* you ask the
 user for anything.
 
-Stage the spec first — `git add docs/specs/<task>.md` — then delegate. From here
-on the staged copy is the version the reviewer has judged, so each revision you
-make is a `git diff` it can read instead of a document it has to re-scan. See
-[The two reviewer sessions](#the-two-reviewer-sessions).
-
-That spawn opens the design session. Keep its handle: Phase 3 sends the plan to
-this same reviewer rather than briefing a new one on the same spec twice.
+Just delegate — the spawn stages for you, so each revision you make afterwards is
+a `git diff` the reviewer can read rather than a document it has to re-scan. That
+spawn opens the design session, and Phase 3 sends the plan back to it, so **keep
+its handle**. See [The two reviewer sessions](#the-two-reviewer-sessions).
 
 Same rule as Phase 5: **open with the stance, not the task.** The difference is
 what you are withholding. A spec *is* your reasoning written down, so the
@@ -277,11 +247,13 @@ pass you did not need trains you to skip the one that mattered.
 
 **Exit:** the spec has been reviewed and the findings are handled, then the user
 approves it. The verdict, what you changed in response, and what you declined all
-go to them **before** the prompt appears — they are approving the spec as it now
-stands, so say what moved. "Reviewer found nothing, spec unchanged" is a complete
-report. Then run `.claude/hooks/phase.sh 3` — the confirmation prompt is their
-approval. A declined prompt means the spec is not finished; ask what is wrong
-rather than retrying.
+go to them **before** you ask — they are approving the spec as it now stands, so
+say what moved. "Reviewer found nothing, spec unchanged" is a complete report.
+
+Then `.claude/hooks/phase.sh ask spec`, pass it to `AskUserQuestion`, and run
+`.claude/hooks/phase.sh 3` once they approve. *Send the spec back* means the spec
+is not finished: ask what is wrong, revise it, and ask again — editing it is what
+clears the answer, so a spec you have not changed is one the gate still refuses.
 
 ## Phase 3 — Plan and failing tests
 
@@ -301,9 +273,8 @@ and do not summarise the spec back to a reviewer that read it:
 > not.
 
 **On slice 2 and after there is no live design session** — Phase 2 ran once, and
-each slice closes its reviewers behind it. Spawn a fresh `spec-adversary` with the
-full Phase 2 preamble, scoped to this slice's plan steps, and say which slice it
-is judging. It has to read the approved spec itself; it was not there.
+each slice closes its reviewers behind it, so this is a fresh spawn rather than a
+`SendMessage`. See [references/slicing.md](references/slicing.md#phase-3-on-slice-2-and-after-no-live-design-session).
 
 **Before the tests, not after.** Tests written against a plan that then gets
 restructured are paid for twice, once in writing them and once in unpicking them.
@@ -338,11 +309,13 @@ asserts and why this failure is the expected one.** A test that fails with
 reason — it is broken, and you fix it here rather than discovering it in Phase 4.
 
 **Exit:** plan reviewed and its findings handled, every new test failing for the
-right reason, output shown and accounted for — then run
-`.claude/hooks/phase.sh 4`. The prompt it raises is the user's assertion that they
-read the failures and accept them. Do not make that call in the same breath as
-`red`: show the output, say what it means, and let them see it before the prompt
-appears.
+right reason, output shown and accounted for — then `.claude/hooks/phase.sh ask
+red`, and `.claude/hooks/phase.sh 4` once they accept the failures.
+
+Do not ask in the same breath as `red`. Show the output, say per test what it
+asserts and why that failure is the expected one, and only then put the question.
+What they are accepting is the half the machine cannot check, and they can only
+accept it if they have read something first.
 
 Once RED is recorded, **do not touch the test files again before advancing.** Any
 edit to them voids the verification and the guard will send you back to `red`.
@@ -367,24 +340,14 @@ checking, the full suite rather than the files you touched, and whatever else it
 gates on.
 
 **Work out what those are. Do not assume, and do not invent a list.** Every repo
-has already decided what "valid" means and encoded it somewhere: in what its
-pre-commit hook runs, what CI runs, what its contributor docs tell a human to run
-before pushing, or in an aggregate script that exists for exactly this purpose.
-Go find that, and run what it says. Your own approximation of a repo's checks is
-how a diff passes review and fails CI ten minutes later.
-
-Say which commands you settled on and where you got them. That one sentence is
-what makes a wrong guess visible instead of silent — and if the repo genuinely
-defines nothing, say that too, then assemble the minimum for the language and
-flag that you chose it.
+has already encoded what "valid" means — in an aggregate check script, in CI, in a
+pre-commit hook, in its contributor docs. Go find that and run what it says. Your
+own approximation of a repo's checks is how a diff passes review and fails CI ten
+minutes later.
 
 Show the output. **Every failure is yours to account for, including ones in files
-you did not touch** — a type error elsewhere that your change surfaced is your
-change's problem. If a failure genuinely predates your work, prove it rather than
-asserting it: stash the change, run the check, restore, and show both results.
-
-Then write it down in the shape Phase 5 hands to the reviewer, so the work of
-finding this repo's checks is done once rather than twice:
+you did not touch.** Then write it down in the shape Phase 5 hands to the reviewer,
+so the work of finding this repo's checks is done once rather than twice:
 
 ```
 VALIDATION REPORT
@@ -394,10 +357,11 @@ Result:   <per command: pass, plus its summary line>
 Not covered: <what this repo does not check at all>
 ```
 
-`Not covered` is the line the reviewer reads first and the one you will be tempted
-to leave blank — see [adversarial-review](../adversarial-review/SKILL.md), step 2,
-for what it is for. Filling it is a Phase 4 job because Phase 4 is where you found
-out what the checks actually run.
+**Read [references/validation.md](references/validation.md) before you fill this
+in.** It has where to look and in what order of authority, how to prove a failure
+predates your change rather than asserting it, and what each report line buys the
+reviewer — including `Not covered`, which is the line the reviewer reads first and
+the one you will be tempted to leave blank.
 
 **Exit:** plan complete, repo validations green, output shown, report written —
 then run
@@ -424,13 +388,11 @@ Phase 4 cannot exit without them, so you are holding the report it wrote. Nothin
 to re-run here — hand it over in step 3. From the second round on, re-run whatever
 a fix could have broken, because a fix is code the validations have not seen.
 
-### 2. `git add -A`
+### 2. Staging — not yours
 
-That is what makes round two legible: from then on the index holds what the
-reviewer has seen and `git diff` holds your response to its verdict. It is
-bookkeeping, not a commit, and it cannot re-arm the review gate — the fingerprint
-is built from file contents, not from index state. If it picked up something you
-want out of the index, `git restore --staged <path>`.
+`review-bookmark.sh` handles it at both ends of the spawn, which is what makes
+round two legible. **Do not run `git add` yourself** — see [The two reviewer
+sessions](#the-two-reviewer-sessions).
 
 ### 3. Spawn, with a pointer and nothing else
 
@@ -464,16 +426,14 @@ the spec's summary in is how the withholding quietly stops happening while still
 looking like it is in force.
 
 Keep the handle the spawn returns. Every round after the first goes back to that
-session — see [The two reviewer sessions](#the-two-reviewer-sessions) — including
-the rounds the review gate asks for, since fixing a finding changes the diff and a
-changed diff is owed review again. Spawning a second reviewer for round two
-discards the only context in the system that knows what round one found.
+session, **including the rounds the review gate asks for** — fixing a finding
+changes the diff, and a changed diff is owed review again.
 
 ### 4. Act on the verdict
 
-**`git add -A` first, before you edit anything.** The verdict has landed, so the
-tree as it stands is now *what the reviewer has seen*, and everything you do next
-is the next round's `git diff`.
+**The staging already happened**, on the way out of the reviewer and before you
+could touch anything. The tree as it stands is now *what the reviewer has seen*,
+and everything you do next is the next round's `git diff`.
 
 - `blocker` / `serious` — fix, then note that the fix itself is unreviewed until
   the next round closes it. The reviewer that found it is the one that says so.
@@ -501,52 +461,39 @@ identical in a log that only records the end**, and only one of them is done.
 ### If the task is sliced, this is a boundary, not the end
 
 At `slice n of total` with slices remaining, Phase 5 is where one increment ends
-and the next begins. Commit the reviewed work, tick the slice off the checklist
-in the spec, then run `.claude/hooks/phase.sh 3` to open the next one.
+and the next begins: commit the reviewed work, tick the slice off the checklist in
+the spec, then `.claude/hooks/phase.sh 3` opens the next one. **The commit is not
+optional and the guard enforces it** — `5 → 3` is refused while anything is owed
+review. If the transition is denied, the message names what is outstanding; commit
+that, do not look for another way forward.
 
-**The commit is not optional and the guard enforces it.** `5 → 3` is refused
-while anything is owed review, because starting the next slice folds this one's
-diff into the new baseline, where the review gate stops seeing it forever. If
-the transition is denied, the message names what is outstanding — commit that,
-do not look for another way forward.
+**Both reviewer sessions end at the boundary too.** The next slice spawns its own,
+cold, and that is the point rather than an oversight.
 
-Then Phase 3 again: the next slice's plan steps, its failing tests, its own RED
-check, its own `3 → 4` approval. The user re-approves every lap, on that lap's
-evidence.
-
-**Both reviewer sessions end at the boundary too.** The next slice spawns its
-own, cold, and that is the point rather than an oversight: a code reviewer still
-holding the last slice's diff re-reports work that is already committed and
-reviewed, and grades this diff on credit the previous one earned. By slice five
-it would be carrying five diffs — which is the exact condition slicing exists to
-avoid, reassembled inside the reviewer.
-
-It also keeps `adversary` ignorant of the slice structure, which it should be.
-Tell it "this is slice 2 of 5" and it starts excusing a gap as *coming later*;
-refusing to grant that is most of what it is for. `spec-adversary` is the
-opposite case — it judges plans, and *"slice 2 needs the types slice 3
-introduces"* is only findable by a reviewer that can see the ordering.
-
-Only when the last slice is reviewed does the close-out below apply.
+[references/slicing.md](references/slicing.md#phase-5-as-a-boundary-rather-than-the-end)
+has the full boundary procedure and why the sessions reset. Only when the last
+slice is reviewed does the close-out below apply.
 
 ### Closing out
 
-The findings being handled does not end the task. **Ask what happens to the
-work:**
+The findings being handled does not end the task. Put the review log on screen,
+then **ask what happens to the work**: `.claude/hooks/phase.sh ask close-out`,
+passed to `AskUserQuestion`. Three answers, three different next moves:
 
-> Review is done and the log is above. Open a pull request?
-
-- **Yes** — open it. Then, and only then, run `.claude/hooks/phase.sh off`.
-  The order is load-bearing: `off` returns the review gate to firing every turn
-  on any dirty tree, so disarming before the work is committed leaves you
-  tripping the gate on your own finished diff.
-- **No** — **stay in Phase 5.** Do not disarm, do not commit, do not decide on
-  their behalf what the work was for. Say what is outstanding and wait. Further
-  changes get reviewed exactly like the last ones did, which is the point of
-  still being here.
+- **Open a pull request** — open it, *then* run `.claude/hooks/phase.sh off`.
+  The order is load-bearing and the gate now holds you to it: until the work is
+  committed, `off` is denied on this answer, because disarming on a dirty tree
+  returns the review gate to firing every turn against your own finished diff.
+- **Keep iterating** — **stay in Phase 5.** Do not disarm, do not commit, do not
+  decide on their behalf what the work was for. Say what is outstanding and wait.
+  Further changes get reviewed exactly like the last ones did, which is the point
+  of still being here. `off` is denied outright on this answer; do not re-ask
+  until something has actually changed.
+- **Disarm and leave it** — run `.claude/hooks/phase.sh off`. They have said the
+  tree is theirs to deal with.
 
 **Never run `phase.sh off` on your own initiative**, in any phase. Ending the
 workflow is the one decision that disposes of the whole task, and it is not
-yours. The guard raises a confirmation prompt as a backstop — treat that as the
-safety net it is, not as the asking. A prompt the user did not see coming is a
-worse conversation than the question above.
+yours. The guard still raises a confirmation prompt if you reach `off` without
+having asked — treat that as the backstop it is, not as the asking. A prompt the
+user did not see coming is a worse conversation than the question above.
