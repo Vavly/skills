@@ -5,15 +5,24 @@
 Claude Code plugins from [Vavly](https://github.com/Vavly). One marketplace, added
 once — everything published here shows up without a second repo to track.
 
+Both steps are required, in this order:
+
 ```
 /plugin marketplace add Vavly/skills
-```
-
-Then install what you want:
-
-```
 /plugin install spec-gate@vavly-skills
 ```
+
+The first line registers the marketplace and is needed once, ever. The second
+installs a plugin from it, and you run it again for each plugin you want.
+
+> **`Marketplace "vavly-skills" not found`** means the first line has not run in
+> this installation. The repo is `Vavly/skills` and the marketplace it declares is
+> named `vavly-skills` — you add it by repo, then install from it by name, and the
+> error mentions only the name. Run the first line and try again.
+
+Outside an interactive session, the same two steps are
+`claude plugin marketplace add Vavly/skills` and
+`claude plugin install spec-gate@vavly-skills`.
 
 ## What's here
 

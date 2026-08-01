@@ -122,6 +122,12 @@ place.
 /plugin install spec-gate@vavly-skills
 ```
 
+Both lines, in that order. `Marketplace "vavly-skills" not found` means only the
+second one ran — the marketplace is added by repo (`Vavly/skills`) and installed
+from by name (`vavly-skills`), and the error names only the latter. Outside an
+interactive session the same two steps are `claude plugin marketplace add …` and
+`claude plugin install …`.
+
 Then, from the root of the **target** repo:
 
 ```bash
