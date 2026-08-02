@@ -138,6 +138,96 @@ expect_w "nested test.sh is a test file"       ALLOW spec-gate/test.sh
 expect_w "run-tests.sh is a test file"         ALLOW run-tests.sh
 expect_w "deploy-test.sh stays production"     DENY  scripts/deploy-test.sh
 
+group "A '>' inside quotes is not a redirect"
+# The scanner used to read the raw command text, so every '>' was an operator
+# wherever it sat. The costly one in practice is the JS arrow function: the
+# target it invented was whatever followed, so `c => {d+=c}` was refused as a
+# write to a production file called '{d+=c}'. Each of these cost a reworded
+# command that was doing nothing wrong.
+expect_b "arrow fn: accumulator"      ALLOW 'node -e "let d=0; s.forEach(c => {d+=c})"'
+expect_b "arrow fn: concatenation"    ALLOW 'node -e "xs.map(k => k+1)"'
+expect_b "arrow fn: single quotes"    ALLOW "node -e 'xs.map(k => k+1)'"
+expect_b "an arrow in a commit msg"   ALLOW 'git commit -m "refactor: parse -> validate -> emit"'
+expect_b "a > inside a jq program"    ALLOW "jq '.a | map(select(.n > 3))' data.json"
+expect_b "a > inside a grep pattern"  ALLOW "grep -c '^[<>]' src/x.ts"
+expect_b "an awk comparison"          ALLOW "awk '\$1 > 5' src/x.ts"
+expect_b "a quoted >> in prose"       ALLOW 'echo "append with >> src/x.ts"'
+# Same defect, same line: the in-place-editor check also read raw text, so
+# naming sed -i inside a string was refused as though it were running it.
+expect_b "sed -i named in a string"   ALLOW 'git commit -m "stop using sed -i here"'
+
+# None of that may cost a genuine redirect. These are the cases the scanner
+# exists for, and they still have to land.
+expect_b "real redirect still denied"      DENY 'echo hi > src/y.ts'
+expect_b "real append still denied"        DENY 'echo hi >> src/y.ts'
+expect_b "quoted target still denied [#6]" DENY 'echo x > "src/a b.ts"'
+expect_b "computed target still denied"    DENY 'echo x > $(mktemp)'
+expect_b "sed -i actually run: denied"     DENY "sed -i '' s/a/b/ src/x.ts"
+expect_b "tee still denied [#3]"           DENY 'cat /tmp/e | tee src/x.ts'
+expect_b "redirect after a quoted arrow"   DENY 'echo "a -> b" > src/y.ts'
+expect_b "fd dup is not a write"           ALLOW 'pytest -q > /dev/null 2>&1'
+expect_b "stderr to stdout is not a write" ALLOW 'make build 2>&1 | tail -5'
+expect_b "explicit >&2 is not a write"     ALLOW 'echo problem >&2'
+# `>|` overrides noclobber. Leaving the bar unconsumed made it read as a pipe,
+# which ended the segment and discarded the target that was pending on it.
+expect_b "noclobber override is a write"   DENY  'echo hi >| src/y.ts'
+expect_b "1> is a write"                   DENY  'echo hi 1> src/y.ts'
+expect_b "&> is a write"                   DENY  'echo hi &> src/y.ts'
+
+# A hook that dies emits no decision, and Claude Code reads no decision as no
+# opinion — so a crash in the parser does not fail closed, it disables the Bash
+# gate entirely. That is how `local s=$1 n=${#s}` (which reads an unset s under
+# set -u) turned every DENY above into a silent ALLOW. Nothing here asserts a
+# verdict; it asserts the guard ran at all.
+for c in 'echo hi > src/y.ts' 'node -e "xs.map(k => k+1)"' 'pytest -q 2>&1' \
+         "grep -c '^[<>]' src/x.ts" 'cat /tmp/e | tee src/x.ts' \
+         "cat > docs/specs/p.md <<'EOF'
+body -> here
+EOF"; do
+  err=$(pl_bash "$c" | .claude/hooks/phase-guard.sh 2>&1 >/dev/null)
+  if [ -z "$err" ]; then
+    ok "the guard runs clean on: $(printf '%s' "$c" | head -1 | cut -c1-38)"
+  else
+    bad "the guard errored (and so failed OPEN) on '$(printf '%s' "$c" | head -1)': $err"
+  fi
+done
+
+group "Heredoc bodies are data, not commands"
+# Phase 3 is where the plan document gets written, and a plan names the files it
+# touches. The body of a heredoc was scanned as though it were shell, so an
+# arrow in a diagram or a sentence made authoring the plan via Bash impossible —
+# the workflow's own instructions blocked by the gate enforcing them.
+expect_b "prose naming production files" ALLOW "cat > docs/specs/plan.md <<'EOF'
+## Plan
+1. Edit src/parser.ts to add the new branch
+2. Update config.json with the flag
+EOF"
+expect_b "an arrow in the body"          ALLOW "cat > docs/specs/plan.md <<'EOF'
+Flow: parser -> validator -> emitter
+EOF"
+expect_b "a mermaid diagram in the body" ALLOW "cat > docs/specs/plan.md <<'EOF'
+graph TD
+  A[read] --> B[write config.json]
+EOF"
+expect_b "a command quoted in the body"  ALLOW "cat > docs/specs/plan.md <<'EOF'
+cp src/old.ts src/new.ts
+EOF"
+expect_b "a redirect quoted in the body" ALLOW "cat > docs/specs/plan.md <<'EOF'
+echo hi > src/y.ts
+EOF"
+# The heredoc's own target is still a real write target.
+expect_b "heredoc onto production denied" DENY "cat > src/x.ts <<'EOF'
+code
+EOF"
+expect_b "heredoc onto a test allowed"    ALLOW "cat > tests/new.test.ts <<'EOF'
+assert(1)
+EOF"
+# A redirect AFTER the body has ended is shell again, not data.
+expect_b "a redirect after the terminator" DENY "cat > docs/specs/plan.md <<'EOF'
+prose
+EOF
+echo sneaky > src/y.ts"
+
 group "Phase state is never the model's [#8]"
 expect_b "redirect into phase file denied"     DENY  'echo phase=5 > .claude/.spec-phase'
 expect_b "rm of phase file denied"             DENY  'rm .claude/.spec-phase'

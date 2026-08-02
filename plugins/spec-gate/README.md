@@ -1130,6 +1130,28 @@ destinations, `touch`, redirects) and refuses the write-ish forms it cannot
 (`sed -i`, `perl -i`, `patch`, runtime-computed targets), pointing at Edit
 instead. The scan is what makes the guarantee.
 
+**That parse reads tokens, not raw text**, and the difference is not cosmetic.
+Asking "is there a `>` in this string?" is not the same question as "does this
+command redirect", and the gap between them refused a steady stream of commands
+that wrote nothing. The expensive one is the JS arrow function — `c => {d+=c}`
+was read as a redirect and denied as a write to a production file named
+`{d+=c}`. So were `.n > 3` inside a quoted jq program, `'^[<>]'` in a grep
+pattern, and `parse -> validate` in a commit message.
+
+Heredocs were the worst of it, because Phase 3 is where the plan document gets
+written and a plan names the files it touches. The body was scanned as though it
+were shell, so one arrow in a sentence or a mermaid diagram made authoring the
+plan through Bash impossible — the gate blocking the workflow it exists to
+enforce, with no route around it but rewording prose until the regex lost
+interest. Quoting and heredoc bodies are tracked properly now: a `>` is an
+operator only where the shell would treat it as one, and a body is data. In-place
+editors are matched per word for the same reason, so naming `sed -i` in a string
+is no longer the same as running one.
+
+None of that loosens what gets caught. Quoted targets (`> "src/a b.ts"`),
+`>|`, `1>`, `&>`, computed targets, and every verb form above still deny, and
+`test.sh` pins each one alongside the false positives.
+
 The phase-entry snapshot is what keeps the scan honest: without a baseline it
 would blame the model for production files you already had dirty before Phase 3
 started.
