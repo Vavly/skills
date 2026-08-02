@@ -226,7 +226,7 @@ if [ -n "$CMD" ] && printf '%s' "$CMD" | grep -qE '(^|[^[:alnum:]_.+-])phase\.sh
       # "this is slice 2 of 5" invites it to excuse a gap as coming later, which
       # is the one thing a reviewer must refuse to grant.
       OFF_SLICES=""
-      if [ "$(slice_current)" -lt "$(slice_total)" ]; then
+      if slices_remain; then
         OFF_SLICES=" You are on slice $(slice_current) of $(slice_total), so $(( $(slice_total) - $(slice_current) )) more are unimplemented — ending now leaves the task half-built, and nothing afterwards remembers that it was sliced."
       fi
       # This is the gate the question buys the most on, because the decision was
@@ -245,11 +245,21 @@ if [ -n "$CMD" ] && printf '%s' "$CMD" | grep -qE '(^|[^[:alnum:]_.+-])phase\.sh
           if [ -n "$(review_pending_paths)" ]; then
             deny "The user chose to open a pull request, and this work is not committed yet: $(review_pending_paths | tr '\n' ' '). Open the PR first, then disarm — that order is the whole point of the answer they gave. Disarming now would arm the review gate on every turn against this same diff."
           fi
-          decide allow "The user chose to open a pull request and nothing is left uncommitted, so the work has shipped. Disarming is what they asked for next." ;;
+          # OFF_SLICES rides on both allows, not just the fallback prompt. It
+          # used to appear only when the model reached `off` WITHOUT asking —
+          # i.e. on the path the workflow forbids — so an eight-slice task
+          # answered through the gate disarmed after slice one with nothing on
+          # screen about the other seven. The warning was there; it was wired to
+          # the branch nobody takes.
+          decide allow "The user chose to open a pull request and nothing is left uncommitted, so the work has shipped. Disarming is what they asked for next.${OFF_SLICES}" ;;
         disarm)
-          decide allow "The user chose to disarm and keep the working tree as it stands. They were told the review gate returns to firing every turn while anything is uncommitted." ;;
+          decide allow "The user chose to disarm and keep the working tree as it stands. They were told the review gate returns to firing every turn while anything is uncommitted.${OFF_SLICES}" ;;
         continue)
           deny "The user chose to keep iterating in Phase 5, so the gate stays on and this task is not over. Say what is still outstanding and wait for them. Do not ask again until something has actually changed — re-asking an answered question until the answer changes is not consent." ;;
+        slice)
+          # They picked the boundary, not the end. Same shape as `continue`: an
+          # answer that keeps the task alive can never be redeemed for `off`.
+          deny "The user chose to commit this slice and open slice $(( $(slice_current) + 1 )) of $(slice_total), which is not a close-out — the task continues and the gate stays on. Commit the reviewed work, tick this slice off the checklist in docs/specs/, then run phase.sh 3 to open the next one." ;;
         expired)
           deny "That close-out answer was given at a different point in this task — a different phase or slice — so it does not decide this one. Ask again: phase.sh ask close-out" ;;
         *)

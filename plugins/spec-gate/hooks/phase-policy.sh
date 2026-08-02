@@ -201,6 +201,13 @@ slice_total() {
                             *)  printf '1\n' ;; esac
 }
 
+# 0 = this is a boundary, not the end. Three callers ask the same question and
+# used to each spell it out: the close-out wording, the close-out options, and
+# the guard's `off` warning. The third had it right and the first two did not,
+# which is exactly the drift one predicate prevents. A 1/1 task answers no, so
+# nobody who never sliced anything sees a word about slices.
+slices_remain() { [ "$(slice_current)" -lt "$(slice_total)" ]; }
+
 # --- Working-tree snapshot ---------------------------------------------------
 # One "<content-hash> <path>" line per dirty or untracked file. Must be run from
 # the project root, inside a work tree.
@@ -409,7 +416,18 @@ gate_question() {
   case "$1" in
     spec)      printf 'Approve the spec, and move on to the plan and its failing tests?' ;;
     red)       printf 'Those tests failed. Unlock production code?' ;;
-    close-out) printf 'Review is done. What happens to this work?' ;;
+    # Slice-aware, because at slice 1 of 8 the flat wording is simply false:
+    # review of ONE slice is done and seven are unbuilt. It was asked anyway —
+    # nothing here consulted the slice position — so the model got three options
+    # that all ended the task and had to write the real next move into a
+    # paragraph underneath. A question whose own contract needs a caveat is the
+    # bug; the caveat is the symptom.
+    close-out) if slices_remain; then
+                 printf 'Slice %s of %s is reviewed. What happens next?' \
+                   "$(slice_current)" "$(slice_total)"
+               else
+                 printf 'Review is done. What happens to this work?'
+               fi ;;
     skip)         printf 'Jump forward past a phase, skipping the approvals in between?' ;;
     abandon)      printf 'Turn the gate off before any code has been written?' ;;
     leave-review) printf 'Leave Phase 5 with a diff that is still owed review?' ;;
@@ -431,7 +449,18 @@ gate_options() {
     red) printf '%s\n' \
       'approve	Accept these failures	Each failure above is the one the spec expects, not an import error or a broken fixture. Phase 4 unlocks production code and freezes the tests.' \
       'decline	One of them is broken	A test failed for the wrong reason. It gets fixed and RED re-verified before you are asked again.' ;;
-    close-out) printf '%s\n' \
+    # The next-slice option comes first and only exists while slices remain. It
+    # is the move slicing.md already called the normal one at a boundary, and
+    # leaving it off the list did not make it unavailable — it made it something
+    # the model announced in prose beside a question that contradicted it.
+    #
+    # The other three stay answerable here on purpose. A user who types `off` at
+    # slice 1 wants out, and a boundary that offered only "carry on" would trade
+    # a missing option for a missing exit.
+    close-out) if slices_remain; then printf '%s\n' \
+      "slice	Commit and open slice $(( $(slice_current) + 1 ))	This slice is finished, not the task. Its reviewed work is committed, the checklist in docs/specs/ is ticked, and Phase 3 opens the next slice with its own plan, its own failing tests and its own approvals. $(( $(slice_total) - $(slice_current) )) slices remain after this one. The gate stays on."
+                 fi
+               printf '%s\n' \
       'pr	Open a pull request	The PR is opened first, then the gate is disarmed. That order is load-bearing: disarming on an uncommitted tree makes the review gate fire on every turn.' \
       'continue	Keep iterating	Stay in Phase 5. Anything that changes from here gets reviewed exactly like the last round did.' \
       'disarm	Disarm and leave it	The phase gate stops and the working tree is what you are left with. The review gate goes back to firing every turn while anything is uncommitted.' ;;

@@ -983,6 +983,27 @@ its default of firing every turn, and a dirty tree means review is owed — so
 disarming before the work is committed leaves you tripping the gate on your own
 finished diff, every turn, until you commit. Ship first, disarm second.
 
+On a sliced task the same gate asks a different question, because at slice 1 of 8
+"review is done" is false and all three answers above end a task that has seven
+slices left:
+
+> Slice 1 of 8 is reviewed. What happens next?
+>
+> - **Commit and open slice 2** — the reviewed work is committed, the checklist in
+>   the spec is ticked, and Phase 3 opens the next slice. The gate stays on.
+> - *…the three above, still answerable.*
+
+The fourth option is first because it is the normal move at a boundary, and the
+other three stay because a user who wants out at slice 1 must still have a way
+out. `slice` denies `off` the way `continue` does — it keeps the task alive — and
+`pr` and `disarm` now say what they are abandoning: *"7 more are unimplemented."*
+
+That warning is older than the option. It existed all along, in the confirmation
+prompt the guard raises when the model reaches `off` **without** asking — so it
+fired on the path the workflow forbids and stayed silent on the path it
+instructs. An eight-slice task, answered properly, disarmed after slice one with
+nothing said about the rest.
+
 This is the gate the question mechanism buys the most on, because the decision
 was never binary. The old prompt could offer only yes or no, so the third answer
 had to be asked for in prose — *"if the work should become a pull request, say so

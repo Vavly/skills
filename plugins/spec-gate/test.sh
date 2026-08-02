@@ -1900,6 +1900,78 @@ phase 2
 answer close-out 'Disarm and leave it'
 expect_b "an answer does not unlock off from phase 2"  DENY  '.claude/hooks/phase.sh off'
 
+group "Close-out at a slice boundary offers the next slice"
+# Observed: at slice 1 of 8 the gate asked "Review is done. What happens to this
+# work?" and offered PR / keep iterating / disarm. Review of slice ONE was done,
+# seven slices were unbuilt, and the move that was actually next — commit, tick
+# the checklist, phase.sh 3 — was not on the list. The model had to add it in
+# prose underneath, which is the gate delegating its own contract to a paragraph.
+#
+# The guard already computed the warning for exactly this (OFF_SLICES) and then
+# used it only in the no-receipt fallback, so it fired when the model skipped the
+# question and stayed silent when the model asked properly.
+setup_repo; phase start sliced
+printf 'phase=5\ntask=sliced\nslice=1/8\n' > .claude/.spec-phase
+
+Q=$(gate_q close-out)
+printf '%s' "$Q" | grep -qi 'slice 1 of 8' \
+  && ok "the close-out question names the slice it is closing" \
+  || bad "close-out still claims the whole task is reviewed at slice 1 of 8: '$Q'"
+
+OPTS=$(.claude/hooks/phase.sh ask close-out 2>/dev/null \
+  | python3 -c 'import json,sys; print("\n".join(o["label"] for o in json.load(sys.stdin)["questions"][0]["options"]))' 2>/dev/null)
+printf '%s' "$OPTS" | grep -qF 'Commit and open slice 2' \
+  && ok "the fourth path is an option, not a caveat" \
+  || bad "close-out does not offer the next slice: '$(printf '%s' "$OPTS" | tr '\n' '/')'"
+# The three that were always there stay answerable: a user who types `off` at
+# slice 1 still wants a way out, and removing it would trade one dead end for
+# another.
+for l in 'Open a pull request' 'Keep iterating' 'Disarm and leave it'; do
+  printf '%s' "$OPTS" | grep -qF "$l" \
+    && ok "'$l' is still on offer mid-task" \
+    || bad "'$l' disappeared at a slice boundary"
+done
+
+# Choosing the next slice is not choosing to end the task, so `off` must refuse
+# it the way `continue` does.
+answer close-out 'Commit and open slice 2'
+expect_b "opening the next slice is not a close-out" DENY '.claude/hooks/phase.sh off'
+reason=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh off')")
+printf '%s' "$reason" | grep -q 'phase.sh 3' \
+  && ok "the denial names the move the user actually chose" \
+  || bad "the next-slice denial does not point at phase.sh 3: '$reason'"
+
+# The two answers that DO disarm have to carry what is being abandoned. This is
+# the silent half of the bug: with a receipt the guard allowed and said nothing
+# about the seven slices it was ending.
+git add -A >/dev/null 2>&1; git commit -qm "slice 1" >/dev/null 2>&1
+for pick in 'Open a pull request' 'Disarm and leave it'; do
+  answer close-out "$pick"
+  expect_b "'$pick' still disarms on a clean tree" ALLOW '.claude/hooks/phase.sh off'
+  reason=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh off')")
+  printf '%s' "$reason" | grep -q '7 more are unimplemented' \
+    && ok "'$pick' says what it is abandoning" \
+    || bad "'$pick' disarms an 8-slice task silently: '$reason'"
+done
+
+# The last slice is the case close-out was written for, and it must not grow a
+# next-slice option that goes nowhere.
+printf 'phase=5\ntask=sliced\nslice=8/8\n' > .claude/.spec-phase
+Q=$(gate_q close-out)
+printf '%s' "$Q" | grep -qi 'slice' \
+  && bad "the final slice is asked about as though more were coming: '$Q'" \
+  || ok "the final slice gets the plain close-out question"
+.claude/hooks/phase.sh ask close-out 2>/dev/null \
+  | grep -qF 'Commit and open slice' \
+  && bad "a ninth slice was offered on an 8-of-8 task" \
+  || ok "no next slice is offered once the last one is reviewed"
+
+# An unsliced task must be indistinguishable from before any of this existed.
+printf 'phase=5\ntask=sliced\nslice=1/1\n' > .claude/.spec-phase
+.claude/hooks/phase.sh ask close-out 2>/dev/null | grep -qiE 'slice' \
+  && bad "a 1/1 task is asked about slices it never had" \
+  || ok "a 1/1 task closes out with no slice wording"
+
 group "The five transitions that used to need a terminal"
 # Each existed as "go run this in your own shell" for one stated reason: a
 # PreToolUse hook cannot tell a Bash call the model chose from one a slash
