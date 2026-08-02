@@ -347,7 +347,7 @@ if [ -n "$CMD" ] && printf '%s' "$CMD" | grep -qE '(^|[^[:alnum:]_.+-])phase\.sh
           stale)
             deny "The RED verification is stale: the test files have changed since they were checked. Run phase.sh red again, show the output, and then ask to advance. Current phase: $PHASE." ;;
           *)
-            deny "RED has not been verified yet, so Phase 4 stays locked. Run phase.sh red — it runs the tests this phase changed and refuses if they pass. Show the failure output, say why each failure is the expected one, then advance. If this repo has no test command configured (.claude/spec-gate-test-cmd), the check cannot run and the force gate covers it: ask with 'phase.sh ask force'" ;;
+            deny "RED has not been verified yet, so Phase 4 stays locked. Run phase.sh red — it runs the tests this phase changed and refuses if they pass. Show the failure output, say why each failure is the expected one, then advance. If this repo has no test command configured, write one to .claude/spec-gate-test-cmd — that path is gate config, not production code, and is writable in every phase — then run the check. Work out the command from package.json, pyproject.toml, the Makefile or CI rather than guessing. Only ask the force gate if nothing in the repo says how its tests run: forcing spends the user's approval in place of evidence you could have produced." ;;
         esac
       else
         advance_deny "$ARG"

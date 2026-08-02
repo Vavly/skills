@@ -149,6 +149,65 @@ expect_w "Write to phase file denied"          DENY  .claude/.spec-phase
 phase 5
 expect_b "phase 5 cannot rewrite state [#8]"   DENY  'echo phase=4 > .claude/.spec-phase'
 
+group "The gate's own config is writable in every phase [#11]"
+# The complement of the group above: phase STATE is never the model's, but gate
+# CONFIG always is. Getting this backwards deadlocked the workflow outright —
+# `phase.sh red` with no test command tells you to create
+# .claude/spec-gate-test-cmd, and Phase 3 then refused the write as "production
+# code", so the only route to Phase 4 was the force gate the user had to answer.
+for p in 1 2 3; do
+  phase "$p"
+  expect_w "phase $p: Write the test command"    ALLOW .claude/spec-gate-test-cmd
+  expect_b "phase $p: redirect the test command" ALLOW "printf 'yarn jest \$SPEC_GATE_TEST_FILES\n' > .claude/spec-gate-test-cmd"
+  expect_w "phase $p: Write the exclude list"    ALLOW .claude/spec-gate-review-exclude
+done
+phase 3
+expect_w "absolute path form allowed"          ALLOW "$PWD/.claude/spec-gate-test-cmd"
+expect_b "tee onto the test command allowed"   ALLOW 'echo x | tee .claude/spec-gate-test-cmd'
+# The exemption is two exact filenames, not a hole in .claude/. Opening the
+# directory would let Phase 3 rewrite settings.json or the guard script itself —
+# i.e. unlock production code by disarming the thing refusing it.
+expect_w "settings.json stays denied"          DENY  .claude/settings.json
+expect_w "the guard script stays denied"       DENY  .claude/hooks/phase-guard.sh
+expect_w "the policy file stays denied"        DENY  .claude/hooks/phase-policy.sh
+expect_w "a lookalike name stays denied"       DENY  .claude/spec-gate-test-cmd.sh
+expect_w "phase state is still denied"         DENY  .claude/.spec-red
+
+# The deadlock, end to end: what `phase.sh red` instructs must be a write the
+# guard permits. These two drifting apart is the actual defect, so pin them
+# against each other rather than against a hardcoded path.
+setup_repo; phase start v; phase 3
+out=$(.claude/hooks/phase.sh red 2>&1)
+sug=$(printf '%s' "$out" | sed -nE "s|.*> (\.claude/[a-z-]+).*|\1|p" | head -1)
+if [ -n "$sug" ]; then
+  ok "phase.sh red names a config path to create ($sug)"
+  expect_w "and the guard permits exactly that path" ALLOW "$sug"
+else
+  bad "phase.sh red printed no config path: $(printf '%s' "$out" | tr '\n' ' ')"
+fi
+
+# Writing the test command decides what "RED verified" means, so the command has
+# to be visible in the transcript the user approves from. Without this, `exit 1`
+# mints a receipt that looks exactly like a real test run.
+printf 'exit 1\n' > .claude/spec-gate-test-cmd
+printf 'a new test\n' > src/feature.test.ts
+out=$(.claude/hooks/phase.sh red 2>&1)
+# Matched with the label, not bare: "RED verified (exit 1)" already contains the
+# command string, so a bare grep passes without the command ever being shown.
+printf '%s' "$out" | grep -q 'command: exit 1' \
+  && ok "red echoes the command it ran" \
+  || bad "red does not show the command: $(printf '%s' "$out" | tr '\n' ' ')"
+grep -q '^cmd=exit 1$' .claude/.spec-red \
+  && ok "the receipt records the command" \
+  || bad "the receipt does not record the command it ran"
+
+# Hand the next group the fixture it expects. The groups below share one repo and
+# reach Phase 4 through `phase 4`, which only succeeds while RED is unverifiABLE
+# — no test command configured. Leaving the one written above in place makes that
+# advance refuse instead, and the failure surfaces three groups later as an
+# unrelated-looking "4 -> 5 denied".
+setup_repo; phase start verify; phase 5
+
 group "Phase 4/5 — normal permission flow"
 phase 4
 expect_w "production write allowed at 4"       ALLOW src/x.ts

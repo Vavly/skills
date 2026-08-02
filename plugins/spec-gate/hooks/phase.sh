@@ -113,7 +113,11 @@ verify_red() {
     echo "  Put a command in $TEST_CMD_FILE — it runs from the project root with"
     echo "  \$SPEC_GATE_TEST_FILES set to the test files this phase changed. e.g."
     echo "      printf 'yarn jest \$SPEC_GATE_TEST_FILES\\n' > .claude/spec-gate-test-cmd"
-    echo "  Until then 3 -> 4 needs the force gate: ask with 'phase.sh ask force'."
+    echo "  Write it now — that path is gate config, not production code, so it is"
+    echo "  writable in this phase. Take the command from package.json, pyproject.toml,"
+    echo "  the Makefile or CI rather than guessing, then run 'phase.sh red' again."
+    echo "  The force gate is for when nothing in the repo says how its tests run:"
+    echo "  it spends the user's approval in place of evidence you could produce."
     return 2
   fi
 
@@ -124,12 +128,19 @@ verify_red() {
     return 1
   fi
 
+  # Echoed, not just run. The test command is the model's to write — it has to
+  # be, or a repo that never configured one cannot verify RED at all — and what
+  # it contains decides what "verified" means. A command of `exit 1` produces a
+  # receipt indistinguishable from a real failing suite, so the command belongs
+  # on screen next to the failures the user is being asked to accept.
+  cmd=$(cat "$TEST_CMD_FILE")
   echo "spec-driven: verifying the new tests fail before unlocking production code"
-  echo "  tests: $files"
+  echo "  tests:   $files"
+  echo "  command: $cmd"
   echo
   (
     cd "$PROJECT_DIR" 2>/dev/null || exit 0
-    SPEC_GATE_TEST_FILES="$files" sh -c "$(cat "$TEST_CMD_FILE")"
+    SPEC_GATE_TEST_FILES="$files" sh -c "$cmd"
   )
   rc=$?
   echo
@@ -143,8 +154,13 @@ verify_red() {
   fi
 
   T=$(sed -n 's/^task=//p' "$STATE" | head -1)
+  # `cmd` rides above the `tests:` block, which is the only part read back —
+  # red_receipt_status parses from `^tests:$` down. It is here so the receipt
+  # says what produced the failures, and because approval_status pins this file
+  # by content hash: swapping the command after the user accepted it voids their
+  # approval instead of silently inheriting it.
   { printf '# spec-gate RED receipt — written by phase.sh red, never by hand\n'
-    printf 'task=%s\nrc=%s\n' "$T" "$rc"
+    printf 'task=%s\nrc=%s\ncmd=%s\n' "$T" "$rc" "$cmd"
     printf 'tests:\n'
     (cd "$PROJECT_DIR" 2>/dev/null && changed_test_snapshot)
   } > "$RECEIPT"

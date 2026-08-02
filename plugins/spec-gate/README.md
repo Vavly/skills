@@ -844,7 +844,10 @@ Scoped to the files one phase touched, that is usually well under a second.
 | tests edited after verification | — | denied, receipt stale |
 | no `spec-gate-test-cmd` configured | cannot run | denied — **terminal only**, as before |
 
-That last row is the deliberate fallback: with no test command there is nothing
+That last row is escapable rather than terminal: the test command is writable in
+every phase, so a repo that arrives at Phase 3 unconfigured can be configured on
+the spot and the check re-run. It is the deliberate fallback only while nothing
+has been put there: with no test command there is nothing
 to put on screen, so there is nothing to approve, and the gate reverts to
 `.claude/hooks/phase.sh 4` in your own terminal. **Configuring
 `spec-gate-test-cmd` is what buys the in-band prompt.**
@@ -1055,6 +1058,21 @@ or `.spec-approval`, so `rm`, `mv` and redirects are all covered. Nothing
 legitimate breaks, because the model reads phase state through `phase.sh status`,
 writes the RED receipt through `phase.sh red`, causes the approval receipt to be
 written by asking the user a question, and never touches any of them directly.
+
+The gate's own **configuration** is the exact opposite, and writable in every
+phase: `.claude/spec-gate-test-cmd` and `.claude/spec-gate-review-exclude`. State
+records decisions, so it is never the model's; config records how to run the
+tests, so it always is. Treating config as production code deadlocked the
+workflow — `phase.sh red` tells you to create the test command, and Phase 3 then
+refused the write, leaving the force gate as the only route to Phase 4 in a repo
+that had merely never been configured.
+
+Two exact filenames, not a hole in `.claude/`. Everything else there is
+`settings.json` and the hook scripts, and a Phase 3 that could write those could
+unlock production code by disarming the thing refusing it. Because the model can
+write the test command, `phase.sh red` echoes the command it ran and records it
+in the receipt: a command of `exit 1` produces a receipt indistinguishable from a
+real failing suite, so it belongs on screen beside the failures you are accepting.
 
 With **no** phase file the Stop gate runs every turn — the intended default for
 ordinary work outside the workflow. When a phase file exists, phases 1–4 suppress
