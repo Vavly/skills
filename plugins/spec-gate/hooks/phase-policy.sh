@@ -37,6 +37,41 @@ is_spec_path() {
   return 1
 }
 
+# --- The gate's own configuration --------------------------------------------
+# The exact opposite of is_phase_state, and the mirror image of the reason: phase
+# state records decisions, so the model may never write it; this records how to
+# run the tests, so the model must always be able to write it.
+#
+# Always, in every phase, is the load-bearing word. Without it the workflow
+# deadlocked: `phase.sh red` with no test command configured tells the model to
+# create .claude/spec-gate-test-cmd, and Phase 3 then refused that write as
+# "production code" — the gate instructing an action the same gate forbids. The
+# only way out was the force gate, so a repo that had simply never been
+# configured had to unlock production code on the user's assertion rather than on
+# a test run. That is the exact evidence Phase 3 exists to produce, lost to a
+# path heuristic.
+#
+# Two exact names, not a hole in .claude/. The rest of that directory is
+# settings.json and the hook scripts themselves, and a Phase 3 that could write
+# those could unlock production code by disarming the thing refusing it.
+#
+# One list, because these paths are also what the review gate ignores, and the
+# two answers must be the same one: a file the gate refuses to review is a file
+# the gate must let you write, or writing it owes a review that never comes.
+gate_config_list() {
+  printf '%s\n' \
+    '.claude/spec-gate-test-cmd' \
+    '.claude/spec-gate-review-exclude'
+}
+
+is_gate_config() {
+  while IFS= read -r c; do
+    [ -z "$c" ] && continue
+    case "$1" in "$c"|*/"$c") return 0 ;; esac
+  done <<< "$(gate_config_list)"
+  return 1
+}
+
 # Phase state is never the model's to touch, in any phase. .spec-red is in here
 # for the same reason as the other two: the model runs the RED check through
 # phase.sh, which writes the receipt only when the tests actually failed. A model
@@ -86,9 +121,7 @@ in_project() {
 # work the gate should judge — and left uncommitted they arm it, so writing a
 # config file would otherwise demand a review of having written a config file.
 review_exclude_list() {
-  printf '%s\n' \
-    '.claude/spec-gate-test-cmd' \
-    '.claude/spec-gate-review-exclude'
+  gate_config_list
 
   f="${PROJECT_DIR%/}/.claude/spec-gate-review-exclude"
   if [ -r "$f" ]; then
@@ -529,6 +562,7 @@ path_allowed_in_phase() {
   DENY_REASON=""
 
   is_spec_path "$p" && return 0
+  is_gate_config "$p" && return 0
 
   case "$phase" in
     1|2)
