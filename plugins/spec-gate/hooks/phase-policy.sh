@@ -193,22 +193,31 @@ spec_foreign_state() {   # $1 = the directory the work is happening in
 
 # The mirror question, and the one the Stop gate has to ask: the state is here,
 # but is there work somewhere this scan will never look? The scan compares
-# PROJECT_DIR's tree against its baseline, so a dirty sibling is work it passes
-# a turn on without having examined.
+# PROJECT_DIR's tree against its baseline, so a sibling holding this task's work
+# is a turn it passes without having examined anything.
 #
-# Gated on the sibling being dirty rather than merely existing, because a
-# worktree that is clean cannot be hiding anything and blocking on its existence
-# would make every repo with a spare worktree unusable. Dirty is the ambiguous
-# state, and ambiguous fails closed.
-spec_dirty_siblings() {   # $1 = the tree the gate is armed in
-  local base w wr
+# "Another worktree is dirty" is NOT that question, and answering it as though it
+# were made every repo with a scratch worktree unusable: one permanently-dirty
+# spare tree would block every turn, forever, over work that has nothing to do
+# with the task. Someone else's branch is someone else's business.
+#
+# So relatedness is required, and the signal for it is the task's own spec
+# document. Phase 2 writes docs/specs/<task>.md on the task's branch, so a tree
+# that predates the task does not have it and a tree carrying the task's work
+# does. Two conditions, both necessary: the sibling holds this task's spec, and
+# it has uncommitted work — a clean tree is hiding nothing whatever it holds.
+spec_related_siblings() {   # $1 = the tree the gate is armed in
+  local base task w wr
   spec_worktrees_exist "$1" || return 0
   base=$(spec_realpath "$1")
   [ -n "$base" ] || return 0
+  task=$(sed -n 's/^task=//p' "$base/.claude/.spec-phase" 2>/dev/null | head -1)
+  [ -n "$task" ] || return 0
   while IFS= read -r w; do
     [ -n "$w" ] || continue
     wr=$(spec_realpath "$w")
     { [ -n "$wr" ] && [ "$wr" != "$base" ]; } || continue
+    [ -f "$wr/docs/specs/$task.md" ] || continue
     ( cd "$wr" 2>/dev/null || exit 0
       d=$( { git diff HEAD --name-only
              git ls-files --others --exclude-standard

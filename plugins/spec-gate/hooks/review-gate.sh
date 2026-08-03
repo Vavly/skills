@@ -86,8 +86,8 @@ if command -v spec_foreign_state >/dev/null 2>&1; then
     F=$(spec_foreign_state "$PROJECT_DIR")
     [ -n "$F" ] && SPLIT=$(spec_split_message "$F" "$(spec_realpath "$PROJECT_DIR")")
   else
-    D=$(spec_dirty_siblings "$PROJECT_DIR" | tr '\n' ' ')
-    [ -n "$D" ] && SPLIT="spec-driven is armed in $(spec_realpath "$PROJECT_DIR") and there is uncommitted work in another worktree of this repo: $D. This scan only ever looks at the armed tree, so ending the turn here would pass work it has not examined. Commit or clear that tree, or move the task to it — spec-gate enforces one tree at a time and cannot vouch for the other."
+    D=$(spec_related_siblings "$PROJECT_DIR" | tr '\n' ' ')
+    [ -n "$D" ] && SPLIT="spec-driven is armed in $(spec_realpath "$PROJECT_DIR"), and this task's own spec document is in another worktree that has uncommitted work: $D. This scan only ever looks at the armed tree, so ending the turn here would pass work it has not examined. Commit or clear that tree, or move the task to it — spec-gate enforces one tree at a time and cannot vouch for the other. Worktrees that do not carry this task's spec are not affected."
   fi
   if [ -n "$SPLIT" ]; then
     { echo "TREE SPLIT: the gate and the work are not in the same worktree."

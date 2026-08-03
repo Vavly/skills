@@ -278,8 +278,18 @@ un-armed tree, and a tool call reaching from the armed tree into the other one.
 So a split fails closed, in all three layers. `phase-guard` denies, `phase.sh`
 refuses every command but `status`, and `status` says where the task actually is
 instead of claiming there isn't one. The Stop gate covers the case the other two
-cannot see: armed here, uncommitted work in a sibling tree, a scan that would
-otherwise pass a turn it never examined.
+cannot see: armed here, and this task's work sitting in a tree the scan will
+never look at.
+
+**"Another worktree is dirty" is not that question**, and answering it as though
+it were made every repo with a scratch worktree unusable — one permanently-dirty
+spare tree would block every turn, forever, over work with no connection to the
+task. Someone else's branch is someone else's business. So the Stop check needs
+the sibling to be *related*, and the signal is the task's own spec document:
+Phase 2 writes `docs/specs/<task>.md` on the task's branch, so a tree that
+predates the task does not carry it and a tree holding the task's work does. Both
+conditions are required — related, and dirty — since a clean tree is hiding
+nothing whatever it holds.
 
 **Reconciling is the user's, by hand.** The refusal names both trees and the two
 ways out — work from the armed tree, or `phase.sh off` there and start again

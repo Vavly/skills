@@ -2448,14 +2448,31 @@ printf '%s' "$out" | grep -qF "$MAIN" \
 # The Stop gate has the same blind spot, and the dangerous direction is the one
 # where PROJECT_DIR points at the CLEAN tree: it scans there, finds nothing owed,
 # and passes a turn whose work it never looked at.
+#
+# But "another worktree is dirty" is not that question. A scratch tree, or
+# someone else's branch, is none of this task's business, and blocking on it
+# would make one permanently-dirty spare worktree block every turn forever. The
+# tree has to be related to THIS task, and the signal is the task's own spec
+# document: written in Phase 2 on the task's branch, so a tree that predates the
+# task does not have it.
 cd "$MAIN" || exit 1
 export CLAUDE_PROJECT_DIR="$MAIN"
 printf 'phase=5\ntask=feature\nslice=1/1\n' > "$MAIN/.claude/.spec-phase"
+printf 'someone elses branch\n' > "$WT/src/unrelated.ts"
+rc=$(gate)
+[ "$rc" = 0 ] && ok "an unrelated dirty worktree is not this task's business" \
+              || bad "a dirty worktree with no connection to the task blocked (exit $rc)"
+
+mkdir -p "$WT/docs/specs"
+printf 'the spec\n' > "$WT/docs/specs/feature.md"
 printf 'work nobody reviewed\n' > "$WT/src/newthing.ts"
 rc=$(gate)
-[ "$rc" = 2 ] && ok "the Stop gate blocks rather than scanning the wrong tree" \
+[ "$rc" = 2 ] && ok "a worktree holding this task's spec blocks the turn" \
               || bad "the Stop gate passed a turn whose work is in another tree (exit $rc)"
-rm -f "$WT/src/newthing.ts"
+rm -rf "$WT/docs/specs" "$WT/src/newthing.ts" "$WT/src/unrelated.ts"
+rc=$(gate)
+[ "$rc" = 0 ] && ok "and goes quiet once no related tree is dirty" \
+              || bad "the Stop gate stayed blocked with no related tree left (exit $rc)"
 printf 'phase=3\ntask=feature\nslice=1/1\n' > "$MAIN/.claude/.spec-phase"
 cd "$WT" || exit 1
 export CLAUDE_PROJECT_DIR="$WT"
