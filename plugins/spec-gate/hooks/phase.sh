@@ -8,8 +8,8 @@
 # model's own say-so, which is what the receipt is for.
 #
 # Install: .claude/hooks/phase.sh  (chmod +x), or via the spec-gate-install skill
-# Add .claude/.spec-phase, .claude/.spec-baseline and .claude/.spec-red to
-# .gitignore
+# Add .claude/.spec-phase, .claude/.spec-baseline, .claude/.spec-red,
+# .claude/.spec-approval* and .claude/.spec-scaffold to .gitignore
 
 set -uo pipefail
 
@@ -25,6 +25,7 @@ STATE="$STATE_DIR/.spec-phase"
 BASELINE="$STATE_DIR/.spec-baseline"
 RECEIPT="$STATE_DIR/.spec-red"
 APPROVAL="$STATE_DIR/.spec-approval"
+SCAFFOLD="$STATE_DIR/.spec-scaffold"
 TEST_CMD_FILE="$STATE_DIR/spec-gate-test-cmd"
 
 # tree_snapshot comes from phase-policy.sh, shared with review-gate.sh so the
@@ -42,6 +43,7 @@ else
   changed_test_snapshot() { :; }
   changed_test_files() { :; }
   red_receipt_status() { printf 'unverifiable\n'; }
+  red_failure_kind() { printf 'assertion\n'; }
   review_pending_paths() { :; }
   slice_status() { printf 'absent\n'; }
   slice_current() { printf '1\n'; }
@@ -54,6 +56,8 @@ else
   gate_question() { :; }
   gate_options() { :; }
   approval_status() { printf 'unverifiable\n'; }
+  scaffold_armed() { false; }
+  is_tracked_path() { return 0; }
 fi
 
 # The state file is written from exactly one place, so a field cannot be dropped
@@ -137,21 +141,61 @@ verify_red() {
   echo "spec-driven: verifying the new tests fail before unlocking production code"
   echo "  tests:   $files"
   echo "  command: $cmd"
+  case "$cmd" in
+    *\|*) echo "  note:    that command contains a pipeline. pipefail is set, so a failure"
+           echo "           in any stage counts — but a final stage that returns non-zero"
+           echo "           when all is well would read as a failing suite." ;;
+  esac
   echo
-  (
+  # Captured rather than streamed, because the classification below reads it.
+  # bash rather than sh, for pipefail: `pytest | tail` returned the tail's zero,
+  # so a genuinely failing suite was reported as PASSED.
+  out=$(
     cd "$PROJECT_DIR" 2>/dev/null || exit 0
-    SPEC_GATE_TEST_FILES="$files" sh -c "$cmd"
+    SPEC_GATE_TEST_FILES="$files" bash -c "set -o pipefail; $cmd" 2>&1
   )
   rc=$?
+  printf '%s\n' "$out"
   echo
-  if [ $rc -eq 0 ]; then
-    rm -f "$RECEIPT"
-    echo "spec-driven: REFUSED — those tests PASSED."
-    echo "  A test that passes before the implementation exists is testing nothing."
-    echo "  Fix the tests so they fail for the reason you expect, then run"
-    echo "  phase.sh red again."
-    return 1
+  kind=$(red_failure_kind "$rc" "$out")
+
+  # Scaffold mode is the one place a missing module is the assertion rather than
+  # a missing prerequisite: existence is what that step delivers.
+  if [ "$kind" = import ] && scaffold_armed; then
+    kind=assertion
   fi
+
+  case "$kind" in
+    green)
+      rm -f "$RECEIPT"
+      echo "spec-driven: REFUSED — those tests PASSED."
+      echo "  A test that passes before the implementation exists is testing nothing."
+      echo "  Fix the tests so they fail for the reason you expect, then run"
+      echo "  phase.sh red again."
+      return 1 ;;
+    harness)
+      rm -f "$RECEIPT"
+      echo "spec-driven: REFUSED — the test command did not run (exit $rc)."
+      echo "  That is not a failing test, it is a missing or broken runner, and it"
+      echo "  produces the same non-zero exit a real failure would. Nothing here is"
+      echo "  evidence about the tests."
+      echo "  Fix the command in $TEST_CMD_FILE — take it from package.json,"
+      echo "  pyproject.toml, the Makefile or CI — then run phase.sh red again."
+      return 1 ;;
+    import)
+      rm -f "$RECEIPT"
+      echo "spec-driven: REFUSED — those tests failed because a module could not be"
+      echo "  resolved, not because anything they assert is wrong."
+      echo "  An import error is not a failing test. Every test against code that"
+      echo "  does not exist yet fails exactly this way whatever it asserts, so this"
+      echo "  proves nothing about the tests you just wrote."
+      echo "  The surface has to exist first: retreat to Phase 2, put the new files"
+      echo "  in a '## Scaffold' list in the spec, and ask for 'Approve, and create"
+      echo "  the files first'. Then Phase 3 tests fail on an assertion instead."
+      echo "  If the module SHOULD already exist, this is a broken import path or a"
+      echo "  missing dependency — fix that and run phase.sh red again."
+      return 1 ;;
+  esac
 
   T=$(sed -n 's/^task=//p' "$STATE" | head -1)
   # `cmd` rides above the `tests:` block, which is the only part read back —
@@ -160,13 +204,15 @@ verify_red() {
   # by content hash: swapping the command after the user accepted it voids their
   # approval instead of silently inheriting it.
   { printf '# spec-gate RED receipt — written by phase.sh red, never by hand\n'
-    printf 'task=%s\nrc=%s\ncmd=%s\n' "$T" "$rc" "$cmd"
+    printf 'task=%s\nrc=%s\nkind=%s\ncmd=%s\n' "$T" "$rc" "$kind" "$cmd"
     printf 'tests:\n'
     (cd "$PROJECT_DIR" 2>/dev/null && changed_test_snapshot)
   } > "$RECEIPT"
 
-  echo "spec-driven: tests failed as required — RED verified (exit $rc)."
-  echo "  Note: this proves not-green, not that they failed for the right reason."
+  echo "spec-driven: tests failed as required — RED verified (exit $rc, $kind)."
+  echo "  Note: this proves not-green, and that the failure was neither a broken"
+  echo "  runner nor an unresolved import. It does NOT prove they failed for the"
+  echo "  reason the spec expects."
   echo "  That part is yours to establish from the output above, and the user's to"
   echo "  accept — say what each test asserts and why its failure is the expected"
   echo "  one before you ask them to advance."
@@ -255,8 +301,33 @@ report_review_state() {
   fi
 }
 
+# "Inactive" was the old answer from a worktree while the task was armed next
+# door, and it is the wrong one in the most expensive way: the model reads it,
+# concludes there is no gate, and carries on writing production code. Something
+# IS started — just not here. Reported by `status` and refused by everything
+# else, since no command can act on state in a tree this process is not in.
+FOREIGN=""
+if [ ! -f "$STATE" ] && command -v spec_foreign_state >/dev/null 2>&1; then
+  FOREIGN=$(spec_foreign_state "$PROJECT_DIR")
+fi
+if [ -n "$FOREIGN" ] && [ "${1:-status}" != status ]; then
+  echo "spec-driven: REFUSED — $(spec_split_message "$FOREIGN" "$(spec_realpath "$PROJECT_DIR")")"
+  exit 1
+fi
+
 case "${1:-status}" in
   status)
+    if [ -n "$FOREIGN" ]; then
+      echo "spec-driven: armed in ANOTHER WORKTREE, not here"
+      echo "  -> gate state: $FOREIGN"
+      echo "  -> this tree:  $(spec_realpath "$PROJECT_DIR")"
+      echo "  -> nothing spec-gate does spans two trees, so the gate would report"
+      echo "     itself armed while enforcing nothing on the files edited here."
+      echo "  -> pick one tree: work from the first, or run 'phase.sh off' there"
+      echo "     and start the task again here. Do not move .spec-phase by hand."
+      report_review_state
+      exit 0
+    fi
     if [ ! -f "$STATE" ]; then
       echo "spec-driven: inactive"
       report_review_state
@@ -284,12 +355,19 @@ case "${1:-status}" in
     case "$P" in
       1) echo "  -> no files may be written"
          echo "  -> next: 2 Spec — Claude may advance" ;;
-      2) echo "  -> docs/specs/ only"
+      2) if scaffold_armed; then
+           echo "  -> SCAFFOLD MODE: docs/specs/, tests, and files that do not exist yet"
+           echo "  -> nothing already tracked may be edited — that is Phase 4"
+           echo "  -> show the surface test red first, then create the files"
+           echo "  -> next: 3 Plan + tests — run 'phase.sh 3' when the surface exists"
+         else
+         echo "  -> docs/specs/ only"
          # Said here because status is what the model re-reads after compaction,
          # and the spec review is instructed rather than enforced — the one step
          # a forgetful model can drop without anything noticing.
          echo "  -> the spec goes to the spec-adversary subagent before you are asked"
-         echo "  -> next: 3 Plan + tests — ask with 'phase.sh ask spec', then advance" ;;
+         echo "  -> next: 3 Plan + tests — ask with 'phase.sh ask spec', then advance"
+         fi ;;
       3) echo "  -> tests only; production code blocked"
          echo "  -> the plan goes to spec-adversary before the tests are written"
          # Same reason as the line above it: status is the post-compaction re-read,
@@ -316,7 +394,7 @@ case "${1:-status}" in
     # A newline in the task name would inject extra lines into the state file.
     T=$(printf '%s' "${2:-unnamed}" | tr -d '\n\r')
     write_state 1 "$T" "1/1"
-    rm -f "$RECEIPT" "$APPROVAL"
+    rm -f "$RECEIPT" "$APPROVAL" "$SCAFFOLD"
     snapshot_baseline
     echo "spec-driven: started '${T}' at phase 1 (Clarify)"
     ;;
@@ -381,10 +459,33 @@ case "${1:-status}" in
     } >&2
     ;;
 
+  # Widen Phase 2 to create files that do not exist yet, so Phase 3's tests can
+  # fail on an assertion instead of on a missing import. Its own command rather
+  # than a phase number: a phase below 3 that wrote production code would be
+  # reachable through the guard's retreat rule, which lets any move to a LOWER
+  # number through unchecked on the grounds that lower has always meant stricter.
+  scaffold)
+    [ -f "$STATE" ] || { echo "spec-driven: not started. Run: phase.sh start <task>"; exit 1; }
+    P=$(sed -n 's/^phase=//p' "$STATE" | head -1)
+    if [ "$P" != 2 ]; then
+      echo "spec-driven: scaffolding belongs to Phase 2, and you are at $(phase_name "$P")."
+      echo "  It runs after the spec is approved and before Phase 3 writes tests,"
+      echo "  so that the surface created is one the user has already read."
+      exit 1
+    fi
+    T=$(sed -n 's/^task=//p' "$STATE" | head -1)
+    printf '# spec-gate scaffold mode - written by phase.sh scaffold, never by hand\ntask=%s\n' "$T" > "$SCAFFOLD"
+    echo "spec-driven: scaffold mode ON (still Phase 2)"
+    echo "  -> you may CREATE files that do not exist yet, and tests"
+    echo "  -> you may NOT edit anything already tracked; that is Phase 4"
+    echo "  -> show the surface test failing first: phase.sh red"
+    echo "  -> then create the files, and advance with: phase.sh 3"
+    ;;
+
   red)
     [ -f "$STATE" ] || { echo "spec-driven: not started. Run: phase.sh start <task>"; exit 1; }
     P=$(sed -n 's/^phase=//p' "$STATE" | head -1)
-    if [ "$P" != 3 ]; then
+    if [ "$P" != 3 ] && ! { [ "$P" = 2 ] && scaffold_armed; }; then
       echo "spec-driven: RED verification belongs to Phase 3, and you are at $(phase_name "$P")."
       echo "  Phase 3 is where the failing tests are written. Nothing to verify here."
       exit 1
@@ -427,7 +528,7 @@ case "${1:-status}" in
     # one phase and spent in it. It is also pinned to the phase it was answered
     # in, so this delete is the second of two locks — cheap, and the kind of
     # redundancy worth having on the file that says the user said yes.
-    rm -f "$RECEIPT" "$APPROVAL"
+    rm -f "$RECEIPT" "$APPROVAL" "$SCAFFOLD"
     snapshot_baseline
     echo "spec-driven: -> $(phase_name "$1")"
     if [ "$ADVANCED" = 1 ]; then
@@ -436,7 +537,7 @@ case "${1:-status}" in
     ;;
 
   off)
-    rm -f "$STATE" "$BASELINE" "$RECEIPT" "$APPROVAL"
+    rm -f "$STATE" "$BASELINE" "$RECEIPT" "$APPROVAL" "$SCAFFOLD"
     echo "spec-driven: phase gate off"
     echo "  This ends the phase workflow. It does not stop review — with no phase"
     echo "  file the Stop gate returns to its default and runs EVERY turn."
@@ -444,7 +545,7 @@ case "${1:-status}" in
     ;;
 
   *)
-    echo "usage: phase.sh [status | start <task> | ask <gate> | red | slices <n> | 1..5 | off]"
+    echo "usage: phase.sh [status | start <task> | ask <gate> | red | scaffold | slices <n> | 1..5 | off]"
     echo "       phase.sh ask <gate>  print the question for a gate as an"
     echo "                            AskUserQuestion payload: spec | red | close-out"
     echo "       phase.sh red         run the Phase 3 tests and record RED if they fail"

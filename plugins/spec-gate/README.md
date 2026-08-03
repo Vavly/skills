@@ -197,7 +197,7 @@ cp -R "$SPEC_GATE"/hooks "$SPEC_GATE"/agents "$SPEC_GATE"/skills .claude/
 # cannot be verified in-band and falls back to being terminal-only.
 printf 'yarn jest $SPEC_GATE_TEST_FILES\n' > .claude/spec-gate-test-cmd
 
-printf '.claude/.spec-phase\n.claude/.spec-baseline\n.claude/.spec-red\n.claude/.spec-approval*\n.claude/review-log.jsonl\n' >> .gitignore
+printf '.claude/.spec-phase\n.claude/.spec-baseline\n.claude/.spec-red\n.claude/.spec-approval*\n.claude/.spec-scaffold\n.claude/review-log.jsonl\n' >> .gitignore
 git add .claude .gitignore && git commit -m "add review gate + spec-driven workflow"
 ```
 
@@ -260,6 +260,99 @@ ability to catch it. `test.sh` runs the shim against four fixtures — plugin-on
 from a subdirectory, two versions present, and none — for the reason
 `resolve-review-target.sh` is executed rather than transcribed: a snippet only
 ever checked by eye drifts from the one that runs.
+
+### Scaffold: reaching assertion-red on code that does not exist
+
+`phase.sh red` has exactly one detector for a test that asserts nothing: **the
+test passes.** That works where the code already exists. Against a module that
+does not, a careful test and an empty one fail identically —
+
+```
+careful test,  module missing  ->  ModuleNotFoundError  ->  RED verified
+worthless test, module missing ->  ModuleNotFoundError  ->  RED verified
+worthless test, module present ->  REFUSED — those tests PASSED
+```
+
+— so the check was blind for exactly the new feature work the five phases exist
+for, and sharp only for bug fixes, where the ceremony is least needed. Phase 3
+forbids creating the module, so no amount of discipline got the agent out of it:
+every new-module test failed on an import, and an import error is not evidence
+about what a test asserts.
+
+Scaffold closes it. The spec declares a `## Scaffold` list, the user picks
+*Approve, and create the files first*, and Phase 2 widens to **create** files
+that do not exist — nothing already tracked can be edited. The surface test is
+shown red first, which is the one case where an import error *is* the assertion,
+because existence is what the step delivers. Phase 3 then writes behavioural
+tests against a module that exists, and gets assertion-red.
+
+Three design points worth not re-litigating:
+
+**It is a mode on Phase 2, not a phase of its own.** Any phase numbered below 3
+that may write production code is reachable through the guard's retreat rule —
+`[ "$ARG" -lt "$PHASE" ]` passes unchecked, on the grounds that lower has always
+meant stricter — so Phase 3 could drop into it and write production code with
+nothing asked. A mode has no number to retreat into.
+
+**"New" means untracked, not "does not exist."** Both layers have to agree about
+the same file at any point in the turn, and by the time the Stop scan runs, the
+file the guard just permitted does exist. An existence test would have prevention
+and detection contradicting each other about the same write; `git ls-files`
+answers the same before and after.
+
+**It rides the spec approval rather than a gate of its own.** Only one
+`.spec-approval` exists at a time, so a second question in Phase 2 would
+overwrite the answer `2 → 3` still needs. The spec is also where the surface is
+described, which makes it the honest place to ask — and one prompt instead of
+two.
+
+### One tree per task
+
+The gate covers the worktree holding `.claude/.spec-phase`, and only that one.
+Nothing here spans two: `PROJECT_DIR` decides where the state is read from and
+`in_project` decides which paths are the gate's business, and the moment someone
+runs `git worktree add` those two answers can come from different trees.
+
+What that produced, observed in use: armed at Phase 3 in the main checkout,
+`phase.sh status` reporting `inactive` from the worktree, and `phase-guard`
+**allowing** a production write to `<worktree>/src` because the path was not
+under `PROJECT_DIR`. The gate reported itself armed and enforced nothing. That is
+a fail-open, and it arrives from both directions — the session standing in the
+un-armed tree, and a tool call reaching from the armed tree into the other one.
+
+So a split fails closed, in all three layers. `phase-guard` denies, `phase.sh`
+refuses every command but `status`, and `status` says where the task actually is
+instead of claiming there isn't one. The Stop gate covers the case the other two
+cannot see: armed here, and this task's work sitting in a tree the scan will
+never look at.
+
+**"Another worktree is dirty" is not that question**, and answering it as though
+it were made every repo with a scratch worktree unusable — one permanently-dirty
+spare tree would block every turn, forever, over work with no connection to the
+task. Someone else's branch is someone else's business. So the Stop check needs
+the sibling to be *related*, and the signal is the task's own spec document:
+Phase 2 writes `docs/specs/<task>.md` on the task's branch, so a tree that
+predates the task does not carry it and a tree holding the task's work does. Both
+conditions are required — related, and dirty — since a clean tree is hiding
+nothing whatever it holds.
+
+**Reconciling is the user's, by hand.** The refusal names both trees and the two
+ways out — work from the armed tree, or `phase.sh off` there and start again
+here. There is deliberately no `phase.sh unify`: `.spec-phase` is phase state,
+denied to the model through every write vector, and a command that relocated it
+would be a command that rewrites phase state. A receipt you moved is a receipt
+nobody gave.
+
+Two consequences worth knowing. `phase.sh start` is refused while a sibling tree
+holds a task, because a `start` that quietly armed a second tree would contradict
+the instruction the same gate just gave — one at a time is the whole claim. And
+the check is gated behind a pure-stat test for whether the repo has any linked
+worktrees at all, so a repo that has never run `git worktree add` pays two
+`stat`s and no subprocess; "inactive costs nothing" stays true.
+
+The better outcome is never splitting, which is why `spec-driven` now says so
+before it arms anything: decide where the work happens, create the worktree
+first, and arm the gate inside it.
 
 ## Running under Cursor
 
@@ -809,6 +902,43 @@ into *"verified not-green"* — narrower than "failing for the right reason", wh
 stays human, but it catches the vacuous-test failure mode outright, which is the
 one that actually happens.
 
+#### Not every non-zero exit is a failing test
+
+Treating one as the other certified two things that are not evidence:
+
+```
+no-such-runner -q                 ->  RED verified (exit 127)   ← nothing ran
+ModuleNotFoundError: src.parser   ->  RED verified (exit 1)     ← nothing asserted
+```
+
+The first is a typo'd or uninstalled test command, and it needs no pipeline to
+happen — it was hit twice while writing the tests for this very section. The
+second is the hole scaffold exists to close: every test against code that does
+not exist yet fails identically whatever it asserts, so refusing it here is what
+makes the scaffold step *required* rather than merely available.
+
+So the failure is classified: `green` and `harness` and `import` all refuse, and
+only `assertion` is RED. **Anything unrecognised is `assertion`** — a runner whose
+wording is not in the pattern list behaves exactly as it always did rather than
+being newly blocked, which is the only safe direction for a list that cannot be
+complete. The receipt records which kind it saw.
+
+The check also runs under `set -o pipefail` now. `pytest | tail` returned the
+tail's zero, so a genuinely failing suite was reported as *PASSED* — and with the
+127 case above, `pytest-typo | tail` was a **safe** refusal that pipefail alone
+would have turned into `RED verified`. That is why the classifier and pipefail
+had to land together; either one alone makes a case worse.
+
+One residual, stated rather than papered over: a **green** suite behind a final
+stage that returns non-zero when all is well — `pytest -q | grep -q FAILED` —
+still reads as a failing suite. No exit status can distinguish that, so the
+command is echoed above the output and a pipeline in it now draws an explicit
+note.
+
+The one place an unresolved import *is* the assertion is scaffold mode, where the
+module's existence is what the step delivers. There, `import` is accepted and
+`harness` still is not.
+
 What you approve at the prompt is the part the machine cannot check: that each
 test failed for the reason the spec expects, rather than on an import error or a
 typo in a fixture. You are reading real output to decide that, which is what
@@ -983,6 +1113,27 @@ its default of firing every turn, and a dirty tree means review is owed — so
 disarming before the work is committed leaves you tripping the gate on your own
 finished diff, every turn, until you commit. Ship first, disarm second.
 
+On a sliced task the same gate asks a different question, because at slice 1 of 8
+"review is done" is false and all three answers above end a task that has seven
+slices left:
+
+> Slice 1 of 8 is reviewed. What happens next?
+>
+> - **Commit and open slice 2** — the reviewed work is committed, the checklist in
+>   the spec is ticked, and Phase 3 opens the next slice. The gate stays on.
+> - *…the three above, still answerable.*
+
+The fourth option is first because it is the normal move at a boundary, and the
+other three stay because a user who wants out at slice 1 must still have a way
+out. `slice` denies `off` the way `continue` does — it keeps the task alive — and
+`pr` and `disarm` now say what they are abandoning: *"7 more are unimplemented."*
+
+That warning is older than the option. It existed all along, in the confirmation
+prompt the guard raises when the model reaches `off` **without** asking — so it
+fired on the path the workflow forbids and stayed silent on the path it
+instructs. An eight-slice task, answered properly, disarmed after slice one with
+nothing said about the rest.
+
 This is the gate the question mechanism buys the most on, because the decision
 was never binary. The old prompt could offer only yes or no, so the third answer
 had to be asked for in prose — *"if the work should become a pull request, say so
@@ -1108,6 +1259,28 @@ parses the targets it can (`tee`, `dd of=`, `cp`/`mv`/`install`/`ln`
 destinations, `touch`, redirects) and refuses the write-ish forms it cannot
 (`sed -i`, `perl -i`, `patch`, runtime-computed targets), pointing at Edit
 instead. The scan is what makes the guarantee.
+
+**That parse reads tokens, not raw text**, and the difference is not cosmetic.
+Asking "is there a `>` in this string?" is not the same question as "does this
+command redirect", and the gap between them refused a steady stream of commands
+that wrote nothing. The expensive one is the JS arrow function — `c => {d+=c}`
+was read as a redirect and denied as a write to a production file named
+`{d+=c}`. So were `.n > 3` inside a quoted jq program, `'^[<>]'` in a grep
+pattern, and `parse -> validate` in a commit message.
+
+Heredocs were the worst of it, because Phase 3 is where the plan document gets
+written and a plan names the files it touches. The body was scanned as though it
+were shell, so one arrow in a sentence or a mermaid diagram made authoring the
+plan through Bash impossible — the gate blocking the workflow it exists to
+enforce, with no route around it but rewording prose until the regex lost
+interest. Quoting and heredoc bodies are tracked properly now: a `>` is an
+operator only where the shell would treat it as one, and a body is data. In-place
+editors are matched per word for the same reason, so naming `sed -i` in a string
+is no longer the same as running one.
+
+None of that loosens what gets caught. Quoted targets (`> "src/a b.ts"`),
+`>|`, `1>`, `&>`, computed targets, and every verb form above still deny, and
+`test.sh` pins each one alongside the false positives.
 
 The phase-entry snapshot is what keeps the scan honest: without a baseline it
 would blame the model for production files you already had dirty before Phase 3

@@ -82,9 +82,204 @@ is_gate_config() {
 # own spec — which is bug #1 from the review list arriving through a new door.
 is_phase_state() {
   case "$1" in
-    *.spec-phase|*.spec-baseline|*.spec-red|*.spec-approval) return 0 ;;
+    *.spec-phase|*.spec-baseline|*.spec-red|*.spec-approval|*.spec-scaffold) return 0 ;;
   esac
   return 1
+}
+
+# --- Scaffold mode -----------------------------------------------------------
+# The hole this closes: `phase.sh red` has exactly one detector for a vacuous
+# test — the test passes. Against a module that does not exist, a careful test
+# and an `assert True` both fail with ModuleNotFoundError, identically, so the
+# detector is blind for precisely the new feature work the five phases exist
+# for. It works only where the code already exists, i.e. bug fixes, which is
+# where the ceremony is least needed.
+#
+# An import error is not a failing test. It is evidence that a prerequisite is
+# missing, and says nothing about what the test asserts — unless the thing being
+# delivered IS the module surface, which is the one case where "does it import
+# and export parse" is the assertion. Scaffold is that case, made explicit.
+#
+# It is a MODE on Phase 2 rather than a phase of its own, and that is load
+# bearing. Any phase numbered below 3 that may write production code would be
+# reachable through the guard's retreat rule — `[ "$ARG" -lt "$PHASE" ]` passes
+# unchecked, because lower has always meant stricter — so Phase 3 could drop
+# into it and write production code with nothing asked. A mode has no number to
+# retreat into.
+#
+# It sits after the 2 -> 3 approval so the surface being created is one the user
+# has already read in the spec. Scaffolding before Clarify would mean guessing
+# the module boundary before the design exists, and committing that guess as the
+# frontier every later test imports from.
+scaffold_path() { printf '%s/.claude/.spec-scaffold' "${PROJECT_DIR%/}"; }
+scaffold_armed() { [ -f "$(scaffold_path)" ]; }
+
+# "New" means NOT IN HEAD. The two layers have to agree about the same file at
+# any point in the turn, and by the time the Stop scan runs, the file the guard
+# just permitted DOES exist — an existence test would have prevention and
+# detection contradicting each other about the same write.
+#
+# `git ls-files --error-unmatch` was the first answer and it was wrong: it also
+# matches STAGED files, so the verdict flipped the moment the work was staged —
+# and review-bookmark.sh stages on every review round. A scaffolded file went
+# ALLOW, then DENY after `git add`, with the Stop scan calling it a phase
+# violation and advising a revert that would destroy the work. HEAD does not move
+# when you stage, so this is the predicate that is actually stable.
+#
+# The pathspec is literal: `git ls-files -- src/foo?.ts` glob-matches
+# src/foo1.ts, and a path is not a pattern.
+is_tracked_path() {
+  ( cd "$PROJECT_DIR" 2>/dev/null || exit 1
+    git rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 1
+    p=${1#"${PROJECT_DIR%/}/"}
+    git cat-file -e "HEAD:$p" >/dev/null 2>&1 )
+}
+
+# --- One tree per task -------------------------------------------------------
+# The gate's state lives in one worktree; the work can be in another the moment
+# someone runs `git worktree add`. Nothing here spans that. PROJECT_DIR decides
+# where .spec-phase is read from and in_project decides which paths are the
+# gate's business, and on a split those two answers come from different trees.
+#
+# What that produced, observed: the gate armed at Phase 3 in the main checkout,
+# `phase.sh status` reporting "inactive" from the worktree, and phase-guard
+# ALLOWING a production write to <worktree>/src because the path was not under
+# PROJECT_DIR. The gate reported itself armed and enforced nothing. That is a
+# fail-open, and the same one from two directions.
+#
+# Failing closed rather than picking a tree. Widening the gate to cover every
+# linked worktree would keep it enforcing, but it would make one task's state
+# authoritative over a tree the user may have created for something unrelated,
+# and it would put the review gate's fingerprint across trees that never share a
+# working state. Refusing is the only answer that cannot silently under-enforce.
+#
+# Reconciling is deliberately the user's, by hand, in a shell: `.spec-phase` is
+# denied to the model through every write vector, so a command that relocated it
+# would be a command that rewrites phase state — the exact door is_phase_state
+# exists to close.
+
+# Absolute physical path, so a comparison is not defeated by /tmp -> /private/tmp
+# or by any other symlinked parent.
+spec_realpath() { ( cd "$1" 2>/dev/null && pwd -P ) 2>/dev/null; }
+
+# The same, for a path that does not exist yet — which is every path worth
+# gating, since the interesting case is a file about to be created. Resolves the
+# deepest existing ancestor and re-attaches the rest.
+#
+# Without this the whole worktree comparison is decoration on macOS: a tool
+# payload names /var/folders/../wt/src/x.ts while git names
+# /private/var/folders/../wt, and a prefix test between those two is false for
+# reasons that have nothing to do with which tree the file is in. The unit tests
+# passed because they had already normalised both sides by hand; the end-to-end
+# reproduction is what caught it.
+spec_norm_path() {   # $1 = an absolute path
+  local p=$1 tail='' r
+  case "$p" in /*) ;; *) printf '%s\n' "$p"; return 0 ;; esac
+  while [ -n "$p" ] && [ "$p" != / ]; do
+    if [ -d "$p" ]; then
+      r=$(spec_realpath "$p")
+      [ -n "$r" ] && { printf '%s%s\n' "$r" "$tail"; return 0; }
+      break
+    fi
+    tail="/${p##*/}$tail"
+    p=${p%/*}
+    [ -z "$p" ] && p=/
+  done
+  printf '%s\n' "$1"
+}
+
+# Every worktree of the repo containing $1, one absolute path per line.
+spec_worktrees() {
+  ( cd "$1" 2>/dev/null || exit 0
+    git rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 0
+    git worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p' )
+}
+
+# The worktree holding an armed gate, when it is NOT the tree $1 is in. Empty
+# means no split: either this tree is the armed one, or nothing is armed
+# anywhere, or this is not a repo at all.
+#
+# A tree armed in its own right is never a split, so two worktrees each running
+# their own task is a supported shape — the tasks simply do not know about each
+# other, which is what separate state files already mean.
+
+# Does this repo have linked worktrees at all? Answered in stats, not processes.
+# A linked worktree has a .git FILE; the main checkout records them under
+# .git/worktrees. This exists so the split check costs nothing on the repos that
+# have never run `git worktree add`, which is most of them — otherwise every tool
+# call in every dormant repo would spawn git rev-parse, and "inactive costs
+# nothing" would stop being true.
+spec_worktrees_exist() {   # $1 = a directory; 0 = maybe, 1 = definitely not
+  local e
+  [ -f "$1/.git" ] && return 0              # we are in a linked worktree
+  if [ -d "$1/.git/worktrees" ]; then
+    for e in "$1"/.git/worktrees/*; do
+      [ -e "$e" ] && return 0
+      break
+    done
+  fi
+  [ -e "$1/.git" ] && return 1              # a repo root, and no linked worktrees
+  return 0                                  # not a repo root: ask git properly
+}
+
+spec_foreign_state() {   # $1 = the directory the work is happening in
+  local top w wr
+  spec_worktrees_exist "$1" || return 0
+  top=$( cd "$1" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null )
+  [ -n "$top" ] || return 0
+  top=$(spec_realpath "$top")
+  [ -n "$top" ] || return 0
+  [ -f "$top/.claude/.spec-phase" ] && return 0
+  while IFS= read -r w; do
+    [ -n "$w" ] || continue
+    wr=$(spec_realpath "$w")
+    [ -n "$wr" ] && [ "$wr" != "$top" ] && [ -f "$wr/.claude/.spec-phase" ] \
+      && { printf '%s\n' "$wr"; return 0; }
+  done <<< "$(spec_worktrees "$top")"
+  return 0
+}
+
+# The mirror question, and the one the Stop gate has to ask: the state is here,
+# but is there work somewhere this scan will never look? The scan compares
+# PROJECT_DIR's tree against its baseline, so a sibling holding this task's work
+# is a turn it passes without having examined anything.
+#
+# "Another worktree is dirty" is NOT that question, and answering it as though it
+# were made every repo with a scratch worktree unusable: one permanently-dirty
+# spare tree would block every turn, forever, over work that has nothing to do
+# with the task. Someone else's branch is someone else's business.
+#
+# So relatedness is required, and the signal for it is the task's own spec
+# document. Phase 2 writes docs/specs/<task>.md on the task's branch, so a tree
+# that predates the task does not have it and a tree carrying the task's work
+# does. Two conditions, both necessary: the sibling holds this task's spec, and
+# it has uncommitted work — a clean tree is hiding nothing whatever it holds.
+spec_related_siblings() {   # $1 = the tree the gate is armed in
+  local base task w wr
+  spec_worktrees_exist "$1" || return 0
+  base=$(spec_realpath "$1")
+  [ -n "$base" ] || return 0
+  task=$(sed -n 's/^task=//p' "$base/.claude/.spec-phase" 2>/dev/null | head -1)
+  [ -n "$task" ] || return 0
+  while IFS= read -r w; do
+    [ -n "$w" ] || continue
+    wr=$(spec_realpath "$w")
+    { [ -n "$wr" ] && [ "$wr" != "$base" ]; } || continue
+    [ -f "$wr/docs/specs/$task.md" ] || continue
+    ( cd "$wr" 2>/dev/null || exit 0
+      d=$( { git diff HEAD --name-only
+             git ls-files --others --exclude-standard
+           } 2>/dev/null | head -1 )
+      [ -n "$d" ] && printf '%s\n' "$wr" )
+  done <<< "$(spec_worktrees "$base")"
+  return 0
+}
+
+# One wording, because three layers refuse on this and a user who reads three
+# different accounts of the same condition learns that none of them is the whole
+# story.
+spec_split_message() {   # $1 = tree holding the state, $2 = tree holding the work
+  printf '%s' "spec-driven is armed in a different worktree. The gate state is in $1 and this work is in $2, and nothing in spec-gate spans two trees — so it would report itself armed while enforcing nothing on the files you are actually editing. Pick one tree: work from $1, or run 'phase.sh off' there and start the task again here. Moving .spec-phase by hand is not a route; it is phase state, and a receipt you relocate is a receipt nobody gave."
 }
 
 # --- Scope -------------------------------------------------------------------
@@ -201,6 +396,13 @@ slice_total() {
                             *)  printf '1\n' ;; esac
 }
 
+# 0 = this is a boundary, not the end. Three callers ask the same question and
+# used to each spell it out: the close-out wording, the close-out options, and
+# the guard's `off` warning. The third had it right and the first two did not,
+# which is exactly the drift one predicate prevents. A 1/1 task answers no, so
+# nobody who never sliced anything sees a word about slices.
+slices_remain() { [ "$(slice_current)" -lt "$(slice_total)" ]; }
+
 # --- Working-tree snapshot ---------------------------------------------------
 # One "<content-hash> <path>" line per dirty or untracked file. Must be run from
 # the project root, inside a work tree.
@@ -303,6 +505,44 @@ red_receipt_status() {
     [ -n "$want" ] || { printf 'stale\n'; exit 0; }
     if [ "$want" = "$(changed_test_snapshot)" ]; then printf 'valid\n'; else printf 'stale\n'; fi
   )
+}
+
+# --- What kind of red is this? -----------------------------------------------
+# `phase.sh red` used to treat any non-zero exit as "the tests failed", which
+# certifies two things that are not a failing test.
+#
+# A runner that never ran. A typo'd or uninstalled test command exits 127 and the
+# receipt recorded RED for a suite that produced no evidence at all — observed
+# twice while writing these very tests, with no pipeline involved.
+#
+# A missing module. Every test against code that does not exist yet fails
+# identically whatever it asserts, so the one detector this check has for a
+# vacuous test — the test passes — is disarmed for all new feature work. Scaffold
+# makes assertion-red reachable; refusing import-red here is what makes it
+# required. The exception is scaffold mode itself, where the module's existence
+# IS what the step delivers, so the import error is the assertion.
+#
+# Anything unrecognised is `assertion`, i.e. exactly the old behaviour. A runner
+# whose wording is not in these lists behaves as it always did rather than being
+# newly blocked, which is the only safe direction for a pattern list that cannot
+# be complete.
+red_failure_kind() {   # $1 = exit status, $2 = combined output -> green|harness|import|assertion
+  [ "$1" = 0 ] && { printf 'green\n'; return 0; }
+  # 126 and 127 are the shell's own codes for "cannot execute" and "not found",
+  # so they are about the command rather than about any test.
+  case "$1" in 126|127) printf 'harness\n'; return 0 ;; esac
+  case "$2" in
+    *"command not found"*) printf 'harness\n'; return 0 ;;
+  esac
+  case "$2" in
+    *ModuleNotFoundError*|*"No module named"*|*ImportError*|\
+    *"Cannot find module"*|*"cannot find module"*|*ERR_MODULE_NOT_FOUND*|*TS2307*|\
+    *"Could not resolve"*|*"cannot find package"*|*"no required module provides package"*|\
+    *"unresolved import"*|*E0432*|\
+    *package*"does not exist"*|*"cannot load such file"*)
+      printf 'import\n'; return 0 ;;
+  esac
+  printf 'assertion\n'
 }
 
 # --- The review fingerprint and its marker ------------------------------------
@@ -409,7 +649,18 @@ gate_question() {
   case "$1" in
     spec)      printf 'Approve the spec, and move on to the plan and its failing tests?' ;;
     red)       printf 'Those tests failed. Unlock production code?' ;;
-    close-out) printf 'Review is done. What happens to this work?' ;;
+    # Slice-aware, because at slice 1 of 8 the flat wording is simply false:
+    # review of ONE slice is done and seven are unbuilt. It was asked anyway —
+    # nothing here consulted the slice position — so the model got three options
+    # that all ended the task and had to write the real next move into a
+    # paragraph underneath. A question whose own contract needs a caveat is the
+    # bug; the caveat is the symptom.
+    close-out) if slices_remain; then
+                 printf 'Slice %s of %s is reviewed. What happens next?' \
+                   "$(slice_current)" "$(slice_total)"
+               else
+                 printf 'Review is done. What happens to this work?'
+               fi ;;
     skip)         printf 'Jump forward past a phase, skipping the approvals in between?' ;;
     abandon)      printf 'Turn the gate off before any code has been written?' ;;
     leave-review) printf 'Leave Phase 5 with a diff that is still owed review?' ;;
@@ -427,11 +678,23 @@ gate_options() {
   case "$1" in
     spec) printf '%s\n' \
       'approve	Approve the spec	You have read the spec in docs/specs/ and accept the approach, the types and the out-of-scope list. Phase 3 writes tests only; production code stays blocked until you have seen them fail.' \
+      'approve-scaffold	Approve, and create the files first	Same approval, plus one step before Phase 3: the new files this spec names get created empty, so the tests written next fail on an assertion instead of on a missing import. Nothing already tracked can be edited. Choose this when the spec introduces modules that do not exist yet.' \
       'decline	Send the spec back	Something is wrong or missing. Say what, and it gets revised before you are asked again. Choose this if the spec-adversary verdict is not in this conversation.' ;;
     red) printf '%s\n' \
       'approve	Accept these failures	Each failure above is the one the spec expects, not an import error or a broken fixture. Phase 4 unlocks production code and freezes the tests.' \
       'decline	One of them is broken	A test failed for the wrong reason. It gets fixed and RED re-verified before you are asked again.' ;;
-    close-out) printf '%s\n' \
+    # The next-slice option comes first and only exists while slices remain. It
+    # is the move slicing.md already called the normal one at a boundary, and
+    # leaving it off the list did not make it unavailable — it made it something
+    # the model announced in prose beside a question that contradicted it.
+    #
+    # The other three stay answerable here on purpose. A user who types `off` at
+    # slice 1 wants out, and a boundary that offered only "carry on" would trade
+    # a missing option for a missing exit.
+    close-out) if slices_remain; then printf '%s\n' \
+      "slice	Commit and open slice $(( $(slice_current) + 1 ))	This slice is finished, not the task. Its reviewed work is committed, the checklist in docs/specs/ is ticked, and Phase 3 opens the next slice with its own plan, its own failing tests and its own approvals. $(( $(slice_total) - $(slice_current) )) slices remain after this one. The gate stays on."
+                 fi
+               printf '%s\n' \
       'pr	Open a pull request	The PR is opened first, then the gate is disarmed. That order is load-bearing: disarming on an uncommitted tree makes the review gate fire on every turn.' \
       'continue	Keep iterating	Stay in Phase 5. Anything that changes from here gets reviewed exactly like the last round did.' \
       'disarm	Disarm and leave it	The phase gate stops and the working tree is what you are left with. The review gate goes back to firing every turn while anything is uncommitted.' ;;
@@ -565,8 +828,24 @@ path_allowed_in_phase() {
   is_gate_config "$p" && return 0
 
   case "$phase" in
-    1|2)
-      DENY_REASON="Phase $phase of spec-driven: no code yet. Phase 1 clarifies, Phase 2 writes docs/specs/ only. Blocked path: $p"
+    2)
+      # Scaffold mode: new module surface only, so Phase 3's tests can fail on
+      # an assertion instead of on an import. Tests are permitted too, because
+      # the surface test is what makes the creation a TDD step rather than a
+      # licence to write code.
+      if scaffold_armed; then
+        is_test_path "$p" && return 0
+        if is_tracked_path "$p"; then
+          DENY_REASON="Scaffold creates new files; it never edits one that already exists. '$p' is tracked, so changing it is implementation, not scaffolding — that is Phase 4. Blocked path: $p"
+          return 1
+        fi
+        return 0
+      fi
+      DENY_REASON="Phase 2 of spec-driven: no code yet. Phase 2 writes docs/specs/ only. Blocked path: $p"
+      return 1
+      ;;
+    1)
+      DENY_REASON="Phase 1 of spec-driven: no code yet. Phase 1 clarifies and writes nothing. Blocked path: $p"
       return 1
       ;;
     3)

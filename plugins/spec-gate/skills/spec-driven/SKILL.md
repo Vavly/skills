@@ -72,6 +72,32 @@ it reports inactive, run `phase.sh start <short-task-name>` to arm the gate at
 Phase 1. Arming is yours to do — Phase 1 is the most restrictive state, so there
 is no risk in it.
 
+## Arm the gate in the tree you will actually work in
+
+**The gate covers one worktree, and it is the one holding `.claude/.spec-phase`.**
+Nothing here spans two. So decide where the work happens *before* you arm it:
+
+- Going to use a worktree — `git worktree add`, `EnterWorktree`, a harness rule
+  that isolates background sessions? **Create it first, move into it, and arm the
+  gate there.**
+- Already armed, and only now moving to a worktree? The task does not come with
+  you. Close it out where it is, or stay put.
+
+Arming in the main checkout and then working in a worktree is the one arrangement
+this cannot enforce, and it fails in the direction that costs you: `status` reads
+`inactive` from the worktree while the task sits armed next door, and the guard
+has no opinion on files outside the tree it was armed in. A gate that reports
+itself armed and permits everything is worse than no gate, because you stop
+checking.
+
+The hooks now refuse rather than let that happen — `status` names both trees and
+every other command declines — but a refusal mid-task is a worse outcome than
+never splitting, and only you can prevent that, at the start. **If a refusal does
+land, do not try to route around it**: `.spec-phase` is phase state, so moving,
+copying or recreating it is denied through every vector, and a receipt you
+relocated is a receipt nobody gave. Report which tree holds the task and let the
+user pick one.
+
 **Three decisions are the user's, and each one is a question you ask them.** Not
 a sentence in your message hoping they answer it, and not a permission prompt on
 a shell command they never asked to see. The pattern is the same all three times:
@@ -256,6 +282,49 @@ slice boundary closes at Phase 5.
 If the answer is no, skip it — slicing costs one adversarial review per slice, and
 a three-step plan is not sliced.
 
+### If this feature needs files that do not exist yet
+
+**An import error is not a failing test.** It says a prerequisite is missing; it
+says nothing about what the test asserts. And `phase.sh red` has exactly one
+detector for a test that asserts nothing — *the test passes*. Against a module
+that does not exist, a careful test and an empty one both fail with
+`ModuleNotFoundError`, identically, so that detector is blind for precisely the
+new feature work this workflow exists for. It only works where the code already
+exists, which is bug fixes.
+
+So when the spec introduces modules that are not there yet, the surface gets
+created **before** Phase 3 writes tests against it. Declare it in the spec:
+
+```markdown
+## Scaffold
+
+- src/parser.py — `parse(text) -> Result`
+- src/emitter.py — `emit(node) -> str`
+```
+
+The user authorises it in the same answer that approves the spec — *Approve, and
+create the files first* — because the surface being created is the one the spec
+describes. Then:
+
+1. `phase.sh scaffold`. Still Phase 2; the gate now permits **creating** files
+   that do not exist, and tests. Anything already tracked stays untouchable —
+   editing existing code is Phase 4, and the gate will refuse it here.
+2. Write the surface test: it imports the module and names the export. Run
+   `phase.sh red` and show it failing. **This is the one place an import error
+   is the assertion**, because existence is what the step delivers.
+3. Create the files, with the surface and nothing behind it — signatures that
+   raise `NotImplementedError` or return nothing. Stop at the frontier. The
+   surface test goes green.
+4. `phase.sh 3` as normal. Scaffold mode ends with the phase change.
+
+Phase 3 then writes behavioural tests against a module that exists, so they fail
+on an assertion — which is the only failure that proves a test asserts anything.
+
+**Skip all of this when the work touches code that is already there.** A bug fix
+or a change to an existing module needs no scaffold: the import already resolves,
+so Phase 3 gets assertion-red for free and the plain *Approve the spec* is the
+answer you want.
+
 ### Have it reviewed before you ask
 
 **You do not review your own spec.** When it is written, delegate to the
@@ -314,6 +383,11 @@ Then `phase.sh ask spec`, pass it to `AskUserQuestion`, and run
 is not finished: ask what is wrong, revise it, and ask again — editing it is what
 clears the answer, so a spec you have not changed is one the gate still refuses.
 
+*Approve, and create the files first* is the same approval plus the scaffold step
+above; it also clears `2 → 3`, so you do not ask twice. If the spec declares a
+`## Scaffold` list, say so when you put the question, because that is the answer
+you are asking them to consider.
+
 ## Phase 3 — Plan and failing tests
 
 Two artifacts, in this order.
@@ -355,6 +429,20 @@ phase.sh red
 It runs exactly the test files this phase changed, refuses if any of them pass,
 and records that RED was verified. Running it through your own test command
 instead proves the same thing to you and nothing to the gate.
+
+**It also refuses two failures that are not failing tests**, and both refusals
+tell you what to do:
+
+- *the test command did not run* — a missing or broken runner exits non-zero
+  exactly like a real failure does. Fix the command in
+  `.claude/spec-gate-test-cmd`, taken from `package.json`, `pyproject.toml`, the
+  Makefile or CI rather than guessed.
+- *a module could not be resolved* — the code under test does not exist yet, so
+  every test fails this way whatever it asserts. That is the [scaffold
+  step](#if-this-feature-needs-files-that-do-not-exist-yet): retreat to Phase 2,
+  put the files in a `## Scaffold` list, and ask for *Approve, and create the
+  files first*. If the module *should* already exist, this is a broken import
+  path or a missing dependency — fix that instead.
 
 If a test passes before the implementation exists, it is testing nothing. Fix
 the test before continuing. Do not proceed until every new test fails for the

@@ -40,7 +40,7 @@ setup_repo() {
   # Must stay identical to the install block in README.md. An untracked state
   # file is work the review gate considers owed, so a name missing here is a gate
   # that arms itself every time it writes its own bookkeeping.
-  printf '.claude/.spec-phase\n.claude/.spec-baseline\n.claude/.spec-red\n.claude/.spec-approval*\n.claude/review-log.jsonl\n' > .gitignore
+  printf '.claude/.spec-phase\n.claude/.spec-baseline\n.claude/.spec-red\n.claude/.spec-approval*\n.claude/.spec-scaffold\n.claude/review-log.jsonl\n' > .gitignore
   git add -A >/dev/null 2>&1; git commit -qm init
   export CLAUDE_PROJECT_DIR="$PWD"
   rm -f .git/claude-review-gate
@@ -137,6 +137,191 @@ expect_w "test.sh is a test file"              ALLOW test.sh
 expect_w "nested test.sh is a test file"       ALLOW spec-gate/test.sh
 expect_w "run-tests.sh is a test file"         ALLOW run-tests.sh
 expect_w "deploy-test.sh stays production"     DENY  scripts/deploy-test.sh
+
+group "A '>' inside quotes is not a redirect"
+# The scanner used to read the raw command text, so every '>' was an operator
+# wherever it sat. The costly one in practice is the JS arrow function: the
+# target it invented was whatever followed, so `c => {d+=c}` was refused as a
+# write to a production file called '{d+=c}'. Each of these cost a reworded
+# command that was doing nothing wrong.
+expect_b "arrow fn: accumulator"      ALLOW 'node -e "let d=0; s.forEach(c => {d+=c})"'
+expect_b "arrow fn: concatenation"    ALLOW 'node -e "xs.map(k => k+1)"'
+expect_b "arrow fn: single quotes"    ALLOW "node -e 'xs.map(k => k+1)'"
+expect_b "an arrow in a commit msg"   ALLOW 'git commit -m "refactor: parse -> validate -> emit"'
+expect_b "a > inside a jq program"    ALLOW "jq '.a | map(select(.n > 3))' data.json"
+expect_b "a > inside a grep pattern"  ALLOW "grep -c '^[<>]' src/x.ts"
+expect_b "an awk comparison"          ALLOW "awk '\$1 > 5' src/x.ts"
+expect_b "a quoted >> in prose"       ALLOW 'echo "append with >> src/x.ts"'
+# Same defect, same line: the in-place-editor check also read raw text, so
+# naming sed -i inside a string was refused as though it were running it.
+expect_b "sed -i named in a string"   ALLOW 'git commit -m "stop using sed -i here"'
+# The editor name has to be a command, not any word whose basename matches. These
+# were all ALLOW before the per-word scan and DENY after it.
+expect_b "a directory called ex"      ALLOW 'pytest tests/ex -s'
+expect_b "a binary called ex"         ALLOW 'bin/ex -s'
+expect_b "a file called patch"        ALLOW 'cat notes/patch'
+expect_b "patch as a commit subject"  ALLOW 'git commit -m patch'
+# ...while the real invocations stay denied, including through a dispatcher.
+expect_b "sed -i through find -exec"  DENY  'find . -name "*.ts" -exec sed -i s/a/b/ {} ;'
+expect_b "sed -i through xargs"       DENY  'ls | xargs sed -i s/a/b/'
+# The original regex scanned raw text, so a wrapper taking its own operand made
+# no difference. Keying off the verb lost these: sudo consumes `-u`, then `root`
+# becomes the verb and everything after it is an argument.
+expect_b "sed -i behind sudo -u"      DENY  'sudo -u root sed -i s/a/b/ src/x.ts'
+expect_b "sed -i behind timeout N"    DENY  'timeout 5 sed -i s/a/b/ src/x.ts'
+expect_b "sed -i behind nice -n"      DENY  'nice -n 10 sed -i s/a/b/ src/x.ts'
+expect_b "perl -i behind env VAR="    DENY  'env FOO=1 perl -pi -e s/a/b/ src/x.ts'
+expect_b "patch as the verb"          DENY  'patch -p1 < fix.diff'
+
+# None of that may cost a genuine redirect. These are the cases the scanner
+# exists for, and they still have to land.
+expect_b "real redirect still denied"      DENY 'echo hi > src/y.ts'
+expect_b "real append still denied"        DENY 'echo hi >> src/y.ts'
+expect_b "quoted target still denied [#6]" DENY 'echo x > "src/a b.ts"'
+expect_b "computed target still denied"    DENY 'echo x > $(mktemp)'
+expect_b "sed -i actually run: denied"     DENY "sed -i '' s/a/b/ src/x.ts"
+expect_b "tee still denied [#3]"           DENY 'cat /tmp/e | tee src/x.ts'
+expect_b "redirect after a quoted arrow"   DENY 'echo "a -> b" > src/y.ts'
+expect_b "fd dup is not a write"           ALLOW 'pytest -q > /dev/null 2>&1'
+expect_b "stderr to stdout is not a write" ALLOW 'make build 2>&1 | tail -5'
+expect_b "explicit >&2 is not a write"     ALLOW 'echo problem >&2'
+expect_b "2>&1 is not a write"             ALLOW 'make 2>&1 | tail -1'
+expect_b ">&- is not a write"              ALLOW 'exec 3>&-'
+# `>&word` where word is not a descriptor is bash's synonym for `&>word`, i.e.
+# a real file write. Treating every `>&` as a dup was a deliberate wrong answer.
+expect_b ">&file IS a write"               DENY  'echo hi >& src/y.ts'
+expect_b ">&file with no space"            DENY  'echo hi >&src/y.ts'
+# `>|` overrides noclobber. Leaving the bar unconsumed made it read as a pipe,
+# which ended the segment and discarded the target that was pending on it.
+expect_b "noclobber override is a write"   DENY  'echo hi >| src/y.ts'
+# A backslash at end of line ran off the end of the string, emitted a spurious
+# empty word that swallowed the pending redirect, and the newline then ended the
+# segment — so the target on the next line was filed as an ordinary argument.
+# Continuing a line before a long path is idiomatic, not adversarial.
+expect_b "continuation before a target"    DENY  "$(printf 'echo hi > \\\n  src/y.ts')"
+expect_b "continuation with no space"      DENY  "$(printf 'echo hi >\\\nsrc/y.ts')"
+expect_b "continuation before a cp dest"   DENY  "$(printf 'cp /tmp/e \\\n  src/x.ts')"
+# Two more ways to desynchronise the lexer and take everything after it with
+# them. `$((1<<3))` was read as a heredoc opening with delimiter `3))`, which
+# never matches, so every later line was swallowed as body. An apostrophe in a
+# comment opened a quote that never closed. Both were caught by the raw-text
+# scanner this replaced.
+expect_b "arithmetic shift is not a heredoc" DENY "$(printf 'echo $((1<<3))\necho x > src/y.ts')"
+expect_b "an apostrophe in a comment"        DENY "$(printf "ls # don't\necho x > src/y.ts")"
+expect_b "a comment does not eat the line"   ALLOW "$(printf 'ls -la   # writes nothing > here')"
+expect_b "a hash inside a word is not one"   DENY  'echo a#b > src/y.ts'
+expect_b "a real heredoc still works"        ALLOW "$(printf 'cat > docs/specs/p.md <<HD\nbody\nHD')"
+expect_b "1> is a write"                   DENY  'echo hi 1> src/y.ts'
+expect_b "&> is a write"                   DENY  'echo hi &> src/y.ts'
+
+# A hook that dies emits no decision, and Claude Code reads no decision as no
+# opinion — so a crash in the parser does not fail closed, it disables the Bash
+# gate entirely. That is how `local s=$1 n=${#s}` (which reads an unset s under
+# set -u) turned every DENY above into a silent ALLOW. Nothing here asserts a
+# verdict; it asserts the guard ran at all.
+for c in 'echo hi > src/y.ts' 'node -e "xs.map(k => k+1)"' 'pytest -q 2>&1' \
+         "grep -c '^[<>]' src/x.ts" 'cat /tmp/e | tee src/x.ts' \
+         "cat > docs/specs/p.md <<'EOF'
+body -> here
+EOF"; do
+  err=$(pl_bash "$c" | .claude/hooks/phase-guard.sh 2>&1 >/dev/null)
+  if [ -z "$err" ]; then
+    ok "the guard runs clean on: $(printf '%s' "$c" | head -1 | cut -c1-38)"
+  else
+    bad "the guard errored (and so failed OPEN) on '$(printf '%s' "$c" | head -1)': $err"
+  fi
+done
+
+group "A quoted string handed to a shell is not data"
+# The tokenizer is right that a quoted `>` is not an operator. It was wrong that
+# a quoted string is therefore inert: `bash -c "..."` and `eval "..."` hand it
+# straight back to a shell. Every one of these was DENY before the tokenizer and
+# ALLOW after it — the most obvious deliberate route around a Bash write gate,
+# reopened by the fix for a different bug.
+expect_b "bash -c payload is re-read"      DENY 'bash -c "echo hi > src/y.ts"'
+expect_b "sh -c payload is re-read"        DENY "sh -c 'echo hi > src/y.ts'"
+expect_b "eval payload is re-read"         DENY 'eval "echo hi > src/y.ts"'
+expect_b "zsh -c too"                      DENY 'zsh -c "echo hi > src/y.ts"'
+expect_b "nested one level deeper"         DENY 'bash -c "sh -c \"echo hi > src/y.ts\""'
+expect_b "through xargs"                   DENY 'echo x | xargs -I{} sh -c "echo x > src/y.ts"'
+expect_b "through find -exec"              DENY 'find . -exec sh -c "echo x > src/y.ts" ;'
+# awk writes files with a redirect to a quoted literal. `$1 > 5` is a comparison
+# and must stay allowed — the distinguishing shape is the quoted target.
+expect_b "awk redirect to a quoted file"   DENY  'awk '"'"'BEGIN{print "x" > "src/y.ts"}'"'"''
+expect_b "awk append to a quoted file"     DENY  'awk '"'"'BEGIN{print "x" >> "src/y.ts"}'"'"''
+expect_b "an awk comparison still passes"  ALLOW "awk '\$1 > 5' src/x.ts"
+# The payload is only shell when a shell runs it.
+expect_b "a -c payload naming a test path" ALLOW 'bash -c "echo hi > src/y.test.ts"'
+expect_b "an ordinary quoted arrow"        ALLOW 'git commit -m "parse -> validate"'
+expect_b "a benign bash -c"                ALLOW 'bash -c "cd src && ls"'
+
+group "The guard cannot be outrun"
+# A PreToolUse hook that exceeds its timeout emits no decision, and no decision
+# reads as no opinion — so a slow guard is a fail-open, not a slow gate. The
+# char-by-char bash lexer was O(n^2): 20 KB took 15.3s against a 15s timeout, and
+# 20 KB is an ordinary `git commit -m`, a `gh pr create --body`, or the heredoc
+# plan document this workflow tells you to write.
+BIG=$(python3 -c "print('x '*10000)")
+START=$(python3 -c 'import time;print(time.time())')
+got=$(guard "$(pl_bash "git commit -m \"$BIG\"")")
+ELAPSED=$(python3 -c "import time;print(round(time.time()-$START,2))")
+if [ "$(python3 -c "print(1 if $ELAPSED < 3 else 0)")" = 1 ]; then
+  ok "a 20KB command is judged in ${ELAPSED}s (timeout is 15s)"
+else
+  bad "a 20KB command took ${ELAPSED}s — the hook times out and the gate vanishes"
+fi
+[ "$got" = ALLOW ] && ok "and judged correctly" || bad "a long commit message was $got"
+# The same length, but as a write that must still be caught.
+got=$(guard "$(pl_bash "echo \"$BIG\" > src/y.ts")")
+[ "$got" = DENY ] && ok "a long command with a real redirect is still denied" \
+                  || bad "length defeated the scan: got $got"
+
+# The tokenizer runs in awk, so awk joined jq/python3 as something the guard
+# needs. A dead hook emits no decision and no decision reads as no opinion, so an
+# unusable awk was a silent, total fail-open of the Bash gate.
+mkdir -p "$WORK/fakebin"; printf '#!/bin/sh\nexit 127\n' > "$WORK/fakebin/awk"; chmod +x "$WORK/fakebin/awk"
+got=$(printf '%s' "$(pl_bash 'echo hi > src/y.ts')" | PATH="$WORK/fakebin:$PATH" .claude/hooks/phase-guard.sh 2>/dev/null \
+  | python3 -c 'import json,sys
+t=sys.stdin.read().strip(); print("ALLOW" if not t else json.loads(t)["hookSpecificOutput"]["permissionDecision"].upper())')
+[ "$got" = DENY ] && ok "an unusable awk fails closed" \
+                  || bad "with awk broken the Bash gate vanished: got $got"
+rm -rf "$WORK/fakebin"
+
+group "Heredoc bodies are data, not commands"
+# Phase 3 is where the plan document gets written, and a plan names the files it
+# touches. The body of a heredoc was scanned as though it were shell, so an
+# arrow in a diagram or a sentence made authoring the plan via Bash impossible —
+# the workflow's own instructions blocked by the gate enforcing them.
+expect_b "prose naming production files" ALLOW "cat > docs/specs/plan.md <<'EOF'
+## Plan
+1. Edit src/parser.ts to add the new branch
+2. Update config.json with the flag
+EOF"
+expect_b "an arrow in the body"          ALLOW "cat > docs/specs/plan.md <<'EOF'
+Flow: parser -> validator -> emitter
+EOF"
+expect_b "a mermaid diagram in the body" ALLOW "cat > docs/specs/plan.md <<'EOF'
+graph TD
+  A[read] --> B[write config.json]
+EOF"
+expect_b "a command quoted in the body"  ALLOW "cat > docs/specs/plan.md <<'EOF'
+cp src/old.ts src/new.ts
+EOF"
+expect_b "a redirect quoted in the body" ALLOW "cat > docs/specs/plan.md <<'EOF'
+echo hi > src/y.ts
+EOF"
+# The heredoc's own target is still a real write target.
+expect_b "heredoc onto production denied" DENY "cat > src/x.ts <<'EOF'
+code
+EOF"
+expect_b "heredoc onto a test allowed"    ALLOW "cat > tests/new.test.ts <<'EOF'
+assert(1)
+EOF"
+# A redirect AFTER the body has ended is shell again, not data.
+expect_b "a redirect after the terminator" DENY "cat > docs/specs/plan.md <<'EOF'
+prose
+EOF
+echo sneaky > src/y.ts"
 
 group "Phase state is never the model's [#8]"
 expect_b "redirect into phase file denied"     DENY  'echo phase=5 > .claude/.spec-phase'
@@ -1900,6 +2085,78 @@ phase 2
 answer close-out 'Disarm and leave it'
 expect_b "an answer does not unlock off from phase 2"  DENY  '.claude/hooks/phase.sh off'
 
+group "Close-out at a slice boundary offers the next slice"
+# Observed: at slice 1 of 8 the gate asked "Review is done. What happens to this
+# work?" and offered PR / keep iterating / disarm. Review of slice ONE was done,
+# seven slices were unbuilt, and the move that was actually next — commit, tick
+# the checklist, phase.sh 3 — was not on the list. The model had to add it in
+# prose underneath, which is the gate delegating its own contract to a paragraph.
+#
+# The guard already computed the warning for exactly this (OFF_SLICES) and then
+# used it only in the no-receipt fallback, so it fired when the model skipped the
+# question and stayed silent when the model asked properly.
+setup_repo; phase start sliced
+printf 'phase=5\ntask=sliced\nslice=1/8\n' > .claude/.spec-phase
+
+Q=$(gate_q close-out)
+printf '%s' "$Q" | grep -qi 'slice 1 of 8' \
+  && ok "the close-out question names the slice it is closing" \
+  || bad "close-out still claims the whole task is reviewed at slice 1 of 8: '$Q'"
+
+OPTS=$(.claude/hooks/phase.sh ask close-out 2>/dev/null \
+  | python3 -c 'import json,sys; print("\n".join(o["label"] for o in json.load(sys.stdin)["questions"][0]["options"]))' 2>/dev/null)
+printf '%s' "$OPTS" | grep -qF 'Commit and open slice 2' \
+  && ok "the fourth path is an option, not a caveat" \
+  || bad "close-out does not offer the next slice: '$(printf '%s' "$OPTS" | tr '\n' '/')'"
+# The three that were always there stay answerable: a user who types `off` at
+# slice 1 still wants a way out, and removing it would trade one dead end for
+# another.
+for l in 'Open a pull request' 'Keep iterating' 'Disarm and leave it'; do
+  printf '%s' "$OPTS" | grep -qF "$l" \
+    && ok "'$l' is still on offer mid-task" \
+    || bad "'$l' disappeared at a slice boundary"
+done
+
+# Choosing the next slice is not choosing to end the task, so `off` must refuse
+# it the way `continue` does.
+answer close-out 'Commit and open slice 2'
+expect_b "opening the next slice is not a close-out" DENY '.claude/hooks/phase.sh off'
+reason=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh off')")
+printf '%s' "$reason" | grep -q 'phase.sh 3' \
+  && ok "the denial names the move the user actually chose" \
+  || bad "the next-slice denial does not point at phase.sh 3: '$reason'"
+
+# The two answers that DO disarm have to carry what is being abandoned. This is
+# the silent half of the bug: with a receipt the guard allowed and said nothing
+# about the seven slices it was ending.
+git add -A >/dev/null 2>&1; git commit -qm "slice 1" >/dev/null 2>&1
+for pick in 'Open a pull request' 'Disarm and leave it'; do
+  answer close-out "$pick"
+  expect_b "'$pick' still disarms on a clean tree" ALLOW '.claude/hooks/phase.sh off'
+  reason=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh off')")
+  printf '%s' "$reason" | grep -q '7 more are unimplemented' \
+    && ok "'$pick' says what it is abandoning" \
+    || bad "'$pick' disarms an 8-slice task silently: '$reason'"
+done
+
+# The last slice is the case close-out was written for, and it must not grow a
+# next-slice option that goes nowhere.
+printf 'phase=5\ntask=sliced\nslice=8/8\n' > .claude/.spec-phase
+Q=$(gate_q close-out)
+printf '%s' "$Q" | grep -qi 'slice' \
+  && bad "the final slice is asked about as though more were coming: '$Q'" \
+  || ok "the final slice gets the plain close-out question"
+.claude/hooks/phase.sh ask close-out 2>/dev/null \
+  | grep -qF 'Commit and open slice' \
+  && bad "a ninth slice was offered on an 8-of-8 task" \
+  || ok "no next slice is offered once the last one is reviewed"
+
+# An unsliced task must be indistinguishable from before any of this existed.
+printf 'phase=5\ntask=sliced\nslice=1/1\n' > .claude/.spec-phase
+.claude/hooks/phase.sh ask close-out 2>/dev/null | grep -qiE 'slice' \
+  && bad "a 1/1 task is asked about slices it never had" \
+  || ok "a 1/1 task closes out with no slice wording"
+
 group "The five transitions that used to need a terminal"
 # Each existed as "go run this in your own shell" for one stated reason: a
 # PreToolUse hook cannot tell a Bash call the model chose from one a slash
@@ -2235,6 +2492,360 @@ while IFS= read -r line; do
                 || bad "no hooks found — the extractor broke, not the wiring" ;;
   esac
 done <<< "$WIRING"
+
+group "RED classifies the failure, not just the exit code"
+# `phase.sh red` treated any non-zero exit as "the tests failed", which certifies
+# two things that are not a failing test:
+#
+#   a runner that never ran   — a typo'd or uninstalled test command exits 127,
+#                               and the receipt recorded RED for a suite that
+#                               produced no evidence at all. No pipeline needed.
+#   a missing module          — every new-module test fails identically whatever
+#                               it asserts, which is the hole scaffold exists to
+#                               close. Reaching assertion-red is not the same as
+#                               being required to.
+setup_repo; phase start t; phase 3
+kind() { # <label> <test-cmd> <expect: RED|REFUSED> [expect-substring]
+  printf '%s\n' "$2" > .claude/spec-gate-test-cmd
+  printf 'changed %s\n' "$RANDOM" > tests/probe.test.ts
+  local out; out=$(.claude/hooks/phase.sh red 2>&1)
+  local got; case "$out" in *"RED verified"*) got=RED ;; *REFUSED*) got=REFUSED ;; *) got=OTHER ;; esac
+  if [ "$got" = "$3" ] && { [ -z "${4:-}" ] || printf '%s' "$out" | grep -qi "$4"; }; then
+    ok "$1"
+  else
+    bad "$1 — got $got (want $3): $(printf '%s' "$out" | grep -iE 'REFUSED|RED verified|did not run' | head -1)"
+  fi
+}
+
+kind "a green suite is still refused"        'true'                              REFUSED 'PASSED'
+kind "a runner that does not exist"          'no-such-test-runner -q'            REFUSED 'did not run'
+kind "a runner that is not executable"       'exit 126'                          REFUSED 'did not run'
+kind "shell 'command not found' in output"   'printf "sh: nope: command not found\n" >&2; exit 1' REFUSED 'did not run'
+kind "a missing module is not a failing test" 'printf "ModuleNotFoundError: No module named src.parser\n"; exit 1' REFUSED 'scaffold'
+kind "a real assertion failure is RED"       'printf "AssertionError: 1 != 2\n"; exit 1' RED 'RED verified'
+# pipefail: the suite failed but the last pipeline stage swallowed it. Without
+# it the gate read the tail's 0 and reported the failing suite as PASSED.
+kind "a failure behind a pipe still counts"  'printf "AssertionError\n"; exit 1 | tail -1' RED 'RED verified'
+
+# The receipt says which kind of red it saw, so the claim it carries is the one
+# that was actually established.
+grep -q '^kind=assertion$' .claude/.spec-red \
+  && ok "the receipt records that the failure was an assertion" \
+  || bad "the receipt does not record the failure kind: $(grep -c . .claude/.spec-red) lines"
+
+# Cross-language module-resolution patterns, checked directly so the list is
+# pinned rather than inferred from whichever runner the fixture happens to use.
+# Captured before the loop: a `| while` runs in a subshell, so every ok/bad it
+# counted would be discarded along with it.
+KINDS=$( . .claude/hooks/phase-policy.sh 2>/dev/null
+  while IFS='|' read -r want text; do
+    [ -z "$want" ] && continue
+    got=$(red_failure_kind 1 "$text")
+    if [ "$got" = "$want" ]; then echo "OK  $want: ${text:0:44}"; else echo "BAD $want expected for '${text:0:44}' — got $got"; fi
+  done <<'CASES'
+import|ModuleNotFoundError: No module named 'src.parser'
+import|ImportError: cannot import name parse from src.parser
+import|Error: Cannot find module './parser'
+import|error TS2307: Cannot find module './parser'.
+import|ERR_MODULE_NOT_FOUND
+import|cannot find package "example.com/x"
+import|no required module provides package example.com/x
+import|error[E0432]: unresolved import crate::parser
+import|error: package com.x does not exist
+import|cannot load such file -- ./parser
+assertion|AssertionError: expected 1 to equal 2
+assertion|FAIL src/x.test.ts (1 failed)
+assertion|Expected: {error: empty}  Received: undefined
+CASES
+)
+while IFS= read -r line; do
+  case "$line" in "OK  "*) ok "${line#OK  }" ;; BAD*) bad "${line#BAD }" ;; esac
+done <<< "$KINDS"
+
+# Scaffold mode is the one place a missing module IS the assertion.
+setup_repo; phase start t; phase 2
+printf 'the spec\n' > docs/specs/t.md
+answer spec 'Approve, and create the files first'
+.claude/hooks/phase.sh scaffold >/dev/null 2>&1
+kind "in scaffold, a missing module is RED"  'printf "ModuleNotFoundError: No module named src.parser\n"; exit 1' RED 'RED verified'
+kind "but a broken runner still is not"      'no-such-test-runner -q'            REFUSED 'did not run'
+
+group "Scaffold: reaching assertion-red on code that does not exist yet"
+# The hole this closes: `phase.sh red` has exactly one detector for a vacuous
+# test — the test passes. Against a module that does not exist, a careful test
+# and `assert True` both fail with ModuleNotFoundError, so the detector is blind
+# for precisely the new feature work the workflow exists for. Phase 3 forbids
+# creating the module, so the agent has no move that produces assertion-red.
+#
+# Scaffold is a MODE on Phase 2, not a phase number. A phase numbered below 3
+# that may write production code would be reachable through the guard's retreat
+# rule ([ "$ARG" -lt "$PHASE" ] is allowed unchecked, because lower has always
+# meant stricter), which is a bypass straight through the gate.
+setup_repo
+phase start newfeature
+phase 2
+printf 'the spec\n' > docs/specs/newfeature.md
+
+# Unasked, this is the confirmation prompt every other gate falls back to — not
+# an allow, and not a refusal either. It is the only route that exists under
+# Cursor, where no receipt can ever be written.
+expect_b "unasked, scaffold prompts rather than proceeds" ASK '.claude/hooks/phase.sh scaffold'
+# Only one .spec-approval exists at a time, so a scaffold gate of its own would
+# overwrite the answer that 2 -> 3 still needs. The decision rides on the spec
+# approval instead — which is where the surface being created is described.
+answer spec 'Approve the spec'
+expect_b "the plain approval does not authorise it"  DENY '.claude/hooks/phase.sh scaffold'
+[ -f .claude/.spec-scaffold ] && bad "scaffold armed itself without an answer" \
+                             || ok "a plain spec approval arms nothing"
+
+answer spec 'Approve, and create the files first'
+expect_b "the scaffold answer authorises it"  ALLOW '.claude/hooks/phase.sh scaffold'
+expect_b "and 2 -> 3 still honours the same answer" ALLOW '.claude/hooks/phase.sh 3'
+
+# Cursor has no AskUserQuestion, so approval_status is permanently `none` there
+# and a receipt can never exist. With scaffold reachable only through a receipt,
+# a Cursor user writing a new module hit import-red in Phase 3, was told to
+# scaffold, and had no way to do it — a hard block introduced by making
+# import-red refuse. beforeShellExecution does carry `ask`, so the fallback every
+# other gate already has works there too.
+rm -f .claude/.spec-approval .claude/.spec-scaffold
+expect_b "unasked, scaffold falls back to a prompt" ASK '.claude/hooks/phase.sh scaffold'
+reason=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh scaffold')")
+printf '%s' "$reason" | grep -qi 'not been approved' \
+  && ok "the prompt says the spec was never approved through the question" \
+  || bad "the scaffold prompt hides that the spec is unapproved: '$reason'"
+printf '%s' "$reason" | grep -qi 'do not exist' \
+  && ok "and says what it is granting" \
+  || bad "the scaffold prompt does not say what it grants: '$reason'"
+# Choosing the plain approval is a decision AGAINST scaffolding, not an absence
+# of one, so it must not degrade into a prompt that asks again.
+answer spec 'Approve the spec'
+expect_b "a plain approval is still a refusal" DENY '.claude/hooks/phase.sh scaffold'
+# `stale` and `expired` are answers, not the absence of one, and every other gate
+# in the guard spells them out as denials. The fallback must not turn them into a
+# fresh prompt — re-asking until the answer changes is not consent.
+answer spec 'Approve, and create the files first'
+printf 'and one more requirement nobody approved\n' >> docs/specs/newfeature.md
+expect_b "a stale answer is not re-prompted"   DENY '.claude/hooks/phase.sh scaffold'
+answer spec 'Approve, and create the files first'
+printf 'phase=2\ntask=newfeature\nslice=1/2\n' > .claude/.spec-phase
+expect_b "an expired answer is not re-prompted" DENY '.claude/hooks/phase.sh scaffold'
+printf 'phase=2\ntask=newfeature\nslice=1/1\n' > .claude/.spec-phase
+.claude/hooks/phase.sh scaffold >/dev/null 2>&1
+[ -f .claude/.spec-scaffold ] && ok "scaffold mode is recorded on disk" \
+                             || bad "phase.sh scaffold left no marker"
+printf '%s' "$(.claude/hooks/phase.sh status 2>&1)" | grep -qi 'scaffold' \
+  && ok "status says the gate is in scaffold mode" \
+  || bad "status does not mention scaffold: $(.claude/hooks/phase.sh status 2>&1 | head -2)"
+
+# The write bound. "New" means UNTRACKED, not "does not exist" — at Stop-scan
+# time the file it just created does exist, so an existence test would have the
+# two layers disagreeing about the same file in the same turn.
+expect_w "a brand-new module may be created"   ALLOW src/parser.ts
+expect_w "a tracked file may NOT be edited"    DENY  src/x.ts
+expect_w "not even to append to it"            DENY  src/x.ts Edit
+expect_b "nor through a redirect"              DENY  'echo x >> src/x.ts'
+expect_w "tests are still writable"            ALLOW src/parser.test.ts
+expect_w "specs are still writable"            ALLOW docs/specs/newfeature.md
+# `git ls-files --error-unmatch` matches STAGED files, so the guard's answer
+# changed the moment the work was staged — and review-bookmark.sh stages on every
+# review round. The file then read as "tracked", the Stop scan called it a phase
+# violation, and its advice was to revert the work scaffold exists to produce.
+printf 'export const parse = () => null\n' > src/scaffolded.ts
+expect_w "a scaffolded file before staging" ALLOW src/scaffolded.ts
+git add src/scaffolded.ts >/dev/null 2>&1
+expect_w "and the same file after staging"  ALLOW src/scaffolded.ts
+expect_gate "staging it is not a phase violation" 0
+git rm -q --cached src/scaffolded.ts >/dev/null 2>&1; rm -f src/scaffolded.ts
+expect_w "phase state is still not writable"   DENY  .claude/.spec-phase
+expect_w "and neither is the scaffold marker"  DENY  .claude/.spec-scaffold
+expect_b "naming the marker at all is denied"  DENY  'rm .claude/.spec-scaffold'
+
+# Both layers have to agree, or prevention and detection contradict each other
+# on the same file. The Stop scan asks git the same question the guard did.
+printf 'export const parse = () => { throw new Error("not implemented") }\n' > src/parser.ts
+expect_gate "a scaffolded new file does not violate the phase" 0
+echo 'edited' >> src/x.ts
+expect_gate "editing a tracked file during scaffold does"      2
+git checkout -- src/x.ts 2>/dev/null
+
+# The import test can be shown red before the file exists — the one case where
+# import-red is the assertion, because existence is what the step delivers.
+rm -f src/parser.ts
+printf 'exit 1\n' > .claude/spec-gate-test-cmd
+printf 'import { parse } from "./parser"\n' > src/parser.test.ts
+out=$(.claude/hooks/phase.sh red 2>&1); rc=$?
+[ "$rc" = 0 ] && ok "phase.sh red runs in scaffold mode" \
+              || bad "red refused during scaffold: $(printf '%s' "$out" | head -2 | tr '\n' ' ')"
+
+# Leaving scaffold closes it. Advancing is the ordinary 2 -> 3, and the spec
+# approval the user already gave still covers it.
+printf 'export const parse = () => null\n' > src/parser.ts
+.claude/hooks/phase.sh 3 >/dev/null 2>&1
+[ -f .claude/.spec-scaffold ] && bad "the scaffold marker survived a phase change" \
+                             || ok "advancing to Phase 3 clears scaffold mode"
+expect_w "and production is blocked again at Phase 3" DENY src/another.ts
+
+# Scaffold belongs to Phase 2 and nowhere else. This is what makes it unable to
+# serve as the free retreat a numbered phase would have been.
+for p in 1 3 4 5; do
+  printf 'phase=%s\ntask=newfeature\nslice=1/1\n' "$p" > .claude/.spec-phase
+  .claude/hooks/phase.sh scaffold >/dev/null 2>&1
+  [ -f .claude/.spec-scaffold ] && bad "scaffold armed from phase $p" \
+                               || ok "scaffold is refused at phase $p"
+done
+printf 'phase=2\ntask=newfeature\nslice=1/1\n' > .claude/.spec-phase
+.claude/hooks/phase.sh off >/dev/null 2>&1
+[ -f .claude/.spec-scaffold ] && bad "off left the scaffold marker behind" \
+                             || ok "off clears scaffold mode too"
+
+group "One tree per task: the gate fails closed on a split"
+# Observed: the gate armed at Phase 3 in the main checkout, `status` reporting
+# "inactive" from a worktree, and the guard ALLOWING a production write to
+# <worktree>/src because the path was not under PROJECT_DIR. The gate reported
+# itself armed and enforced nothing — a fail-open, not friction. Nothing here can
+# span two trees: PROJECT_DIR decides where .spec-phase is read from and
+# in_project decides which paths are the gate's business, and on a split those
+# two answers come from different trees.
+setup_repo
+MAIN=$PWD
+phase start feature
+phase 3
+git worktree add -q "$WORK/wt" -b feature-wt >/dev/null 2>&1
+WT=$(cd "$WORK/wt" && pwd -P)
+
+# From the worktree: nothing is armed here, but something is armed next door.
+# "Inactive" was the old answer and it is the dangerous one.
+export CLAUDE_PROJECT_DIR="$WT"
+cd "$WT" || exit 1
+expect_w "a write from the un-armed worktree is denied" DENY "$WT/src/x.ts"
+# Failing closed means refusing the WRITES, not bricking the tree. The deny used
+# to fire before the tool was even looked at, so `ls`, `git status` and `cat`
+# all died — including the phase.sh status that reports the split, which made the
+# one escape hatch unreachable from the session that needed it. It also caught
+# Claude Code's own worktree-isolated subagents.
+expect_b "reads are not the gate's business"  ALLOW 'ls -la'
+expect_b "nor is git status"                  ALLOW 'git status'
+expect_b "nor running the suite"              ALLOW 'npm test'
+expect_b "and status stays reachable"         ALLOW '.claude/hooks/phase.sh status'
+expect_b "but a write through Bash is denied" DENY  'echo x > src/x.ts'
+# in_project is a prefix test against THIS tree, so an absolute path into the
+# armed tree scored as "not our business" — the same fail-open the split check
+# exists to close, from the mirror direction. The third one disarms the gate.
+expect_b "a write INTO the armed tree"       DENY  "echo x > $MAIN/src/x.ts"
+expect_b "a cp INTO the armed tree"          DENY  "cp /tmp/e $MAIN/src/x.ts"
+expect_b "rewriting the armed tree's state"  DENY  "printf 'phase=5' > $MAIN/.claude/.spec-phase"
+# The escape hatch matched *phase.sh* anywhere in the command, so naming it in a
+# comment or a string skipped the check entirely.
+expect_b "phase.sh in a comment is not it"   DENY  'echo x > src/x.ts # phase.sh'
+expect_b "phase.sh in a string is not it"    DENY  'echo "phase.sh" > src/x.ts'
+expect_b "reading phase.sh into a file"      DENY  'cat .claude/hooks/phase.sh > src/x.ts'
+reason=$(guard_reason "$(pl_write "$WT/src/x.ts")")
+printf '%s' "$reason" | grep -qF "$MAIN" && printf '%s' "$reason" | grep -qF "$WT" \
+  && ok "the refusal names both trees" \
+  || bad "the split refusal does not name both trees: '$reason'"
+printf '%s' "$reason" | grep -q 'phase.sh off' \
+  && ok "the refusal says how to reconcile by hand" \
+  || bad "the split refusal offers no way out: '$reason'"
+
+out=$("$MAIN"/.claude/hooks/phase.sh status 2>&1)
+printf '%s' "$out" | grep -qi 'inactive' \
+  && bad "status still reports inactive while a sibling tree is armed: '$out'" \
+  || ok "status reports the split instead of inactive"
+printf '%s' "$out" | grep -qF "$MAIN" \
+  && ok "status names the tree that holds the state" \
+  || bad "status does not say where the state actually is: '$out'"
+
+out=$("$MAIN"/.claude/hooks/phase.sh 4 2>&1)
+[ "$(sed -n 's/^phase=//p' "$MAIN/.claude/.spec-phase" | head -1)" = 3 ] \
+  && ok "phase.sh does not advance a task living in another tree" \
+  || bad "the cross-tree call moved the real state"
+# "not started" is the OLD answer and it is wrong: something IS started, next
+# door. A refusal that misdescribes why it refused is how people learn to stop
+# reading refusals.
+printf '%s' "$out" | grep -qF "$MAIN" \
+  && ok "and says which tree the task is actually in" \
+  || bad "phase.sh refuses across a split without saying where the task is: '$out'"
+
+# The Stop gate has the same blind spot, and the dangerous direction is the one
+# where PROJECT_DIR points at the CLEAN tree: it scans there, finds nothing owed,
+# and passes a turn whose work it never looked at.
+#
+# But "another worktree is dirty" is not that question. A scratch tree, or
+# someone else's branch, is none of this task's business, and blocking on it
+# would make one permanently-dirty spare worktree block every turn forever. The
+# tree has to be related to THIS task, and the signal is the task's own spec
+# document: written in Phase 2 on the task's branch, so a tree that predates the
+# task does not have it.
+cd "$MAIN" || exit 1
+export CLAUDE_PROJECT_DIR="$MAIN"
+printf 'phase=5\ntask=feature\nslice=1/1\n' > "$MAIN/.claude/.spec-phase"
+printf 'someone elses branch\n' > "$WT/src/unrelated.ts"
+rc=$(gate)
+[ "$rc" = 0 ] && ok "an unrelated dirty worktree is not this task's business" \
+              || bad "a dirty worktree with no connection to the task blocked (exit $rc)"
+
+mkdir -p "$WT/docs/specs"
+printf 'the spec\n' > "$WT/docs/specs/feature.md"
+printf 'work nobody reviewed\n' > "$WT/src/newthing.ts"
+rc=$(gate)
+[ "$rc" = 2 ] && ok "a worktree holding this task's spec blocks the turn" \
+              || bad "the Stop gate passed a turn whose work is in another tree (exit $rc)"
+rm -rf "$WT/docs/specs" "$WT/src/newthing.ts" "$WT/src/unrelated.ts"
+rc=$(gate)
+[ "$rc" = 0 ] && ok "and goes quiet once no related tree is dirty" \
+              || bad "the Stop gate stayed blocked with no related tree left (exit $rc)"
+printf 'phase=3\ntask=feature\nslice=1/1\n' > "$MAIN/.claude/.spec-phase"
+cd "$WT" || exit 1
+export CLAUDE_PROJECT_DIR="$WT"
+
+# The mirror case: armed in main, and a tool call reaches into the worktree.
+# in_project used to read that as "not repo work" and skip it.
+cd "$MAIN" || exit 1
+export CLAUDE_PROJECT_DIR="$MAIN"
+expect_w "a write INTO another worktree is denied" DENY "$WT/src/x.ts"
+# The same write, named the way a real tool payload names it: unresolved, with
+# whatever symlinked parent the caller happened to be standing under. git reports
+# worktrees in physical form, so a prefix comparison against the raw path is
+# false for reasons that have nothing to do with which tree the file is in. Both
+# unit tests above pass with the normalisation removed; this one does not.
+expect_w "and denied when the path is not pre-resolved" DENY "$WORK/wt/src/x.ts"
+expect_w "a not-yet-existing nested path too"          DENY "$WORK/wt/src/deep/new/thing.ts"
+# Paths genuinely outside the repo are still none of the gate's business.
+expect_b "an unrelated absolute path still passes" ALLOW 'pytest -q > /dev/null 2>&1'
+expect_w "a path outside any worktree is ignored"  ALLOW /tmp/scratch.ts
+
+# Starting a second task here while one is armed next door is refused too, and
+# has to be: the refusal tells you to turn the other one off first, so a `start`
+# that quietly armed a second tree would contradict the instruction the same
+# gate just gave. One tree at a time is the whole claim.
+cd "$WT" || exit 1
+export CLAUDE_PROJECT_DIR="$WT"
+"$MAIN"/.claude/hooks/phase.sh start wt-task >/dev/null 2>&1
+[ -f "$WT/.claude/.spec-phase" ] \
+  && bad "start armed a second tree while another was already armed" \
+  || ok "start is refused while a sibling tree holds the task"
+
+# The reconciliation the refusal actually names, end to end. This is the path a
+# user is told to take, so it is the one that must work.
+cd "$MAIN" || exit 1
+export CLAUDE_PROJECT_DIR="$MAIN"
+"$MAIN"/.claude/hooks/phase.sh off >/dev/null 2>&1
+cd "$WT" || exit 1
+export CLAUDE_PROJECT_DIR="$WT"
+"$MAIN"/.claude/hooks/phase.sh start wt-task >/dev/null 2>&1
+"$MAIN"/.claude/hooks/phase.sh 3 >/dev/null 2>&1
+[ "$(sed -n 's/^phase=//p' "$WT/.claude/.spec-phase" 2>/dev/null | head -1)" = 3 ] \
+  && ok "once the other tree is disarmed, this one arms normally" \
+  || bad "the reconciliation the refusal names does not work"
+expect_w "the newly armed tree denies production" DENY  "$WT/src/x.ts"
+expect_w "and permits its own tests"              ALLOW "$WT/src/x.test.ts"
+out=$("$MAIN"/.claude/hooks/phase.sh status 2>&1)
+printf '%s' "$out" | grep -qi 'another worktree' \
+  && bad "the surviving armed tree still reports a split: '$out'" \
+  || ok "one armed tree is not a split"
+cd "$MAIN" || exit 1
+export CLAUDE_PROJECT_DIR="$MAIN"
 
 # The manifest is what makes the plugin installable at all; a plugin directory the
 # marketplace does not list is a plugin nobody can reach.

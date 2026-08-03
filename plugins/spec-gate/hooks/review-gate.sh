@@ -75,6 +75,29 @@ fi
 
 PHASE=$(sed -n 's/^phase=//p' .claude/.spec-phase 2>/dev/null | head -1)
 
+# --- 0. One tree per task ----------------------------------------------------
+# This scan compares PROJECT_DIR's tree against PROJECT_DIR's baseline. On a
+# split that is the wrong tree, and being the completeness layer, it fails the
+# quietest way there is: it looks at a clean checkout, finds nothing owed, and
+# passes a turn whose work it never saw. Both directions of the split end here.
+if command -v spec_foreign_state >/dev/null 2>&1; then
+  SPLIT=""
+  if [ -z "$PHASE" ]; then
+    F=$(spec_foreign_state "$PROJECT_DIR")
+    [ -n "$F" ] && SPLIT=$(spec_split_message "$F" "$(spec_realpath "$PROJECT_DIR")")
+  else
+    D=$(spec_related_siblings "$PROJECT_DIR" | tr '\n' ' ')
+    [ -n "$D" ] && SPLIT="spec-driven is armed in $(spec_realpath "$PROJECT_DIR"), and this task's own spec document is in another worktree that has uncommitted work: $D. This scan only ever looks at the armed tree, so ending the turn here would pass work it has not examined. Commit or clear that tree, or move the task to it — spec-gate enforces one tree at a time and cannot vouch for the other. Worktrees that do not carry this task's spec are not affected."
+  fi
+  if [ -n "$SPLIT" ]; then
+    { echo "TREE SPLIT: the gate and the work are not in the same worktree."
+      echo
+      echo "$SPLIT"
+    } >&2
+    exit 2
+  fi
+fi
+
 # --- 1. Phase scan -----------------------------------------------------------
 # Compares the working tree against the snapshot taken when the phase was
 # entered, so pre-existing dirty files are not blamed on this phase. Runs for
