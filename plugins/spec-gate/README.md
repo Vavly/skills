@@ -261,6 +261,44 @@ from a subdirectory, two versions present, and none — for the reason
 `resolve-review-target.sh` is executed rather than transcribed: a snippet only
 ever checked by eye drifts from the one that runs.
 
+### One tree per task
+
+The gate covers the worktree holding `.claude/.spec-phase`, and only that one.
+Nothing here spans two: `PROJECT_DIR` decides where the state is read from and
+`in_project` decides which paths are the gate's business, and the moment someone
+runs `git worktree add` those two answers can come from different trees.
+
+What that produced, observed in use: armed at Phase 3 in the main checkout,
+`phase.sh status` reporting `inactive` from the worktree, and `phase-guard`
+**allowing** a production write to `<worktree>/src` because the path was not
+under `PROJECT_DIR`. The gate reported itself armed and enforced nothing. That is
+a fail-open, and it arrives from both directions — the session standing in the
+un-armed tree, and a tool call reaching from the armed tree into the other one.
+
+So a split fails closed, in all three layers. `phase-guard` denies, `phase.sh`
+refuses every command but `status`, and `status` says where the task actually is
+instead of claiming there isn't one. The Stop gate covers the case the other two
+cannot see: armed here, uncommitted work in a sibling tree, a scan that would
+otherwise pass a turn it never examined.
+
+**Reconciling is the user's, by hand.** The refusal names both trees and the two
+ways out — work from the armed tree, or `phase.sh off` there and start again
+here. There is deliberately no `phase.sh unify`: `.spec-phase` is phase state,
+denied to the model through every write vector, and a command that relocated it
+would be a command that rewrites phase state. A receipt you moved is a receipt
+nobody gave.
+
+Two consequences worth knowing. `phase.sh start` is refused while a sibling tree
+holds a task, because a `start` that quietly armed a second tree would contradict
+the instruction the same gate just gave — one at a time is the whole claim. And
+the check is gated behind a pure-stat test for whether the repo has any linked
+worktrees at all, so a repo that has never run `git worktree add` pays two
+`stat`s and no subprocess; "inactive costs nothing" stays true.
+
+The better outcome is never splitting, which is why `spec-driven` now says so
+before it arms anything: decide where the work happens, create the worktree
+first, and arm the gate inside it.
+
 ## Running under Cursor
 
 Cursor has its own hook system (1.7+) and does not read `.claude/`, so a

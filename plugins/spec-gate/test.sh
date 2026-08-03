@@ -2398,6 +2398,116 @@ while IFS= read -r line; do
   esac
 done <<< "$WIRING"
 
+group "One tree per task: the gate fails closed on a split"
+# Observed: the gate armed at Phase 3 in the main checkout, `status` reporting
+# "inactive" from a worktree, and the guard ALLOWING a production write to
+# <worktree>/src because the path was not under PROJECT_DIR. The gate reported
+# itself armed and enforced nothing — a fail-open, not friction. Nothing here can
+# span two trees: PROJECT_DIR decides where .spec-phase is read from and
+# in_project decides which paths are the gate's business, and on a split those
+# two answers come from different trees.
+setup_repo
+MAIN=$PWD
+phase start feature
+phase 3
+git worktree add -q "$WORK/wt" -b feature-wt >/dev/null 2>&1
+WT=$(cd "$WORK/wt" && pwd -P)
+
+# From the worktree: nothing is armed here, but something is armed next door.
+# "Inactive" was the old answer and it is the dangerous one.
+export CLAUDE_PROJECT_DIR="$WT"
+cd "$WT" || exit 1
+expect_w "a write from the un-armed worktree is denied" DENY "$WT/src/x.ts"
+reason=$(guard_reason "$(pl_write "$WT/src/x.ts")")
+printf '%s' "$reason" | grep -qF "$MAIN" && printf '%s' "$reason" | grep -qF "$WT" \
+  && ok "the refusal names both trees" \
+  || bad "the split refusal does not name both trees: '$reason'"
+printf '%s' "$reason" | grep -q 'phase.sh off' \
+  && ok "the refusal says how to reconcile by hand" \
+  || bad "the split refusal offers no way out: '$reason'"
+
+out=$("$MAIN"/.claude/hooks/phase.sh status 2>&1)
+printf '%s' "$out" | grep -qi 'inactive' \
+  && bad "status still reports inactive while a sibling tree is armed: '$out'" \
+  || ok "status reports the split instead of inactive"
+printf '%s' "$out" | grep -qF "$MAIN" \
+  && ok "status names the tree that holds the state" \
+  || bad "status does not say where the state actually is: '$out'"
+
+out=$("$MAIN"/.claude/hooks/phase.sh 4 2>&1)
+[ "$(sed -n 's/^phase=//p' "$MAIN/.claude/.spec-phase" | head -1)" = 3 ] \
+  && ok "phase.sh does not advance a task living in another tree" \
+  || bad "the cross-tree call moved the real state"
+# "not started" is the OLD answer and it is wrong: something IS started, next
+# door. A refusal that misdescribes why it refused is how people learn to stop
+# reading refusals.
+printf '%s' "$out" | grep -qF "$MAIN" \
+  && ok "and says which tree the task is actually in" \
+  || bad "phase.sh refuses across a split without saying where the task is: '$out'"
+
+# The Stop gate has the same blind spot, and the dangerous direction is the one
+# where PROJECT_DIR points at the CLEAN tree: it scans there, finds nothing owed,
+# and passes a turn whose work it never looked at.
+cd "$MAIN" || exit 1
+export CLAUDE_PROJECT_DIR="$MAIN"
+printf 'phase=5\ntask=feature\nslice=1/1\n' > "$MAIN/.claude/.spec-phase"
+printf 'work nobody reviewed\n' > "$WT/src/newthing.ts"
+rc=$(gate)
+[ "$rc" = 2 ] && ok "the Stop gate blocks rather than scanning the wrong tree" \
+              || bad "the Stop gate passed a turn whose work is in another tree (exit $rc)"
+rm -f "$WT/src/newthing.ts"
+printf 'phase=3\ntask=feature\nslice=1/1\n' > "$MAIN/.claude/.spec-phase"
+cd "$WT" || exit 1
+export CLAUDE_PROJECT_DIR="$WT"
+
+# The mirror case: armed in main, and a tool call reaches into the worktree.
+# in_project used to read that as "not repo work" and skip it.
+cd "$MAIN" || exit 1
+export CLAUDE_PROJECT_DIR="$MAIN"
+expect_w "a write INTO another worktree is denied" DENY "$WT/src/x.ts"
+# The same write, named the way a real tool payload names it: unresolved, with
+# whatever symlinked parent the caller happened to be standing under. git reports
+# worktrees in physical form, so a prefix comparison against the raw path is
+# false for reasons that have nothing to do with which tree the file is in. Both
+# unit tests above pass with the normalisation removed; this one does not.
+expect_w "and denied when the path is not pre-resolved" DENY "$WORK/wt/src/x.ts"
+expect_w "a not-yet-existing nested path too"          DENY "$WORK/wt/src/deep/new/thing.ts"
+# Paths genuinely outside the repo are still none of the gate's business.
+expect_b "an unrelated absolute path still passes" ALLOW 'pytest -q > /dev/null 2>&1'
+expect_w "a path outside any worktree is ignored"  ALLOW /tmp/scratch.ts
+
+# Starting a second task here while one is armed next door is refused too, and
+# has to be: the refusal tells you to turn the other one off first, so a `start`
+# that quietly armed a second tree would contradict the instruction the same
+# gate just gave. One tree at a time is the whole claim.
+cd "$WT" || exit 1
+export CLAUDE_PROJECT_DIR="$WT"
+"$MAIN"/.claude/hooks/phase.sh start wt-task >/dev/null 2>&1
+[ -f "$WT/.claude/.spec-phase" ] \
+  && bad "start armed a second tree while another was already armed" \
+  || ok "start is refused while a sibling tree holds the task"
+
+# The reconciliation the refusal actually names, end to end. This is the path a
+# user is told to take, so it is the one that must work.
+cd "$MAIN" || exit 1
+export CLAUDE_PROJECT_DIR="$MAIN"
+"$MAIN"/.claude/hooks/phase.sh off >/dev/null 2>&1
+cd "$WT" || exit 1
+export CLAUDE_PROJECT_DIR="$WT"
+"$MAIN"/.claude/hooks/phase.sh start wt-task >/dev/null 2>&1
+"$MAIN"/.claude/hooks/phase.sh 3 >/dev/null 2>&1
+[ "$(sed -n 's/^phase=//p' "$WT/.claude/.spec-phase" 2>/dev/null | head -1)" = 3 ] \
+  && ok "once the other tree is disarmed, this one arms normally" \
+  || bad "the reconciliation the refusal names does not work"
+expect_w "the newly armed tree denies production" DENY  "$WT/src/x.ts"
+expect_w "and permits its own tests"              ALLOW "$WT/src/x.test.ts"
+out=$("$MAIN"/.claude/hooks/phase.sh status 2>&1)
+printf '%s' "$out" | grep -qi 'another worktree' \
+  && bad "the surviving armed tree still reports a split: '$out'" \
+  || ok "one armed tree is not a split"
+cd "$MAIN" || exit 1
+export CLAUDE_PROJECT_DIR="$MAIN"
+
 # The manifest is what makes the plugin installable at all; a plugin directory the
 # marketplace does not list is a plugin nobody can reach.
 MANIFEST="$SRC/.claude-plugin/plugin.json"

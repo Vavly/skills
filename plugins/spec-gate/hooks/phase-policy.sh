@@ -87,6 +87,144 @@ is_phase_state() {
   return 1
 }
 
+# --- One tree per task -------------------------------------------------------
+# The gate's state lives in one worktree; the work can be in another the moment
+# someone runs `git worktree add`. Nothing here spans that. PROJECT_DIR decides
+# where .spec-phase is read from and in_project decides which paths are the
+# gate's business, and on a split those two answers come from different trees.
+#
+# What that produced, observed: the gate armed at Phase 3 in the main checkout,
+# `phase.sh status` reporting "inactive" from the worktree, and phase-guard
+# ALLOWING a production write to <worktree>/src because the path was not under
+# PROJECT_DIR. The gate reported itself armed and enforced nothing. That is a
+# fail-open, and the same one from two directions.
+#
+# Failing closed rather than picking a tree. Widening the gate to cover every
+# linked worktree would keep it enforcing, but it would make one task's state
+# authoritative over a tree the user may have created for something unrelated,
+# and it would put the review gate's fingerprint across trees that never share a
+# working state. Refusing is the only answer that cannot silently under-enforce.
+#
+# Reconciling is deliberately the user's, by hand, in a shell: `.spec-phase` is
+# denied to the model through every write vector, so a command that relocated it
+# would be a command that rewrites phase state — the exact door is_phase_state
+# exists to close.
+
+# Absolute physical path, so a comparison is not defeated by /tmp -> /private/tmp
+# or by any other symlinked parent.
+spec_realpath() { ( cd "$1" 2>/dev/null && pwd -P ) 2>/dev/null; }
+
+# The same, for a path that does not exist yet — which is every path worth
+# gating, since the interesting case is a file about to be created. Resolves the
+# deepest existing ancestor and re-attaches the rest.
+#
+# Without this the whole worktree comparison is decoration on macOS: a tool
+# payload names /var/folders/../wt/src/x.ts while git names
+# /private/var/folders/../wt, and a prefix test between those two is false for
+# reasons that have nothing to do with which tree the file is in. The unit tests
+# passed because they had already normalised both sides by hand; the end-to-end
+# reproduction is what caught it.
+spec_norm_path() {   # $1 = an absolute path
+  local p=$1 tail='' r
+  case "$p" in /*) ;; *) printf '%s\n' "$p"; return 0 ;; esac
+  while [ -n "$p" ] && [ "$p" != / ]; do
+    if [ -d "$p" ]; then
+      r=$(spec_realpath "$p")
+      [ -n "$r" ] && { printf '%s%s\n' "$r" "$tail"; return 0; }
+      break
+    fi
+    tail="/${p##*/}$tail"
+    p=${p%/*}
+    [ -z "$p" ] && p=/
+  done
+  printf '%s\n' "$1"
+}
+
+# Every worktree of the repo containing $1, one absolute path per line.
+spec_worktrees() {
+  ( cd "$1" 2>/dev/null || exit 0
+    git rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 0
+    git worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p' )
+}
+
+# The worktree holding an armed gate, when it is NOT the tree $1 is in. Empty
+# means no split: either this tree is the armed one, or nothing is armed
+# anywhere, or this is not a repo at all.
+#
+# A tree armed in its own right is never a split, so two worktrees each running
+# their own task is a supported shape — the tasks simply do not know about each
+# other, which is what separate state files already mean.
+
+# Does this repo have linked worktrees at all? Answered in stats, not processes.
+# A linked worktree has a .git FILE; the main checkout records them under
+# .git/worktrees. This exists so the split check costs nothing on the repos that
+# have never run `git worktree add`, which is most of them — otherwise every tool
+# call in every dormant repo would spawn git rev-parse, and "inactive costs
+# nothing" would stop being true.
+spec_worktrees_exist() {   # $1 = a directory; 0 = maybe, 1 = definitely not
+  local e
+  [ -f "$1/.git" ] && return 0              # we are in a linked worktree
+  if [ -d "$1/.git/worktrees" ]; then
+    for e in "$1"/.git/worktrees/*; do
+      [ -e "$e" ] && return 0
+      break
+    done
+  fi
+  [ -e "$1/.git" ] && return 1              # a repo root, and no linked worktrees
+  return 0                                  # not a repo root: ask git properly
+}
+
+spec_foreign_state() {   # $1 = the directory the work is happening in
+  local top w wr
+  spec_worktrees_exist "$1" || return 0
+  top=$( cd "$1" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null )
+  [ -n "$top" ] || return 0
+  top=$(spec_realpath "$top")
+  [ -n "$top" ] || return 0
+  [ -f "$top/.claude/.spec-phase" ] && return 0
+  while IFS= read -r w; do
+    [ -n "$w" ] || continue
+    wr=$(spec_realpath "$w")
+    [ -n "$wr" ] && [ "$wr" != "$top" ] && [ -f "$wr/.claude/.spec-phase" ] \
+      && { printf '%s\n' "$wr"; return 0; }
+  done <<< "$(spec_worktrees "$top")"
+  return 0
+}
+
+# The mirror question, and the one the Stop gate has to ask: the state is here,
+# but is there work somewhere this scan will never look? The scan compares
+# PROJECT_DIR's tree against its baseline, so a dirty sibling is work it passes
+# a turn on without having examined.
+#
+# Gated on the sibling being dirty rather than merely existing, because a
+# worktree that is clean cannot be hiding anything and blocking on its existence
+# would make every repo with a spare worktree unusable. Dirty is the ambiguous
+# state, and ambiguous fails closed.
+spec_dirty_siblings() {   # $1 = the tree the gate is armed in
+  local base w wr
+  spec_worktrees_exist "$1" || return 0
+  base=$(spec_realpath "$1")
+  [ -n "$base" ] || return 0
+  while IFS= read -r w; do
+    [ -n "$w" ] || continue
+    wr=$(spec_realpath "$w")
+    { [ -n "$wr" ] && [ "$wr" != "$base" ]; } || continue
+    ( cd "$wr" 2>/dev/null || exit 0
+      d=$( { git diff HEAD --name-only
+             git ls-files --others --exclude-standard
+           } 2>/dev/null | head -1 )
+      [ -n "$d" ] && printf '%s\n' "$wr" )
+  done <<< "$(spec_worktrees "$base")"
+  return 0
+}
+
+# One wording, because three layers refuse on this and a user who reads three
+# different accounts of the same condition learns that none of them is the whole
+# story.
+spec_split_message() {   # $1 = tree holding the state, $2 = tree holding the work
+  printf '%s' "spec-driven is armed in a different worktree. The gate state is in $1 and this work is in $2, and nothing in spec-gate spans two trees — so it would report itself armed while enforcing nothing on the files you are actually editing. Pick one tree: work from $1, or run 'phase.sh off' there and start the task again here. Moving .spec-phase by hand is not a route; it is phase state, and a receipt you relocate is a receipt nobody gave."
+}
+
 # --- Scope -------------------------------------------------------------------
 # Only paths inside the project are this gate's business. An absolute path
 # somewhere else is not repo work: /dev/null, /tmp scratch, ~/.config. This is

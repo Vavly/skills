@@ -68,17 +68,29 @@ PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$(json_get cwd)}"
 PROJECT_DIR="${PROJECT_DIR:-$PWD}"
 STATE="$PROJECT_DIR/.claude/.spec-phase"
 
-[ -f "$STATE" ] || exit 0            # workflow not active: nothing to enforce
+# The policy file is read before the "is anything armed here" check, because the
+# answer to that question now lives in it: a tree with no state of its own may
+# still be the wrong half of a split.
+if [ ! -r "$HOOK_DIR/phase-policy.sh" ]; then
+  [ -f "$STATE" ] && deny "phase-guard cannot read phase-policy.sh next to it in $HOOK_DIR. Failing closed rather than guessing at the policy."
+  exit 0
+fi
+# shellcheck source=phase-policy.sh
+. "$HOOK_DIR/phase-policy.sh"
+
+# No state HERE is not the same as no state. It also describes a session standing
+# in a worktree while the task is armed next door, and that used to exit 0 — the
+# gate silently absent in exactly the tree the work was happening in. Checked
+# before the early exit, because the early exit is the bug.
+if [ ! -f "$STATE" ]; then
+  FOREIGN=$(spec_foreign_state "$PROJECT_DIR")
+  [ -n "$FOREIGN" ] && deny "$(spec_split_message "$FOREIGN" "$(spec_realpath "$PROJECT_DIR")")"
+  exit 0                             # workflow not active anywhere: nothing to enforce
+fi
 
 if [ -z "$PARSER" ]; then
   deny "phase-guard cannot read the tool call: neither jq nor python3 is on PATH. Failing closed. Install jq, or ask the user to run phase.sh off to disable the phase gate."
 fi
-
-if [ ! -r "$HOOK_DIR/phase-policy.sh" ]; then
-  deny "phase-guard cannot read phase-policy.sh next to it in $HOOK_DIR. Failing closed rather than guessing at the policy."
-fi
-# shellcheck source=phase-policy.sh
-. "$HOOK_DIR/phase-policy.sh"
 
 # A corrupt state file used to fall through to exit 0, silently disabling the
 # gate — the same fail-open bug as a missing parser. It now fails closed, with a
@@ -588,7 +600,34 @@ while IFS= read -r P; do
       deny "Phase $PHASE of spec-driven: this command writes to a target the shell computes at runtime ($P), which phase-guard cannot evaluate. Use Write or Edit for file changes during phases 1-3." ;;
   esac
 
-  in_project "$P" || continue           # /dev/null, /tmp scratch: not repo work
+  # /dev/null, /tmp scratch, ~/.config: not repo work, and never were.
+  #
+  # But "outside PROJECT_DIR" also describes a path in another worktree of this
+  # same repo, and that is repo work — in a tree this gate cannot judge. Skipping
+  # it was the second half of the split fail-open: armed in the main checkout,
+  # writing production code into the worktree, allowed because the path did not
+  # start with PROJECT_DIR.
+  if ! in_project "$P"; then
+    case "$P" in
+      /*) ;;
+      *)  continue ;;                   # relative: already scored as in-project
+    esac
+    PN=$(spec_norm_path "$P")
+    PROOT=$(spec_realpath "${PROJECT_DIR%/}")
+    case "$PN" in
+      "$PROOT"/*) : ;;                  # the same tree once symlinks are resolved
+      *)
+        while IFS= read -r WTREE; do
+          [ -n "$WTREE" ] || continue
+          WTREE=$(spec_realpath "$WTREE")
+          { [ -n "$WTREE" ] && [ "$WTREE" != "$PROOT" ]; } || continue
+          case "$PN" in
+            "$WTREE"/*) deny "$(spec_split_message "$PROOT" "$WTREE")" ;;
+          esac
+        done <<< "$(spec_worktrees "$PROJECT_DIR")"
+        continue ;;
+    esac
+  fi
   is_phase_state "$P" && deny "The phase state is not yours to write."
   path_allowed_in_phase "$PHASE" "$P" || deny "$DENY_REASON"
 done <<< "$PATHS"

@@ -255,8 +255,33 @@ report_review_state() {
   fi
 }
 
+# "Inactive" was the old answer from a worktree while the task was armed next
+# door, and it is the wrong one in the most expensive way: the model reads it,
+# concludes there is no gate, and carries on writing production code. Something
+# IS started — just not here. Reported by `status` and refused by everything
+# else, since no command can act on state in a tree this process is not in.
+FOREIGN=""
+if [ ! -f "$STATE" ] && command -v spec_foreign_state >/dev/null 2>&1; then
+  FOREIGN=$(spec_foreign_state "$PROJECT_DIR")
+fi
+if [ -n "$FOREIGN" ] && [ "${1:-status}" != status ]; then
+  echo "spec-driven: REFUSED — $(spec_split_message "$FOREIGN" "$(spec_realpath "$PROJECT_DIR")")"
+  exit 1
+fi
+
 case "${1:-status}" in
   status)
+    if [ -n "$FOREIGN" ]; then
+      echo "spec-driven: armed in ANOTHER WORKTREE, not here"
+      echo "  -> gate state: $FOREIGN"
+      echo "  -> this tree:  $(spec_realpath "$PROJECT_DIR")"
+      echo "  -> nothing spec-gate does spans two trees, so the gate would report"
+      echo "     itself armed while enforcing nothing on the files edited here."
+      echo "  -> pick one tree: work from the first, or run 'phase.sh off' there"
+      echo "     and start the task again here. Do not move .spec-phase by hand."
+      report_review_state
+      exit 0
+    fi
     if [ ! -f "$STATE" ]; then
       echo "spec-driven: inactive"
       report_review_state

@@ -72,6 +72,32 @@ it reports inactive, run `phase.sh start <short-task-name>` to arm the gate at
 Phase 1. Arming is yours to do — Phase 1 is the most restrictive state, so there
 is no risk in it.
 
+## Arm the gate in the tree you will actually work in
+
+**The gate covers one worktree, and it is the one holding `.claude/.spec-phase`.**
+Nothing here spans two. So decide where the work happens *before* you arm it:
+
+- Going to use a worktree — `git worktree add`, `EnterWorktree`, a harness rule
+  that isolates background sessions? **Create it first, move into it, and arm the
+  gate there.**
+- Already armed, and only now moving to a worktree? The task does not come with
+  you. Close it out where it is, or stay put.
+
+Arming in the main checkout and then working in a worktree is the one arrangement
+this cannot enforce, and it fails in the direction that costs you: `status` reads
+`inactive` from the worktree while the task sits armed next door, and the guard
+has no opinion on files outside the tree it was armed in. A gate that reports
+itself armed and permits everything is worse than no gate, because you stop
+checking.
+
+The hooks now refuse rather than let that happen — `status` names both trees and
+every other command declines — but a refusal mid-task is a worse outcome than
+never splitting, and only you can prevent that, at the start. **If a refusal does
+land, do not try to route around it**: `.spec-phase` is phase state, so moving,
+copying or recreating it is denied through every vector, and a receipt you
+relocated is a receipt nobody gave. Report which tree holds the task and let the
+user pick one.
+
 **Three decisions are the user's, and each one is a question you ask them.** Not
 a sentence in your message hoping they answer it, and not a permission prompt on
 a shell command they never asked to see. The pattern is the same all three times:
