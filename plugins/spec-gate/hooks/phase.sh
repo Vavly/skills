@@ -43,6 +43,7 @@ else
   changed_test_snapshot() { :; }
   changed_test_files() { :; }
   red_receipt_status() { printf 'unverifiable\n'; }
+  red_failure_kind() { printf 'assertion\n'; }
   review_pending_paths() { :; }
   slice_status() { printf 'absent\n'; }
   slice_current() { printf '1\n'; }
@@ -140,21 +141,61 @@ verify_red() {
   echo "spec-driven: verifying the new tests fail before unlocking production code"
   echo "  tests:   $files"
   echo "  command: $cmd"
+  case "$cmd" in
+    *\|*) echo "  note:    that command contains a pipeline. pipefail is set, so a failure"
+           echo "           in any stage counts — but a final stage that returns non-zero"
+           echo "           when all is well would read as a failing suite." ;;
+  esac
   echo
-  (
+  # Captured rather than streamed, because the classification below reads it.
+  # bash rather than sh, for pipefail: `pytest | tail` returned the tail's zero,
+  # so a genuinely failing suite was reported as PASSED.
+  out=$(
     cd "$PROJECT_DIR" 2>/dev/null || exit 0
-    SPEC_GATE_TEST_FILES="$files" sh -c "$cmd"
+    SPEC_GATE_TEST_FILES="$files" bash -c "set -o pipefail; $cmd" 2>&1
   )
   rc=$?
+  printf '%s\n' "$out"
   echo
-  if [ $rc -eq 0 ]; then
-    rm -f "$RECEIPT"
-    echo "spec-driven: REFUSED — those tests PASSED."
-    echo "  A test that passes before the implementation exists is testing nothing."
-    echo "  Fix the tests so they fail for the reason you expect, then run"
-    echo "  phase.sh red again."
-    return 1
+  kind=$(red_failure_kind "$rc" "$out")
+
+  # Scaffold mode is the one place a missing module is the assertion rather than
+  # a missing prerequisite: existence is what that step delivers.
+  if [ "$kind" = import ] && scaffold_armed; then
+    kind=assertion
   fi
+
+  case "$kind" in
+    green)
+      rm -f "$RECEIPT"
+      echo "spec-driven: REFUSED — those tests PASSED."
+      echo "  A test that passes before the implementation exists is testing nothing."
+      echo "  Fix the tests so they fail for the reason you expect, then run"
+      echo "  phase.sh red again."
+      return 1 ;;
+    harness)
+      rm -f "$RECEIPT"
+      echo "spec-driven: REFUSED — the test command did not run (exit $rc)."
+      echo "  That is not a failing test, it is a missing or broken runner, and it"
+      echo "  produces the same non-zero exit a real failure would. Nothing here is"
+      echo "  evidence about the tests."
+      echo "  Fix the command in $TEST_CMD_FILE — take it from package.json,"
+      echo "  pyproject.toml, the Makefile or CI — then run phase.sh red again."
+      return 1 ;;
+    import)
+      rm -f "$RECEIPT"
+      echo "spec-driven: REFUSED — those tests failed because a module could not be"
+      echo "  resolved, not because anything they assert is wrong."
+      echo "  An import error is not a failing test. Every test against code that"
+      echo "  does not exist yet fails exactly this way whatever it asserts, so this"
+      echo "  proves nothing about the tests you just wrote."
+      echo "  The surface has to exist first: retreat to Phase 2, put the new files"
+      echo "  in a '## Scaffold' list in the spec, and ask for 'Approve, and create"
+      echo "  the files first'. Then Phase 3 tests fail on an assertion instead."
+      echo "  If the module SHOULD already exist, this is a broken import path or a"
+      echo "  missing dependency — fix that and run phase.sh red again."
+      return 1 ;;
+  esac
 
   T=$(sed -n 's/^task=//p' "$STATE" | head -1)
   # `cmd` rides above the `tests:` block, which is the only part read back —
@@ -163,13 +204,15 @@ verify_red() {
   # by content hash: swapping the command after the user accepted it voids their
   # approval instead of silently inheriting it.
   { printf '# spec-gate RED receipt — written by phase.sh red, never by hand\n'
-    printf 'task=%s\nrc=%s\ncmd=%s\n' "$T" "$rc" "$cmd"
+    printf 'task=%s\nrc=%s\nkind=%s\ncmd=%s\n' "$T" "$rc" "$kind" "$cmd"
     printf 'tests:\n'
     (cd "$PROJECT_DIR" 2>/dev/null && changed_test_snapshot)
   } > "$RECEIPT"
 
-  echo "spec-driven: tests failed as required — RED verified (exit $rc)."
-  echo "  Note: this proves not-green, not that they failed for the right reason."
+  echo "spec-driven: tests failed as required — RED verified (exit $rc, $kind)."
+  echo "  Note: this proves not-green, and that the failure was neither a broken"
+  echo "  runner nor an unresolved import. It does NOT prove they failed for the"
+  echo "  reason the spec expects."
   echo "  That part is yours to establish from the output above, and the user's to"
   echo "  accept — say what each test asserts and why its failure is the expected"
   echo "  one before you ask them to advance."

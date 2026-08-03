@@ -902,6 +902,43 @@ into *"verified not-green"* — narrower than "failing for the right reason", wh
 stays human, but it catches the vacuous-test failure mode outright, which is the
 one that actually happens.
 
+#### Not every non-zero exit is a failing test
+
+Treating one as the other certified two things that are not evidence:
+
+```
+no-such-runner -q                 ->  RED verified (exit 127)   ← nothing ran
+ModuleNotFoundError: src.parser   ->  RED verified (exit 1)     ← nothing asserted
+```
+
+The first is a typo'd or uninstalled test command, and it needs no pipeline to
+happen — it was hit twice while writing the tests for this very section. The
+second is the hole scaffold exists to close: every test against code that does
+not exist yet fails identically whatever it asserts, so refusing it here is what
+makes the scaffold step *required* rather than merely available.
+
+So the failure is classified: `green` and `harness` and `import` all refuse, and
+only `assertion` is RED. **Anything unrecognised is `assertion`** — a runner whose
+wording is not in the pattern list behaves exactly as it always did rather than
+being newly blocked, which is the only safe direction for a list that cannot be
+complete. The receipt records which kind it saw.
+
+The check also runs under `set -o pipefail` now. `pytest | tail` returned the
+tail's zero, so a genuinely failing suite was reported as *PASSED* — and with the
+127 case above, `pytest-typo | tail` was a **safe** refusal that pipefail alone
+would have turned into `RED verified`. That is why the classifier and pipefail
+had to land together; either one alone makes a case worse.
+
+One residual, stated rather than papered over: a **green** suite behind a final
+stage that returns non-zero when all is well — `pytest -q | grep -q FAILED` —
+still reads as a failing suite. No exit status can distinguish that, so the
+command is echoed above the output and a pipeline in it now draws an explicit
+note.
+
+The one place an unresolved import *is* the assertion is scaffold mode, where the
+module's existence is what the step delivers. There, `import` is accepted and
+`harness` still is not.
+
 What you approve at the prompt is the part the machine cannot check: that each
 test failed for the reason the spec expects, rather than on an import error or a
 typo in a fixture. You are reading real output to decide that, which is what

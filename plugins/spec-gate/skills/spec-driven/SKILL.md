@@ -430,6 +430,20 @@ It runs exactly the test files this phase changed, refuses if any of them pass,
 and records that RED was verified. Running it through your own test command
 instead proves the same thing to you and nothing to the gate.
 
+**It also refuses two failures that are not failing tests**, and both refusals
+tell you what to do:
+
+- *the test command did not run* — a missing or broken runner exits non-zero
+  exactly like a real failure does. Fix the command in
+  `.claude/spec-gate-test-cmd`, taken from `package.json`, `pyproject.toml`, the
+  Makefile or CI rather than guessed.
+- *a module could not be resolved* — the code under test does not exist yet, so
+  every test fails this way whatever it asserts. That is the [scaffold
+  step](#if-this-feature-needs-files-that-do-not-exist-yet): retreat to Phase 2,
+  put the files in a `## Scaffold` list, and ask for *Approve, and create the
+  files first*. If the module *should* already exist, this is a broken import
+  path or a missing dependency — fix that instead.
+
 If a test passes before the implementation exists, it is testing nothing. Fix
 the test before continuing. Do not proceed until every new test fails for the
 reason you expect.

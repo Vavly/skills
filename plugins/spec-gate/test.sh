@@ -2398,6 +2398,82 @@ while IFS= read -r line; do
   esac
 done <<< "$WIRING"
 
+group "RED classifies the failure, not just the exit code"
+# `phase.sh red` treated any non-zero exit as "the tests failed", which certifies
+# two things that are not a failing test:
+#
+#   a runner that never ran   — a typo'd or uninstalled test command exits 127,
+#                               and the receipt recorded RED for a suite that
+#                               produced no evidence at all. No pipeline needed.
+#   a missing module          — every new-module test fails identically whatever
+#                               it asserts, which is the hole scaffold exists to
+#                               close. Reaching assertion-red is not the same as
+#                               being required to.
+setup_repo; phase start t; phase 3
+kind() { # <label> <test-cmd> <expect: RED|REFUSED> [expect-substring]
+  printf '%s\n' "$2" > .claude/spec-gate-test-cmd
+  printf 'changed %s\n' "$RANDOM" > tests/probe.test.ts
+  local out; out=$(.claude/hooks/phase.sh red 2>&1)
+  local got; case "$out" in *"RED verified"*) got=RED ;; *REFUSED*) got=REFUSED ;; *) got=OTHER ;; esac
+  if [ "$got" = "$3" ] && { [ -z "${4:-}" ] || printf '%s' "$out" | grep -qi "$4"; }; then
+    ok "$1"
+  else
+    bad "$1 — got $got (want $3): $(printf '%s' "$out" | grep -iE 'REFUSED|RED verified|did not run' | head -1)"
+  fi
+}
+
+kind "a green suite is still refused"        'true'                              REFUSED 'PASSED'
+kind "a runner that does not exist"          'no-such-test-runner -q'            REFUSED 'did not run'
+kind "a runner that is not executable"       'exit 126'                          REFUSED 'did not run'
+kind "shell 'command not found' in output"   'printf "sh: nope: command not found\n" >&2; exit 1' REFUSED 'did not run'
+kind "a missing module is not a failing test" 'printf "ModuleNotFoundError: No module named src.parser\n"; exit 1' REFUSED 'scaffold'
+kind "a real assertion failure is RED"       'printf "AssertionError: 1 != 2\n"; exit 1' RED 'RED verified'
+# pipefail: the suite failed but the last pipeline stage swallowed it. Without
+# it the gate read the tail's 0 and reported the failing suite as PASSED.
+kind "a failure behind a pipe still counts"  'printf "AssertionError\n"; exit 1 | tail -1' RED 'RED verified'
+
+# The receipt says which kind of red it saw, so the claim it carries is the one
+# that was actually established.
+grep -q '^kind=assertion$' .claude/.spec-red \
+  && ok "the receipt records that the failure was an assertion" \
+  || bad "the receipt does not record the failure kind: $(grep -c . .claude/.spec-red) lines"
+
+# Cross-language module-resolution patterns, checked directly so the list is
+# pinned rather than inferred from whichever runner the fixture happens to use.
+# Captured before the loop: a `| while` runs in a subshell, so every ok/bad it
+# counted would be discarded along with it.
+KINDS=$( . .claude/hooks/phase-policy.sh 2>/dev/null
+  while IFS='|' read -r want text; do
+    [ -z "$want" ] && continue
+    got=$(red_failure_kind 1 "$text")
+    if [ "$got" = "$want" ]; then echo "OK  $want: ${text:0:44}"; else echo "BAD $want expected for '${text:0:44}' — got $got"; fi
+  done <<'CASES'
+import|ModuleNotFoundError: No module named 'src.parser'
+import|ImportError: cannot import name parse from src.parser
+import|Error: Cannot find module './parser'
+import|error TS2307: Cannot find module './parser'.
+import|ERR_MODULE_NOT_FOUND
+import|cannot find package "example.com/x"
+import|error[E0432]: unresolved import crate::parser
+import|error: package com.x does not exist
+import|cannot load such file -- ./parser
+assertion|AssertionError: expected 1 to equal 2
+assertion|FAIL src/x.test.ts (1 failed)
+assertion|Expected: {error: empty}  Received: undefined
+CASES
+)
+while IFS= read -r line; do
+  case "$line" in "OK  "*) ok "${line#OK  }" ;; BAD*) bad "${line#BAD }" ;; esac
+done <<< "$KINDS"
+
+# Scaffold mode is the one place a missing module IS the assertion.
+setup_repo; phase start t; phase 2
+printf 'the spec\n' > docs/specs/t.md
+answer spec 'Approve, and create the files first'
+.claude/hooks/phase.sh scaffold >/dev/null 2>&1
+kind "in scaffold, a missing module is RED"  'printf "ModuleNotFoundError: No module named src.parser\n"; exit 1' RED 'RED verified'
+kind "but a broken runner still is not"      'no-such-test-runner -q'            REFUSED 'did not run'
+
 group "Scaffold: reaching assertion-red on code that does not exist yet"
 # The hole this closes: `phase.sh red` has exactly one detector for a vacuous
 # test — the test passes. Against a module that does not exist, a careful test

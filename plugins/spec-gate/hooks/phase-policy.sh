@@ -497,6 +497,43 @@ red_receipt_status() {
   )
 }
 
+# --- What kind of red is this? -----------------------------------------------
+# `phase.sh red` used to treat any non-zero exit as "the tests failed", which
+# certifies two things that are not a failing test.
+#
+# A runner that never ran. A typo'd or uninstalled test command exits 127 and the
+# receipt recorded RED for a suite that produced no evidence at all — observed
+# twice while writing these very tests, with no pipeline involved.
+#
+# A missing module. Every test against code that does not exist yet fails
+# identically whatever it asserts, so the one detector this check has for a
+# vacuous test — the test passes — is disarmed for all new feature work. Scaffold
+# makes assertion-red reachable; refusing import-red here is what makes it
+# required. The exception is scaffold mode itself, where the module's existence
+# IS what the step delivers, so the import error is the assertion.
+#
+# Anything unrecognised is `assertion`, i.e. exactly the old behaviour. A runner
+# whose wording is not in these lists behaves as it always did rather than being
+# newly blocked, which is the only safe direction for a pattern list that cannot
+# be complete.
+red_failure_kind() {   # $1 = exit status, $2 = combined output -> green|harness|import|assertion
+  [ "$1" = 0 ] && { printf 'green\n'; return 0; }
+  # 126 and 127 are the shell's own codes for "cannot execute" and "not found",
+  # so they are about the command rather than about any test.
+  case "$1" in 126|127) printf 'harness\n'; return 0 ;; esac
+  case "$2" in
+    *"command not found"*) printf 'harness\n'; return 0 ;;
+  esac
+  case "$2" in
+    *ModuleNotFoundError*|*"No module named"*|*ImportError*|\
+    *"Cannot find module"*|*"cannot find module"*|*ERR_MODULE_NOT_FOUND*|*TS2307*|\
+    *"Could not resolve"*|*"cannot find package"*|*"unresolved import"*|*E0432*|\
+    *package*"does not exist"*|*"cannot load such file"*)
+      printf 'import\n'; return 0 ;;
+  esac
+  printf 'assertion\n'
+}
+
 # --- The review fingerprint and its marker ------------------------------------
 # What the review gate considers "this diff", and where it records the round it
 # last saw. Both live here rather than in review-gate.sh because there are now two
