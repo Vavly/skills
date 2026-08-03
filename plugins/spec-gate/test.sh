@@ -2551,7 +2551,10 @@ phase start newfeature
 phase 2
 printf 'the spec\n' > docs/specs/newfeature.md
 
-expect_b "scaffold is refused before the spec is approved" DENY '.claude/hooks/phase.sh scaffold'
+# Unasked, this is the confirmation prompt every other gate falls back to — not
+# an allow, and not a refusal either. It is the only route that exists under
+# Cursor, where no receipt can ever be written.
+expect_b "unasked, scaffold prompts rather than proceeds" ASK '.claude/hooks/phase.sh scaffold'
 # Only one .spec-approval exists at a time, so a scaffold gate of its own would
 # overwrite the answer that 2 -> 3 still needs. The decision rides on the spec
 # approval instead — which is where the surface being created is described.
@@ -2563,6 +2566,26 @@ expect_b "the plain approval does not authorise it"  DENY '.claude/hooks/phase.s
 answer spec 'Approve, and create the files first'
 expect_b "the scaffold answer authorises it"  ALLOW '.claude/hooks/phase.sh scaffold'
 expect_b "and 2 -> 3 still honours the same answer" ALLOW '.claude/hooks/phase.sh 3'
+
+# Cursor has no AskUserQuestion, so approval_status is permanently `none` there
+# and a receipt can never exist. With scaffold reachable only through a receipt,
+# a Cursor user writing a new module hit import-red in Phase 3, was told to
+# scaffold, and had no way to do it — a hard block introduced by making
+# import-red refuse. beforeShellExecution does carry `ask`, so the fallback every
+# other gate already has works there too.
+rm -f .claude/.spec-approval .claude/.spec-scaffold
+expect_b "unasked, scaffold falls back to a prompt" ASK '.claude/hooks/phase.sh scaffold'
+reason=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh scaffold')")
+printf '%s' "$reason" | grep -qi 'not been approved' \
+  && ok "the prompt says the spec was never approved through the question" \
+  || bad "the scaffold prompt hides that the spec is unapproved: '$reason'"
+printf '%s' "$reason" | grep -qi 'do not exist' \
+  && ok "and says what it is granting" \
+  || bad "the scaffold prompt does not say what it grants: '$reason'"
+# Choosing the plain approval is a decision AGAINST scaffolding, not an absence
+# of one, so it must not degrade into a prompt that asks again.
+answer spec 'Approve the spec'
+expect_b "a plain approval is still a refusal" DENY '.claude/hooks/phase.sh scaffold'
 .claude/hooks/phase.sh scaffold >/dev/null 2>&1
 [ -f .claude/.spec-scaffold ] && ok "scaffold mode is recorded on disk" \
                              || bad "phase.sh scaffold left no marker"

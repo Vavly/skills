@@ -471,7 +471,14 @@ if [ -n "$CMD" ] && printf '%s' "$CMD" | grep -qE '(^|[^[:alnum:]_.+-])phase\.sh
         decline)
           deny "The user sent the spec back, so there is no approved surface to scaffold. Revise the spec and ask again: phase.sh ask spec" ;;
         *)
-          deny "Scaffolding is authorised by the spec approval, and the spec has not been approved yet. Put the question to them — run 'phase.sh ask spec' and pass the JSON it prints to AskUserQuestion unchanged. 'Approve, and create the files first' is the answer that permits this." ;;
+          # No receipt to read. Under Claude Code that means the question was
+          # never put; under Cursor it means it never can be — there is no
+          # AskUserQuestion there, so approval_status is permanently `none` and a
+          # receipt-only scaffold was unreachable. Since import-red now refuses
+          # in Phase 3 and points here, that combination was a hard block on all
+          # new-module work under Cursor. beforeShellExecution carries `ask`, so
+          # this falls back the way every other gate already does.
+          ask "Arm scaffold mode? Phase 2 is widened to CREATE files that do not exist yet, and only those — nothing already tracked can be edited, so no existing behaviour changes. This is what lets the tests written next fail on an assertion rather than on a missing import, which is the only failure that proves a test asserts anything. Note that the spec has not been approved through the gate's own question, so this is granting the widening on its own. Decline if you have not read docs/specs/ and accepted the surface it describes." ;;
       esac ;;
     slices)
       # Before the spec is approved the count is not approved either: the seams
