@@ -8,8 +8,8 @@
 # model's own say-so, which is what the receipt is for.
 #
 # Install: .claude/hooks/phase.sh  (chmod +x), or via the spec-gate-install skill
-# Add .claude/.spec-phase, .claude/.spec-baseline and .claude/.spec-red to
-# .gitignore
+# Add .claude/.spec-phase, .claude/.spec-baseline, .claude/.spec-red,
+# .claude/.spec-approval* and .claude/.spec-scaffold to .gitignore
 
 set -uo pipefail
 
@@ -25,6 +25,7 @@ STATE="$STATE_DIR/.spec-phase"
 BASELINE="$STATE_DIR/.spec-baseline"
 RECEIPT="$STATE_DIR/.spec-red"
 APPROVAL="$STATE_DIR/.spec-approval"
+SCAFFOLD="$STATE_DIR/.spec-scaffold"
 TEST_CMD_FILE="$STATE_DIR/spec-gate-test-cmd"
 
 # tree_snapshot comes from phase-policy.sh, shared with review-gate.sh so the
@@ -54,6 +55,8 @@ else
   gate_question() { :; }
   gate_options() { :; }
   approval_status() { printf 'unverifiable\n'; }
+  scaffold_armed() { false; }
+  is_tracked_path() { return 0; }
 fi
 
 # The state file is written from exactly one place, so a field cannot be dropped
@@ -309,12 +312,19 @@ case "${1:-status}" in
     case "$P" in
       1) echo "  -> no files may be written"
          echo "  -> next: 2 Spec — Claude may advance" ;;
-      2) echo "  -> docs/specs/ only"
+      2) if scaffold_armed; then
+           echo "  -> SCAFFOLD MODE: docs/specs/, tests, and files that do not exist yet"
+           echo "  -> nothing already tracked may be edited — that is Phase 4"
+           echo "  -> show the surface test red first, then create the files"
+           echo "  -> next: 3 Plan + tests — run 'phase.sh 3' when the surface exists"
+         else
+         echo "  -> docs/specs/ only"
          # Said here because status is what the model re-reads after compaction,
          # and the spec review is instructed rather than enforced — the one step
          # a forgetful model can drop without anything noticing.
          echo "  -> the spec goes to the spec-adversary subagent before you are asked"
-         echo "  -> next: 3 Plan + tests — ask with 'phase.sh ask spec', then advance" ;;
+         echo "  -> next: 3 Plan + tests — ask with 'phase.sh ask spec', then advance"
+         fi ;;
       3) echo "  -> tests only; production code blocked"
          echo "  -> the plan goes to spec-adversary before the tests are written"
          # Same reason as the line above it: status is the post-compaction re-read,
@@ -341,7 +351,7 @@ case "${1:-status}" in
     # A newline in the task name would inject extra lines into the state file.
     T=$(printf '%s' "${2:-unnamed}" | tr -d '\n\r')
     write_state 1 "$T" "1/1"
-    rm -f "$RECEIPT" "$APPROVAL"
+    rm -f "$RECEIPT" "$APPROVAL" "$SCAFFOLD"
     snapshot_baseline
     echo "spec-driven: started '${T}' at phase 1 (Clarify)"
     ;;
@@ -406,10 +416,33 @@ case "${1:-status}" in
     } >&2
     ;;
 
+  # Widen Phase 2 to create files that do not exist yet, so Phase 3's tests can
+  # fail on an assertion instead of on a missing import. Its own command rather
+  # than a phase number: a phase below 3 that wrote production code would be
+  # reachable through the guard's retreat rule, which lets any move to a LOWER
+  # number through unchecked on the grounds that lower has always meant stricter.
+  scaffold)
+    [ -f "$STATE" ] || { echo "spec-driven: not started. Run: phase.sh start <task>"; exit 1; }
+    P=$(sed -n 's/^phase=//p' "$STATE" | head -1)
+    if [ "$P" != 2 ]; then
+      echo "spec-driven: scaffolding belongs to Phase 2, and you are at $(phase_name "$P")."
+      echo "  It runs after the spec is approved and before Phase 3 writes tests,"
+      echo "  so that the surface created is one the user has already read."
+      exit 1
+    fi
+    T=$(sed -n 's/^task=//p' "$STATE" | head -1)
+    printf '# spec-gate scaffold mode - written by phase.sh scaffold, never by hand\ntask=%s\n' "$T" > "$SCAFFOLD"
+    echo "spec-driven: scaffold mode ON (still Phase 2)"
+    echo "  -> you may CREATE files that do not exist yet, and tests"
+    echo "  -> you may NOT edit anything already tracked; that is Phase 4"
+    echo "  -> show the surface test failing first: phase.sh red"
+    echo "  -> then create the files, and advance with: phase.sh 3"
+    ;;
+
   red)
     [ -f "$STATE" ] || { echo "spec-driven: not started. Run: phase.sh start <task>"; exit 1; }
     P=$(sed -n 's/^phase=//p' "$STATE" | head -1)
-    if [ "$P" != 3 ]; then
+    if [ "$P" != 3 ] && ! { [ "$P" = 2 ] && scaffold_armed; }; then
       echo "spec-driven: RED verification belongs to Phase 3, and you are at $(phase_name "$P")."
       echo "  Phase 3 is where the failing tests are written. Nothing to verify here."
       exit 1
@@ -452,7 +485,7 @@ case "${1:-status}" in
     # one phase and spent in it. It is also pinned to the phase it was answered
     # in, so this delete is the second of two locks — cheap, and the kind of
     # redundancy worth having on the file that says the user said yes.
-    rm -f "$RECEIPT" "$APPROVAL"
+    rm -f "$RECEIPT" "$APPROVAL" "$SCAFFOLD"
     snapshot_baseline
     echo "spec-driven: -> $(phase_name "$1")"
     if [ "$ADVANCED" = 1 ]; then
@@ -461,7 +494,7 @@ case "${1:-status}" in
     ;;
 
   off)
-    rm -f "$STATE" "$BASELINE" "$RECEIPT" "$APPROVAL"
+    rm -f "$STATE" "$BASELINE" "$RECEIPT" "$APPROVAL" "$SCAFFOLD"
     echo "spec-driven: phase gate off"
     echo "  This ends the phase workflow. It does not stop review — with no phase"
     echo "  file the Stop gate returns to its default and runs EVERY turn."
@@ -469,7 +502,7 @@ case "${1:-status}" in
     ;;
 
   *)
-    echo "usage: phase.sh [status | start <task> | ask <gate> | red | slices <n> | 1..5 | off]"
+    echo "usage: phase.sh [status | start <task> | ask <gate> | red | scaffold | slices <n> | 1..5 | off]"
     echo "       phase.sh ask <gate>  print the question for a gate as an"
     echo "                            AskUserQuestion payload: spec | red | close-out"
     echo "       phase.sh red         run the Phase 3 tests and record RED if they fail"

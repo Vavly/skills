@@ -87,13 +87,14 @@ to verify anything, and 3 → 4 then rests on an assertion instead of on output.
 
 ## 5. `.gitignore`
 
-Five entries, and each one is state the gate writes about itself:
+Six entries, and each one is state the gate writes about itself:
 
 ```
 .claude/.spec-phase
 .claude/.spec-baseline
 .claude/.spec-red
 .claude/.spec-approval*
+.claude/.spec-scaffold
 .claude/review-log.jsonl
 ```
 

@@ -197,7 +197,7 @@ cp -R "$SPEC_GATE"/hooks "$SPEC_GATE"/agents "$SPEC_GATE"/skills .claude/
 # cannot be verified in-band and falls back to being terminal-only.
 printf 'yarn jest $SPEC_GATE_TEST_FILES\n' > .claude/spec-gate-test-cmd
 
-printf '.claude/.spec-phase\n.claude/.spec-baseline\n.claude/.spec-red\n.claude/.spec-approval*\n.claude/review-log.jsonl\n' >> .gitignore
+printf '.claude/.spec-phase\n.claude/.spec-baseline\n.claude/.spec-red\n.claude/.spec-approval*\n.claude/.spec-scaffold\n.claude/review-log.jsonl\n' >> .gitignore
 git add .claude .gitignore && git commit -m "add review gate + spec-driven workflow"
 ```
 
@@ -260,6 +260,51 @@ ability to catch it. `test.sh` runs the shim against four fixtures — plugin-on
 from a subdirectory, two versions present, and none — for the reason
 `resolve-review-target.sh` is executed rather than transcribed: a snippet only
 ever checked by eye drifts from the one that runs.
+
+### Scaffold: reaching assertion-red on code that does not exist
+
+`phase.sh red` has exactly one detector for a test that asserts nothing: **the
+test passes.** That works where the code already exists. Against a module that
+does not, a careful test and an empty one fail identically —
+
+```
+careful test,  module missing  ->  ModuleNotFoundError  ->  RED verified
+worthless test, module missing ->  ModuleNotFoundError  ->  RED verified
+worthless test, module present ->  REFUSED — those tests PASSED
+```
+
+— so the check was blind for exactly the new feature work the five phases exist
+for, and sharp only for bug fixes, where the ceremony is least needed. Phase 3
+forbids creating the module, so no amount of discipline got the agent out of it:
+every new-module test failed on an import, and an import error is not evidence
+about what a test asserts.
+
+Scaffold closes it. The spec declares a `## Scaffold` list, the user picks
+*Approve, and create the files first*, and Phase 2 widens to **create** files
+that do not exist — nothing already tracked can be edited. The surface test is
+shown red first, which is the one case where an import error *is* the assertion,
+because existence is what the step delivers. Phase 3 then writes behavioural
+tests against a module that exists, and gets assertion-red.
+
+Three design points worth not re-litigating:
+
+**It is a mode on Phase 2, not a phase of its own.** Any phase numbered below 3
+that may write production code is reachable through the guard's retreat rule —
+`[ "$ARG" -lt "$PHASE" ]` passes unchecked, on the grounds that lower has always
+meant stricter — so Phase 3 could drop into it and write production code with
+nothing asked. A mode has no number to retreat into.
+
+**"New" means untracked, not "does not exist."** Both layers have to agree about
+the same file at any point in the turn, and by the time the Stop scan runs, the
+file the guard just permitted does exist. An existence test would have prevention
+and detection contradicting each other about the same write; `git ls-files`
+answers the same before and after.
+
+**It rides the spec approval rather than a gate of its own.** Only one
+`.spec-approval` exists at a time, so a second question in Phase 2 would
+overwrite the answer `2 → 3` still needs. The spec is also where the surface is
+described, which makes it the honest place to ask — and one prompt instead of
+two.
 
 ### One tree per task
 

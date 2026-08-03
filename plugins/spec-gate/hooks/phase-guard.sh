@@ -118,7 +118,7 @@ esac
 # phase state through `phase.sh status`, never through the file.
 if [ -n "$CMD" ]; then
   case "$CMD" in
-    *.spec-phase*|*.spec-baseline*|*.spec-red*|*.spec-approval*)
+    *.spec-phase*|*.spec-baseline*|*.spec-red*|*.spec-approval*|*.spec-scaffold*)
       deny "The phase state is not yours to edit, move or remove — .spec-red and .spec-approval included, because a receipt you could write by hand would assert RED without running anything, or record an approval the user never gave. Change phases with phase.sh <n>, verify RED with phase.sh red, ask the user with phase.sh ask <gate>, and read the current phase with phase.sh status." ;;
   esac
 fi
@@ -208,6 +208,27 @@ if [ -n "$CMD" ] && printf '%s' "$CMD" | grep -qE '(^|[^[:alnum:]_.+-])phase\.sh
     # gate. Allowing this freely is what makes the question the normal way to
     # reach a checkpoint rather than a step worth skipping.
     ask) ;;
+    # Scaffold widens Phase 2 to create files that do not exist yet, so it is a
+    # write-access expansion and takes the user's answer like the others. It also
+    # requires the spec approval that precedes it: the surface being created is
+    # the one they read in the spec, and creating it before they have accepted
+    # the design is scaffolding a frontier nobody agreed to.
+    scaffold)
+      # Authorised by the spec approval rather than a gate of its own. Only one
+      # .spec-approval exists at a time, so a second question asked in Phase 2
+      # would overwrite the answer that 2 -> 3 still needs — and the spec is
+      # where the surface being created is described anyway, which makes it the
+      # honest place to ask.
+      case "$(approval_status spec)" in
+        approve-scaffold)
+          decide allow "The user approved the spec and chose to have the new files created before the tests are written. Create only files that do not exist yet; nothing already tracked may be edited." ;;
+        approve)
+          deny "The user approved the spec, but chose the plain approval rather than 'Approve, and create the files first'. Scaffolding is not part of what they accepted. Go to Phase 3, or show them why the surface has to exist first and ask again: phase.sh ask spec" ;;
+        decline)
+          deny "The user sent the spec back, so there is no approved surface to scaffold. Revise the spec and ask again: phase.sh ask spec" ;;
+        *)
+          deny "Scaffolding is authorised by the spec approval, and the spec has not been approved yet. Put the question to them — run 'phase.sh ask spec' and pass the JSON it prints to AskUserQuestion unchanged. 'Approve, and create the files first' is the answer that permits this." ;;
+      esac ;;
     slices)
       # Before the spec is approved the count is not approved either: the seams
       # are declared in the spec and the 2 -> 3 prompt covers them, so asking
@@ -324,7 +345,7 @@ if [ -n "$CMD" ] && printf '%s' "$CMD" | grep -qE '(^|[^[:alnum:]_.+-])phase\.sh
         # whole safety argument for building on an undocumented payload shape:
         # the worst case is the prompt this gate has always raised.
         case "$(approval_status spec)" in
-          approve)
+          approve|approve-scaffold)
             decide allow "The user approved this spec through the gate's own question, and no spec document has changed since they answered." ;;
           decline)
             deny "The user was asked and sent the spec back, and nothing in docs/specs/ has changed since. Revise the spec against what they said, then ask again: phase.sh ask spec" ;;

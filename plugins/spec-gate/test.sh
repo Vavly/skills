@@ -40,7 +40,7 @@ setup_repo() {
   # Must stay identical to the install block in README.md. An untracked state
   # file is work the review gate considers owed, so a name missing here is a gate
   # that arms itself every time it writes its own bookkeeping.
-  printf '.claude/.spec-phase\n.claude/.spec-baseline\n.claude/.spec-red\n.claude/.spec-approval*\n.claude/review-log.jsonl\n' > .gitignore
+  printf '.claude/.spec-phase\n.claude/.spec-baseline\n.claude/.spec-red\n.claude/.spec-approval*\n.claude/.spec-scaffold\n.claude/review-log.jsonl\n' > .gitignore
   git add -A >/dev/null 2>&1; git commit -qm init
   export CLAUDE_PROJECT_DIR="$PWD"
   rm -f .git/claude-review-gate
@@ -2397,6 +2397,92 @@ while IFS= read -r line; do
                 || bad "no hooks found — the extractor broke, not the wiring" ;;
   esac
 done <<< "$WIRING"
+
+group "Scaffold: reaching assertion-red on code that does not exist yet"
+# The hole this closes: `phase.sh red` has exactly one detector for a vacuous
+# test — the test passes. Against a module that does not exist, a careful test
+# and `assert True` both fail with ModuleNotFoundError, so the detector is blind
+# for precisely the new feature work the workflow exists for. Phase 3 forbids
+# creating the module, so the agent has no move that produces assertion-red.
+#
+# Scaffold is a MODE on Phase 2, not a phase number. A phase numbered below 3
+# that may write production code would be reachable through the guard's retreat
+# rule ([ "$ARG" -lt "$PHASE" ] is allowed unchecked, because lower has always
+# meant stricter), which is a bypass straight through the gate.
+setup_repo
+phase start newfeature
+phase 2
+printf 'the spec\n' > docs/specs/newfeature.md
+
+expect_b "scaffold is refused before the spec is approved" DENY '.claude/hooks/phase.sh scaffold'
+# Only one .spec-approval exists at a time, so a scaffold gate of its own would
+# overwrite the answer that 2 -> 3 still needs. The decision rides on the spec
+# approval instead — which is where the surface being created is described.
+answer spec 'Approve the spec'
+expect_b "the plain approval does not authorise it"  DENY '.claude/hooks/phase.sh scaffold'
+[ -f .claude/.spec-scaffold ] && bad "scaffold armed itself without an answer" \
+                             || ok "a plain spec approval arms nothing"
+
+answer spec 'Approve, and create the files first'
+expect_b "the scaffold answer authorises it"  ALLOW '.claude/hooks/phase.sh scaffold'
+expect_b "and 2 -> 3 still honours the same answer" ALLOW '.claude/hooks/phase.sh 3'
+.claude/hooks/phase.sh scaffold >/dev/null 2>&1
+[ -f .claude/.spec-scaffold ] && ok "scaffold mode is recorded on disk" \
+                             || bad "phase.sh scaffold left no marker"
+printf '%s' "$(.claude/hooks/phase.sh status 2>&1)" | grep -qi 'scaffold' \
+  && ok "status says the gate is in scaffold mode" \
+  || bad "status does not mention scaffold: $(.claude/hooks/phase.sh status 2>&1 | head -2)"
+
+# The write bound. "New" means UNTRACKED, not "does not exist" — at Stop-scan
+# time the file it just created does exist, so an existence test would have the
+# two layers disagreeing about the same file in the same turn.
+expect_w "a brand-new module may be created"   ALLOW src/parser.ts
+expect_w "a tracked file may NOT be edited"    DENY  src/x.ts
+expect_w "not even to append to it"            DENY  src/x.ts Edit
+expect_b "nor through a redirect"              DENY  'echo x >> src/x.ts'
+expect_w "tests are still writable"            ALLOW src/parser.test.ts
+expect_w "specs are still writable"            ALLOW docs/specs/newfeature.md
+expect_w "phase state is still not writable"   DENY  .claude/.spec-phase
+expect_w "and neither is the scaffold marker"  DENY  .claude/.spec-scaffold
+expect_b "naming the marker at all is denied"  DENY  'rm .claude/.spec-scaffold'
+
+# Both layers have to agree, or prevention and detection contradict each other
+# on the same file. The Stop scan asks git the same question the guard did.
+printf 'export const parse = () => { throw new Error("not implemented") }\n' > src/parser.ts
+expect_gate "a scaffolded new file does not violate the phase" 0
+echo 'edited' >> src/x.ts
+expect_gate "editing a tracked file during scaffold does"      2
+git checkout -- src/x.ts 2>/dev/null
+
+# The import test can be shown red before the file exists — the one case where
+# import-red is the assertion, because existence is what the step delivers.
+rm -f src/parser.ts
+printf 'exit 1\n' > .claude/spec-gate-test-cmd
+printf 'import { parse } from "./parser"\n' > src/parser.test.ts
+out=$(.claude/hooks/phase.sh red 2>&1); rc=$?
+[ "$rc" = 0 ] && ok "phase.sh red runs in scaffold mode" \
+              || bad "red refused during scaffold: $(printf '%s' "$out" | head -2 | tr '\n' ' ')"
+
+# Leaving scaffold closes it. Advancing is the ordinary 2 -> 3, and the spec
+# approval the user already gave still covers it.
+printf 'export const parse = () => null\n' > src/parser.ts
+.claude/hooks/phase.sh 3 >/dev/null 2>&1
+[ -f .claude/.spec-scaffold ] && bad "the scaffold marker survived a phase change" \
+                             || ok "advancing to Phase 3 clears scaffold mode"
+expect_w "and production is blocked again at Phase 3" DENY src/another.ts
+
+# Scaffold belongs to Phase 2 and nowhere else. This is what makes it unable to
+# serve as the free retreat a numbered phase would have been.
+for p in 1 3 4 5; do
+  printf 'phase=%s\ntask=newfeature\nslice=1/1\n' "$p" > .claude/.spec-phase
+  .claude/hooks/phase.sh scaffold >/dev/null 2>&1
+  [ -f .claude/.spec-scaffold ] && bad "scaffold armed from phase $p" \
+                               || ok "scaffold is refused at phase $p"
+done
+printf 'phase=2\ntask=newfeature\nslice=1/1\n' > .claude/.spec-phase
+.claude/hooks/phase.sh off >/dev/null 2>&1
+[ -f .claude/.spec-scaffold ] && bad "off left the scaffold marker behind" \
+                             || ok "off clears scaffold mode too"
 
 group "One tree per task: the gate fails closed on a split"
 # Observed: the gate armed at Phase 3 in the main checkout, `status` reporting

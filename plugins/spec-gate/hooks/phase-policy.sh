@@ -82,9 +82,47 @@ is_gate_config() {
 # own spec — which is bug #1 from the review list arriving through a new door.
 is_phase_state() {
   case "$1" in
-    *.spec-phase|*.spec-baseline|*.spec-red|*.spec-approval) return 0 ;;
+    *.spec-phase|*.spec-baseline|*.spec-red|*.spec-approval|*.spec-scaffold) return 0 ;;
   esac
   return 1
+}
+
+# --- Scaffold mode -----------------------------------------------------------
+# The hole this closes: `phase.sh red` has exactly one detector for a vacuous
+# test — the test passes. Against a module that does not exist, a careful test
+# and an `assert True` both fail with ModuleNotFoundError, identically, so the
+# detector is blind for precisely the new feature work the five phases exist
+# for. It works only where the code already exists, i.e. bug fixes, which is
+# where the ceremony is least needed.
+#
+# An import error is not a failing test. It is evidence that a prerequisite is
+# missing, and says nothing about what the test asserts — unless the thing being
+# delivered IS the module surface, which is the one case where "does it import
+# and export parse" is the assertion. Scaffold is that case, made explicit.
+#
+# It is a MODE on Phase 2 rather than a phase of its own, and that is load
+# bearing. Any phase numbered below 3 that may write production code would be
+# reachable through the guard's retreat rule — `[ "$ARG" -lt "$PHASE" ]` passes
+# unchecked, because lower has always meant stricter — so Phase 3 could drop
+# into it and write production code with nothing asked. A mode has no number to
+# retreat into.
+#
+# It sits after the 2 -> 3 approval so the surface being created is one the user
+# has already read in the spec. Scaffolding before Clarify would mean guessing
+# the module boundary before the design exists, and committing that guess as the
+# frontier every later test imports from.
+scaffold_path() { printf '%s/.claude/.spec-scaffold' "${PROJECT_DIR%/}"; }
+scaffold_armed() { [ -f "$(scaffold_path)" ]; }
+
+# "New" means UNTRACKED, not "does not exist". The two layers have to agree on
+# the same file at any point in the turn, and by the time the Stop scan runs, the
+# file the guard just permitted DOES exist — an existence test would have
+# prevention and detection contradicting each other about the same write.
+# Tracked is a question git answers the same way before and after.
+is_tracked_path() {
+  ( cd "$PROJECT_DIR" 2>/dev/null || exit 1
+    git rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 1
+    git ls-files --error-unmatch -- "$1" >/dev/null 2>&1 )
 }
 
 # --- One tree per task -------------------------------------------------------
@@ -592,6 +630,7 @@ gate_options() {
   case "$1" in
     spec) printf '%s\n' \
       'approve	Approve the spec	You have read the spec in docs/specs/ and accept the approach, the types and the out-of-scope list. Phase 3 writes tests only; production code stays blocked until you have seen them fail.' \
+      'approve-scaffold	Approve, and create the files first	Same approval, plus one step before Phase 3: the new files this spec names get created empty, so the tests written next fail on an assertion instead of on a missing import. Nothing already tracked can be edited. Choose this when the spec introduces modules that do not exist yet.' \
       'decline	Send the spec back	Something is wrong or missing. Say what, and it gets revised before you are asked again. Choose this if the spec-adversary verdict is not in this conversation.' ;;
     red) printf '%s\n' \
       'approve	Accept these failures	Each failure above is the one the spec expects, not an import error or a broken fixture. Phase 4 unlocks production code and freezes the tests.' \
@@ -611,6 +650,9 @@ gate_options() {
       'pr	Open a pull request	The PR is opened first, then the gate is disarmed. That order is load-bearing: disarming on an uncommitted tree makes the review gate fire on every turn.' \
       'continue	Keep iterating	Stay in Phase 5. Anything that changes from here gets reviewed exactly like the last round did.' \
       'disarm	Disarm and leave it	The phase gate stops and the working tree is what you are left with. The review gate goes back to firing every turn while anything is uncommitted.' ;;
+    scaffold) printf '%s\n' \
+      'approve	Create the new files	Phase 2 is widened to create files that do not exist yet - and only those. Nothing already tracked can be edited, so no existing behaviour changes. This is what lets Phase 3 tests fail on an assertion instead of on a missing import, which is the only failure that proves a test asserts anything.' \
+      'decline	Go straight to the tests	Phase 3 begins with nothing created. Tests against a module that does not exist all fail identically whatever they assert, so the RED check cannot tell a real test from an empty one.' ;;
     skip) printf '%s\n' \
       'approve	Skip the phases between	You are giving up the approvals in the phases being jumped over — spec approval, or reading the tests fail, or both. Nothing later asks for them again. Choose this only if you already know what those phases would have shown you.' \
       'decline	Go one phase at a time	The workflow advances normally and each gate is asked in its turn.' ;;
@@ -741,8 +783,24 @@ path_allowed_in_phase() {
   is_gate_config "$p" && return 0
 
   case "$phase" in
-    1|2)
-      DENY_REASON="Phase $phase of spec-driven: no code yet. Phase 1 clarifies, Phase 2 writes docs/specs/ only. Blocked path: $p"
+    2)
+      # Scaffold mode: new module surface only, so Phase 3's tests can fail on
+      # an assertion instead of on an import. Tests are permitted too, because
+      # the surface test is what makes the creation a TDD step rather than a
+      # licence to write code.
+      if scaffold_armed; then
+        is_test_path "$p" && return 0
+        if is_tracked_path "$p"; then
+          DENY_REASON="Scaffold creates new files; it never edits one that already exists. '$p' is tracked, so changing it is implementation, not scaffolding — that is Phase 4. Blocked path: $p"
+          return 1
+        fi
+        return 0
+      fi
+      DENY_REASON="Phase 2 of spec-driven: no code yet. Phase 2 writes docs/specs/ only. Blocked path: $p"
+      return 1
+      ;;
+    1)
+      DENY_REASON="Phase 1 of spec-driven: no code yet. Phase 1 clarifies and writes nothing. Blocked path: $p"
       return 1
       ;;
     3)
