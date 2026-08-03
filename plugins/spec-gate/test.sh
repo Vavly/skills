@@ -155,6 +155,16 @@ expect_b "a quoted >> in prose"       ALLOW 'echo "append with >> src/x.ts"'
 # Same defect, same line: the in-place-editor check also read raw text, so
 # naming sed -i inside a string was refused as though it were running it.
 expect_b "sed -i named in a string"   ALLOW 'git commit -m "stop using sed -i here"'
+# The editor name has to be a command, not any word whose basename matches. These
+# were all ALLOW before the per-word scan and DENY after it.
+expect_b "a directory called ex"      ALLOW 'pytest tests/ex -s'
+expect_b "a binary called ex"         ALLOW 'bin/ex -s'
+expect_b "a file called patch"        ALLOW 'cat notes/patch'
+expect_b "patch as a commit subject"  ALLOW 'git commit -m patch'
+# ...while the real invocations stay denied, including through a dispatcher.
+expect_b "sed -i through find -exec"  DENY  'find . -name "*.ts" -exec sed -i s/a/b/ {} ;'
+expect_b "sed -i through xargs"       DENY  'ls | xargs sed -i s/a/b/'
+expect_b "patch as the verb"          DENY  'patch -p1 < fix.diff'
 
 # None of that may cost a genuine redirect. These are the cases the scanner
 # exists for, and they still have to land.
@@ -168,6 +178,12 @@ expect_b "redirect after a quoted arrow"   DENY 'echo "a -> b" > src/y.ts'
 expect_b "fd dup is not a write"           ALLOW 'pytest -q > /dev/null 2>&1'
 expect_b "stderr to stdout is not a write" ALLOW 'make build 2>&1 | tail -5'
 expect_b "explicit >&2 is not a write"     ALLOW 'echo problem >&2'
+expect_b "2>&1 is not a write"             ALLOW 'make 2>&1 | tail -1'
+expect_b ">&- is not a write"              ALLOW 'exec 3>&-'
+# `>&word` where word is not a descriptor is bash's synonym for `&>word`, i.e.
+# a real file write. Treating every `>&` as a dup was a deliberate wrong answer.
+expect_b ">&file IS a write"               DENY  'echo hi >& src/y.ts'
+expect_b ">&file with no space"            DENY  'echo hi >&src/y.ts'
 # `>|` overrides noclobber. Leaving the bar unconsumed made it read as a pipe,
 # which ended the segment and discarded the target that was pending on it.
 expect_b "noclobber override is a write"   DENY  'echo hi >| src/y.ts'
@@ -191,6 +207,50 @@ EOF"; do
     bad "the guard errored (and so failed OPEN) on '$(printf '%s' "$c" | head -1)': $err"
   fi
 done
+
+group "A quoted string handed to a shell is not data"
+# The tokenizer is right that a quoted `>` is not an operator. It was wrong that
+# a quoted string is therefore inert: `bash -c "..."` and `eval "..."` hand it
+# straight back to a shell. Every one of these was DENY before the tokenizer and
+# ALLOW after it — the most obvious deliberate route around a Bash write gate,
+# reopened by the fix for a different bug.
+expect_b "bash -c payload is re-read"      DENY 'bash -c "echo hi > src/y.ts"'
+expect_b "sh -c payload is re-read"        DENY "sh -c 'echo hi > src/y.ts'"
+expect_b "eval payload is re-read"         DENY 'eval "echo hi > src/y.ts"'
+expect_b "zsh -c too"                      DENY 'zsh -c "echo hi > src/y.ts"'
+expect_b "nested one level deeper"         DENY 'bash -c "sh -c \"echo hi > src/y.ts\""'
+expect_b "through xargs"                   DENY 'echo x | xargs -I{} sh -c "echo x > src/y.ts"'
+expect_b "through find -exec"              DENY 'find . -exec sh -c "echo x > src/y.ts" ;'
+# awk writes files with a redirect to a quoted literal. `$1 > 5` is a comparison
+# and must stay allowed — the distinguishing shape is the quoted target.
+expect_b "awk redirect to a quoted file"   DENY  'awk '"'"'BEGIN{print "x" > "src/y.ts"}'"'"''
+expect_b "awk append to a quoted file"     DENY  'awk '"'"'BEGIN{print "x" >> "src/y.ts"}'"'"''
+expect_b "an awk comparison still passes"  ALLOW "awk '\$1 > 5' src/x.ts"
+# The payload is only shell when a shell runs it.
+expect_b "a -c payload naming a test path" ALLOW 'bash -c "echo hi > src/y.test.ts"'
+expect_b "an ordinary quoted arrow"        ALLOW 'git commit -m "parse -> validate"'
+expect_b "a benign bash -c"                ALLOW 'bash -c "cd src && ls"'
+
+group "The guard cannot be outrun"
+# A PreToolUse hook that exceeds its timeout emits no decision, and no decision
+# reads as no opinion — so a slow guard is a fail-open, not a slow gate. The
+# char-by-char bash lexer was O(n^2): 20 KB took 15.3s against a 15s timeout, and
+# 20 KB is an ordinary `git commit -m`, a `gh pr create --body`, or the heredoc
+# plan document this workflow tells you to write.
+BIG=$(python3 -c "print('x '*10000)")
+START=$(python3 -c 'import time;print(time.time())')
+got=$(guard "$(pl_bash "git commit -m \"$BIG\"")")
+ELAPSED=$(python3 -c "import time;print(round(time.time()-$START,2))")
+if [ "$(python3 -c "print(1 if $ELAPSED < 3 else 0)")" = 1 ]; then
+  ok "a 20KB command is judged in ${ELAPSED}s (timeout is 15s)"
+else
+  bad "a 20KB command took ${ELAPSED}s — the hook times out and the gate vanishes"
+fi
+[ "$got" = ALLOW ] && ok "and judged correctly" || bad "a long commit message was $got"
+# The same length, but as a write that must still be caught.
+got=$(guard "$(pl_bash "echo \"$BIG\" > src/y.ts")")
+[ "$got" = DENY ] && ok "a long command with a real redirect is still denied" \
+                  || bad "length defeated the scan: got $got"
 
 group "Heredoc bodies are data, not commands"
 # Phase 3 is where the plan document gets written, and a plan names the files it
@@ -2454,6 +2514,7 @@ import|Error: Cannot find module './parser'
 import|error TS2307: Cannot find module './parser'.
 import|ERR_MODULE_NOT_FOUND
 import|cannot find package "example.com/x"
+import|no required module provides package example.com/x
 import|error[E0432]: unresolved import crate::parser
 import|error: package com.x does not exist
 import|cannot load such file -- ./parser
@@ -2518,6 +2579,16 @@ expect_w "not even to append to it"            DENY  src/x.ts Edit
 expect_b "nor through a redirect"              DENY  'echo x >> src/x.ts'
 expect_w "tests are still writable"            ALLOW src/parser.test.ts
 expect_w "specs are still writable"            ALLOW docs/specs/newfeature.md
+# `git ls-files --error-unmatch` matches STAGED files, so the guard's answer
+# changed the moment the work was staged — and review-bookmark.sh stages on every
+# review round. The file then read as "tracked", the Stop scan called it a phase
+# violation, and its advice was to revert the work scaffold exists to produce.
+printf 'export const parse = () => null\n' > src/scaffolded.ts
+expect_w "a scaffolded file before staging" ALLOW src/scaffolded.ts
+git add src/scaffolded.ts >/dev/null 2>&1
+expect_w "and the same file after staging"  ALLOW src/scaffolded.ts
+expect_gate "staging it is not a phase violation" 0
+git rm -q --cached src/scaffolded.ts >/dev/null 2>&1; rm -f src/scaffolded.ts
 expect_w "phase state is still not writable"   DENY  .claude/.spec-phase
 expect_w "and neither is the scaffold marker"  DENY  .claude/.spec-scaffold
 expect_b "naming the marker at all is denied"  DENY  'rm .claude/.spec-scaffold'
@@ -2580,6 +2651,16 @@ WT=$(cd "$WORK/wt" && pwd -P)
 export CLAUDE_PROJECT_DIR="$WT"
 cd "$WT" || exit 1
 expect_w "a write from the un-armed worktree is denied" DENY "$WT/src/x.ts"
+# Failing closed means refusing the WRITES, not bricking the tree. The deny used
+# to fire before the tool was even looked at, so `ls`, `git status` and `cat`
+# all died — including the phase.sh status that reports the split, which made the
+# one escape hatch unreachable from the session that needed it. It also caught
+# Claude Code's own worktree-isolated subagents.
+expect_b "reads are not the gate's business"  ALLOW 'ls -la'
+expect_b "nor is git status"                  ALLOW 'git status'
+expect_b "nor running the suite"              ALLOW 'npm test'
+expect_b "and status stays reachable"         ALLOW '.claude/hooks/phase.sh status'
+expect_b "but a write through Bash is denied" DENY  'echo x > src/x.ts'
 reason=$(guard_reason "$(pl_write "$WT/src/x.ts")")
 printf '%s' "$reason" | grep -qF "$MAIN" && printf '%s' "$reason" | grep -qF "$WT" \
   && ok "the refusal names both trees" \

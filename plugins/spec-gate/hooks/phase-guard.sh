@@ -82,10 +82,11 @@ fi
 # in a worktree while the task is armed next door, and that used to exit 0 — the
 # gate silently absent in exactly the tree the work was happening in. Checked
 # before the early exit, because the early exit is the bug.
+PHASE=""
+SPLIT=""
 if [ ! -f "$STATE" ]; then
-  FOREIGN=$(spec_foreign_state "$PROJECT_DIR")
-  [ -n "$FOREIGN" ] && deny "$(spec_split_message "$FOREIGN" "$(spec_realpath "$PROJECT_DIR")")"
-  exit 0                             # workflow not active anywhere: nothing to enforce
+  SPLIT=$(spec_foreign_state "$PROJECT_DIR")
+  [ -n "$SPLIT" ] || exit 0          # workflow not active anywhere: nothing to enforce
 fi
 
 if [ -z "$PARSER" ]; then
@@ -98,8 +99,224 @@ fi
 PHASE=$(sed -n 's/^phase=//p' "$STATE" | head -1)
 case "$PHASE" in
   1|2|3|4|5) ;;
+  "") [ -n "$SPLIT" ] || deny "phase-guard: .claude/.spec-phase is unreadable. Failing closed." ;;
   *) deny "phase-guard: .claude/.spec-phase is corrupt (phase=$PHASE). Failing closed, because a broken state file must not silently disable the gate. Ask the user with 'phase.sh ask abandon', or repair the file." ;;
 esac
+
+# --- What would this Bash command write? -------------------------------------
+# Parse the forms whose target is unambiguous. Refuse the write-ish forms whose
+# target cannot be parsed, rather than allowing them.
+#
+# This reads a token stream rather than raw text: a `>` is an operator only where
+# the shell would treat it as one, and a heredoc body is data. Asking "is there a
+# > in this string?" refused a steady stream of commands that wrote nothing — a
+# JS arrow function, a comparison inside a quoted jq or awk program, an arrow in
+# a commit message, and any of those inside the heredoc that writes a plan
+# document, which is work this workflow explicitly asks for.
+#
+# Written in awk rather than bash. Stepping through ${s:i:1} is O(n^2) on a long
+# string: 20 KB of command took 15.3s against this hook's 15s timeout, on the
+# bash 3.2 that /usr/bin/env bash resolves to on macOS. A hook that exceeds its
+# timeout emits no decision, and no decision reads as no opinion — so the Bash
+# gate vanished for exactly the commands most likely to be long: a git commit
+# message, a gh pr body, a heredoc plan. awk is on every system that has bash,
+# scans in one pass, and adds no dependency.
+#
+# One token per line: "OP<TAB>>", "OP<TAB>>>", "SEP", or "WORD<TAB><text>".
+# Quotes are consumed rather than stripped afterwards, so a quoted redirect
+# target survives as a single word: the target of `> "src/a b.ts"` is
+# `src/a b.ts`, not the `"src/a` a regex would report.
+#
+# The single-quote character is built with sprintf rather than written, so the
+# whole program sits inside a single-quoted shell string with nothing escaped.
+lex_command() {
+  printf '%s' "$1" | awk '
+    BEGIN { SQ = sprintf("%c", 39); DQ = sprintf("%c", 34); BS = sprintf("%c", 92)
+            hd_head = 1 }   # awk zero-inits, and hd_d[0] is a delimiter that never matches
+    function flush() {
+      if (have) print "WORD\t" w
+      w = ""; have = 0
+    }
+    function nexthd() {
+      if (hd_head <= hd_tail) {
+        hd_active = 1; hd_delim = hd_d[hd_head]; hd_strip = hd_s[hd_head]; hd_head++
+      } else hd_active = 0
+    }
+    {
+      # A heredoc body is data. Consumed whole; nothing inside it is shell.
+      if (hd_active) {
+        t = $0
+        if (hd_strip) sub(/^\t+/, "", t)
+        if (t == hd_delim) nexthd()
+        next
+      }
+      line = $0; n = length(line); i = 1
+      while (i <= n) {
+        c = substr(line, i, 1)
+        if (q == 1) { if (c == SQ) q = 0; else w = w c; i++; continue }
+        if (q == 2) {
+          if (c == BS && i < n) { w = w substr(line, i+1, 1); i += 2; continue }
+          if (c == DQ) q = 0; else w = w c
+          i++; continue
+        }
+        if (c == SQ) { q = 1; have = 1; i++; continue }
+        if (c == DQ) { q = 2; have = 1; i++; continue }
+        if (c == BS) { w = w substr(line, i+1, 1); have = 1; i += 2; continue }
+        if (c == " " || c == "\t") { flush(); i++; continue }
+        if (c == "<") {
+          flush()
+          if (substr(line, i+1, 2) == "<<") { print "SEP"; i += 3; continue }
+          if (substr(line, i+1, 1) == "<") {
+            i += 2; strip = 0
+            if (substr(line, i, 1) == "-") { strip = 1; i++ }
+            while (i <= n && (substr(line, i, 1) == " " || substr(line, i, 1) == "\t")) i++
+            d = ""
+            while (i <= n) {
+              c = substr(line, i, 1)
+              if (c == " " || c == "\t" || c == ";" || c == "|" || c == "&" || c == ">" || c == "<") break
+              if (c == SQ || c == DQ) {
+                qc = c; i++
+                while (i <= n && substr(line, i, 1) != qc) { d = d substr(line, i, 1); i++ }
+                i++
+              } else { d = d c; i++ }
+            }
+            hd_tail++; hd_d[hd_tail] = d; hd_s[hd_tail] = strip
+            continue
+          }
+          i++; continue                       # plain input redirect: reads, never writes
+        }
+        if (c == ">") {
+          flush()
+          i++; op = ">"
+          if (substr(line, i, 1) == ">") { op = ">>"; i++ }
+          if (substr(line, i, 1) == "|") i++  # >| overrides noclobber, still a redirect
+          if (substr(line, i, 1) == "&") {
+            # >&2 and 2>&1 duplicate a descriptor. `>&word` where word is NOT a
+            # descriptor is bash for `&>word` — a real write to a real file.
+            rest = substr(line, i)
+            if (rest ~ /^&[0-9]+/ || rest ~ /^&-/) {
+              i++
+              while (i <= n && substr(line, i, 1) ~ /[0-9-]/) i++
+              continue
+            }
+            i++
+          }
+          print "OP\t" op; continue
+        }
+        if (c == ";" || c == "|" || c == "&") { flush(); print "SEP"; i++; continue }
+        w = w c; have = 1; i++
+      }
+      if (q != 0) { w = w " "; next }         # a quoted string spanning lines
+      flush(); print "SEP"
+      if (!hd_active) nexthd()
+    }
+    END { flush() }
+  '
+}
+
+# In-place editors: the target is genuinely ambiguous to parse (BSD `sed -i ''`
+# versus GNU `sed -i`, script arguments that look like paths). Denying is the
+# honest answer, and Edit is the better tool anyway.
+#
+# Matched on the segment's VERB, or on the word after a dispatcher that runs one
+# (`xargs sed -i`, `find . -exec sed -i`). Matching every word turned
+# `pytest tests/ex -s`, `bin/ex -s` and `cat notes/patch` into denials, because a
+# path whose basename happens to be `ex` or `patch` is not a command.
+finish_segment() {
+  local seg=$SEGW t verb='' last='' ed='' ipe='' expect_verb=1
+  SEGW=''
+  [ -z "$seg" ] && return 0
+  while IFS= read -r t; do
+    [ -z "$t" ] && continue
+    if [ "$expect_verb" = 1 ]; then
+      case "${t##*/}" in
+        *=*|sudo|env|command|nohup|time|xargs|exec) continue ;;
+        -*|'{}'|';'|'+') continue ;;
+      esac
+      verb=${t##*/}
+      case "${t##*/}" in
+        sed|perl|awk) ed=${t##*/} ;;
+      esac
+      case "$t" in
+        ex)    ed=ex ;;
+        patch) ipe=patch ;;
+      esac
+      expect_verb=0
+      continue
+    fi
+    case "$t" in
+      -exec|-execdir|-ok) expect_verb=1; continue ;;
+    esac
+    case "$ed" in
+      sed|perl) case "$t" in -i|-i[!-]*|-[!-]*i*|--in-place*) ipe=$ed ;; esac ;;
+      ex)       case "$t" in -s|-[!-]*s*) ipe=ex ;; esac ;;
+      awk)      case "$t" in -i|--in-place*|inplace) ipe=awk ;; esac ;;
+    esac
+    # awk writes files with a redirect to a quoted literal inside its program.
+    # `$1 > 5` is a comparison and stays allowed; the quoted target tells them
+    # apart.
+    if [ "$verb" = awk ]; then
+      case "$t" in
+        *'>'*'"'*)
+          AWKT=$(printf '%s' "$t" | sed -n 's/.*>>*[[:space:]]*"\([^"]*\)".*/\1/p')
+          [ -n "$AWKT" ] && CAND="$CAND$AWKT"$'\n' ;;
+      esac
+    fi
+    # A quoted string handed to a shell is not data, it is shell. Re-read it.
+    case "$verb" in
+      sh|bash|zsh|ksh|dash|eval)
+        case "$t" in
+          -*) ;;
+          *)  NESTED="$NESTED$t"$'\n' ;;
+        esac ;;
+    esac
+    case "$verb" in
+      tee|touch)              case "$t" in -*) ;; *) CAND="$CAND$t"$'\n' ;; esac ;;
+      cp|mv|install|ln|rsync) case "$t" in -*) ;; *) last=$t ;; esac ;;
+      dd)                     case "$t" in of=*) CAND="$CAND${t#of=}"$'\n' ;; esac ;;
+    esac
+  done <<< "$seg"
+  [ -n "$last" ] && CAND="$CAND$last"$'\n'
+  [ -n "$ipe" ] && deny "spec-driven: in-place editing (sed -i, perl -i, patch, awk -i inplace) is blocked because phase-guard cannot reliably tell which file it targets. Use Edit instead — the gate can evaluate that exactly."
+  return 0
+}
+
+scan_command() {
+  local KIND VAL
+  WANT_TARGET=0
+  SEGW=''
+  while IFS=$'\t' read -r KIND VAL; do
+    case "$KIND" in
+      OP)   WANT_TARGET=1 ;;
+      SEP)  finish_segment; WANT_TARGET=0 ;;
+      WORD)
+        if [ "$WANT_TARGET" = 1 ]; then
+          CAND="$CAND$VAL"$'\n'
+          WANT_TARGET=0
+        else
+          SEGW="$SEGW$VAL"$'\n'
+        fi ;;
+    esac
+  done <<< "$(lex_command "$1")"
+  finish_segment
+}
+
+# `bash -c "echo x > src/y.ts"` is the obvious way around a scanner that treats a
+# quoted string as inert. Each payload is re-tokenised as the shell it is, to a
+# bounded depth so pathological nesting cannot spin.
+collect_write_targets() {
+  CAND=""
+  NESTED=""
+  local depth=0 queue payload
+  scan_command "$1"
+  while [ -n "$NESTED" ] && [ "$depth" -lt 4 ]; do
+    queue=$NESTED; NESTED=""
+    depth=$((depth + 1))
+    while IFS= read -r payload; do
+      [ -n "$payload" ] && scan_command "$payload"
+    done <<< "$queue"
+  done
+}
 
 TOOL=$(json_get tool_name)
 CMD=""
@@ -109,6 +326,33 @@ case "$TOOL" in
   Bash)                    CMD=$(json_get tool_input.command) ;;
   *) exit 0 ;;
 esac
+
+# --- A task armed in another worktree ----------------------------------------
+# There is no local phase to enforce, so the only question is whether this call
+# would write into a tree the armed gate cannot judge.
+#
+# Failing closed means refusing the WRITES, not bricking the tree. Denying before
+# the tool was even looked at killed `ls`, `git status` and `cat` — and the
+# `phase.sh status` that reports the split, which left the one escape hatch
+# unreachable from the session that needed it. It also caught Claude Code's own
+# worktree-isolated subagents, which is most of when this fires at all.
+if [ -n "$SPLIT" ]; then
+  SPLIT_MSG=$(spec_split_message "$SPLIT" "$(spec_realpath "$PROJECT_DIR")")
+  case "$TOOL" in
+    Edit|Write|NotebookEdit) deny "$SPLIT_MSG" ;;
+    Bash)
+      case "$CMD" in
+        *phase.sh*) exit 0 ;;        # the escape hatch; phase.sh refuses on its own
+      esac
+      collect_write_targets "$CMD"
+      while IFS= read -r P; do
+        [ -z "$P" ] && continue
+        in_project "$P" && deny "$SPLIT_MSG"
+      done <<< "$CAND"
+      ;;
+  esac
+  exit 0
+fi
 
 # --- Phase state is off limits, in every phase -------------------------------
 # Checked before the phase>=4 early exit below. Otherwise at Phase 5 the model
@@ -400,213 +644,11 @@ fi
 
 [ "$PHASE" -ge 4 ] && exit 0            # execute onward: normal permission flow
 
-# --- What would this Bash command write? -------------------------------------
-# Parse the forms whose target is unambiguous. Refuse the write-ish forms whose
-# target cannot be parsed, rather than allowing them — the earlier version
-# matched tee/sed -i/dd and then allowed them all, because it only ever
-# extracted redirect targets. Anything still missed is caught by the Stop scan.
-#
-# This reads a token stream rather than the raw command text. The raw-text
-# version asked "is there a > in this string?", which is not the question it
-# meant to ask, and the gap between the two refused a steady stream of commands
-# that wrote nothing. The expensive one is the JS arrow function: `c => {d+=c}`
-# was read as a redirect and denied as a write to a production file named
-# `{d+=c}`. So were a comparison inside a quoted jq or awk program, a `>` in a
-# grep pattern, and an arrow in a commit message.
-#
-# Worst of all was the heredoc, because Phase 3 is where the plan document gets
-# written and a plan names the files it touches. The body was scanned as though
-# it were shell, so an arrow in a sentence or a mermaid diagram made authoring
-# the plan through Bash impossible — the gate blocking the workflow it exists to
-# enforce, with no way around it but rewording prose until the regex lost
-# interest.
-#
-# Quoting and heredoc bodies are therefore tracked properly: a `>` is an operator
-# only where the shell would treat it as one, and a heredoc body is data. What
-# does NOT change is what happens once a target is found — an unparseable target
-# is still denied, and every case the old scanner caught it still catches.
-
-# One token per line: "OP<TAB>>", "OP<TAB>>>", "SEP", or "WORD<TAB><text>".
-# Quotes are consumed rather than stripped afterwards, so a quoted redirect
-# target survives as a single word: the target of `> "src/a b.ts"` is
-# `src/a b.ts`, not the `"src/a` the regex used to report.
-#
-# Newlines inside a word become spaces. A path containing one is beyond what
-# this can evaluate, and collapsing it keeps one word on one line — the reader
-# below is line-oriented, and a word that split across lines would have its tail
-# silently dropped, which for a redirect target means dropped from the check.
-_LEXW=''; _LEXH=0
-_lex_flush() {
-  [ "$_LEXH" = 1 ] && printf 'WORD\t%s\n' "${_LEXW//$'\n'/ }"
-  _LEXW=''; _LEXH=0
-  return 0
-}
-
-lex_command() {
-  # Two statements, not one: `local s=$1 n=${#s}` localises every name before it
-  # assigns any, so ${#s} read an unset s and `set -u` killed the hook outright.
-  # A dead hook emits no decision, which Claude Code reads as "no opinion" — so
-  # the whole Bash gate failed OPEN. Exactly the shape of the fail-open the
-  # parser and the corrupt-state branches were written to avoid.
-  local s=$1
-  local n=${#s} i=0 c op delim strip line rest hdocs='' entry
-  _LEXW=''; _LEXH=0
-  while [ "$i" -lt "$n" ]; do
-    c=${s:i:1}
-    case $c in
-      "'")                              # single quotes: everything is literal
-        i=$((i+1))
-        while [ "$i" -lt "$n" ] && [ "${s:i:1}" != "'" ]; do
-          _LEXW="$_LEXW${s:i:1}"; i=$((i+1))
-        done
-        i=$((i+1)); _LEXH=1 ;;
-      '"')
-        i=$((i+1))
-        while [ "$i" -lt "$n" ] && [ "${s:i:1}" != '"' ]; do
-          if [ "${s:i:1}" = '\' ] && [ $((i+1)) -lt "$n" ]; then
-            _LEXW="$_LEXW${s:i+1:1}"; i=$((i+2))
-          else
-            _LEXW="$_LEXW${s:i:1}"; i=$((i+1))
-          fi
-        done
-        i=$((i+1)); _LEXH=1 ;;
-      '\')
-        _LEXW="$_LEXW${s:i+1:1}"; i=$((i+2)); _LEXH=1 ;;
-      ' '|$'\t')
-        _lex_flush; i=$((i+1)) ;;
-      $'\n')
-        _lex_flush; printf 'SEP\n'; i=$((i+1))
-        # A heredoc body begins on the line after its operator, so this is where
-        # the pending ones get consumed. Skipped whole: nothing inside is shell.
-        while [ -n "$hdocs" ]; do
-          entry=${hdocs%%$'\n'*}; hdocs=${hdocs#*$'\n'}
-          strip=${entry%%:*}; delim=${entry#*:}
-          while [ "$i" -lt "$n" ]; do
-            rest=${s:i}; line=${rest%%$'\n'*}
-            i=$((i + ${#line} + 1))
-            if [ "$strip" = 1 ]; then
-              while case $line in $'\t'*) true ;; *) false ;; esac; do line=${line#?}; done
-            fi
-            [ "$line" = "$delim" ] && break
-          done
-        done ;;
-      '<')
-        if [ "${s:i+1:1}" = '<' ] && [ "${s:i+2:1}" = '<' ]; then
-          _lex_flush; printf 'SEP\n'; i=$((i+3))   # herestring: what follows is data
-        elif [ "${s:i+1:1}" = '<' ]; then
-          _lex_flush; i=$((i+2)); strip=0
-          [ "${s:i:1}" = '-' ] && { strip=1; i=$((i+1)); }
-          while [ "$i" -lt "$n" ] && case ${s:i:1} in ' '|$'\t') true ;; *) false ;; esac; do
-            i=$((i+1))
-          done
-          delim=''
-          while [ "$i" -lt "$n" ]; do
-            c=${s:i:1}
-            case $c in
-              ' '|$'\t'|$'\n'|';'|'|'|'&'|'>'|'<') break ;;
-              "'"|'"')
-                i=$((i+1))
-                while [ "$i" -lt "$n" ] && [ "${s:i:1}" != "$c" ]; do
-                  delim="$delim${s:i:1}"; i=$((i+1))
-                done
-                i=$((i+1)) ;;
-              '\') delim="$delim${s:i+1:1}"; i=$((i+2)) ;;
-              *)   delim="$delim$c"; i=$((i+1)) ;;
-            esac
-          done
-          hdocs="$hdocs$strip:$delim"$'\n'
-        else
-          _lex_flush; i=$((i+1))          # plain input redirect: reads, never writes
-        fi ;;
-      '>')
-        _lex_flush
-        i=$((i+1)); op='>'
-        [ "${s:i:1}" = '>' ] && { op='>>'; i=$((i+1)); }
-        # `>|` overrides noclobber and is still a redirect. Left unconsumed the
-        # `|` read as a pipe, which ended the segment and took the pending target
-        # with it — a write that parsed as nothing at all.
-        [ "${s:i:1}" = '|' ] && i=$((i+1))
-        if [ "${s:i:1}" = '&' ]; then
-          # `>&2` and `2>&1` duplicate a descriptor. No path is written.
-          i=$((i+1))
-          while [ "$i" -lt "$n" ] && case ${s:i:1} in [0-9]|'-') true ;; *) false ;; esac; do
-            i=$((i+1))
-          done
-        else
-          printf 'OP\t%s\n' "$op"
-        fi ;;
-      ';'|'|'|'&')
-        _lex_flush; printf 'SEP\n'; i=$((i+1)) ;;
-      *)
-        _LEXW="$_LEXW$c"; _LEXH=1; i=$((i+1)) ;;
-    esac
-  done
-  _lex_flush
-}
-
 if [ -n "$CMD" ]; then
-  CAND=""
-  SEGW=""        # the current pipeline segment's words, one per line
-
-  # In-place editors: the target is genuinely ambiguous to parse (BSD `sed -i ''`
-  # versus GNU `sed -i`, script arguments that look like paths). Denying is the
-  # honest answer, and Edit is the better tool anyway.
-  #
-  # Checked against words rather than raw text, so naming one in a string —
-  # `git commit -m "stop using sed -i here"` — is no longer the same as running
-  # one. Every word is checked for the editor name, not just the segment's verb,
-  # because `find . -exec sed -i` and `xargs sed -i` are how it usually arrives.
-  finish_segment() {
-    local seg=$SEGW t verb='' last='' ed='' ipe=''
-    SEGW=''
-    [ -z "$seg" ] && return 0
-    while IFS= read -r t; do
-      [ -z "$t" ] && continue
-      case "${t##*/}" in
-        sed|perl|ex|awk) ed=${t##*/} ;;
-        patch)           ipe=patch ;;
-      esac
-      case "$ed" in
-        sed|perl) case "$t" in -i|-i[!-]*|-[!-]*i*|--in-place*) ipe=$ed ;; esac ;;
-        ex)       case "$t" in -s|-[!-]*s*) ipe=ex ;; esac ;;
-        awk)      case "$t" in -i|--in-place*|inplace) ipe=awk ;; esac ;;
-      esac
-      if [ -z "$verb" ]; then           # strip env assignments and wrappers
-        case "${t##*/}" in
-          *=*|sudo|env|command|nohup|time) continue ;;
-        esac
-        verb=${t##*/}
-        continue
-      fi
-      case "$verb" in
-        tee|touch)              case "$t" in -*) ;; *) CAND="$CAND$t"$'\n' ;; esac ;;
-        cp|mv|install|ln|rsync) case "$t" in -*) ;; *) last=$t ;; esac ;;
-        dd)                     case "$t" in of=*) CAND="$CAND${t#of=}"$'\n' ;; esac ;;
-      esac
-    done <<< "$seg"
-    # cp/mv/install/ln/rsync: the destination is the last non-flag token.
-    [ -n "$last" ] && CAND="$CAND$last"$'\n'
-    [ -n "$ipe" ] && deny "Phase $PHASE of spec-driven: in-place editing (sed -i, perl -i, patch, awk -i inplace) is blocked because phase-guard cannot reliably tell which file it targets. Use Edit instead — the gate can evaluate that exactly."
-    return 0
-  }
-
-  WANT_TARGET=0
-  while IFS=$'\t' read -r KIND VAL; do
-    case "$KIND" in
-      OP)   WANT_TARGET=1 ;;
-      SEP)  finish_segment; WANT_TARGET=0 ;;
-      WORD)
-        if [ "$WANT_TARGET" = 1 ]; then
-          CAND="$CAND$VAL"$'\n'
-          WANT_TARGET=0
-        else
-          SEGW="$SEGW$VAL"$'\n'
-        fi ;;
-    esac
-  done <<< "$(lex_command "$CMD")"
-  finish_segment
+  collect_write_targets "$CMD"
   PATHS=$CAND
 fi
+
 
 [ -z "$PATHS" ] && exit 0
 

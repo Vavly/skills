@@ -114,15 +114,25 @@ is_phase_state() {
 scaffold_path() { printf '%s/.claude/.spec-scaffold' "${PROJECT_DIR%/}"; }
 scaffold_armed() { [ -f "$(scaffold_path)" ]; }
 
-# "New" means UNTRACKED, not "does not exist". The two layers have to agree on
-# the same file at any point in the turn, and by the time the Stop scan runs, the
-# file the guard just permitted DOES exist — an existence test would have
-# prevention and detection contradicting each other about the same write.
-# Tracked is a question git answers the same way before and after.
+# "New" means NOT IN HEAD. The two layers have to agree about the same file at
+# any point in the turn, and by the time the Stop scan runs, the file the guard
+# just permitted DOES exist — an existence test would have prevention and
+# detection contradicting each other about the same write.
+#
+# `git ls-files --error-unmatch` was the first answer and it was wrong: it also
+# matches STAGED files, so the verdict flipped the moment the work was staged —
+# and review-bookmark.sh stages on every review round. A scaffolded file went
+# ALLOW, then DENY after `git add`, with the Stop scan calling it a phase
+# violation and advising a revert that would destroy the work. HEAD does not move
+# when you stage, so this is the predicate that is actually stable.
+#
+# The pathspec is literal: `git ls-files -- src/foo?.ts` glob-matches
+# src/foo1.ts, and a path is not a pattern.
 is_tracked_path() {
   ( cd "$PROJECT_DIR" 2>/dev/null || exit 1
     git rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 1
-    git ls-files --error-unmatch -- "$1" >/dev/null 2>&1 )
+    p=${1#"${PROJECT_DIR%/}/"}
+    git cat-file -e "HEAD:$p" >/dev/null 2>&1 )
 }
 
 # --- One tree per task -------------------------------------------------------
@@ -527,7 +537,8 @@ red_failure_kind() {   # $1 = exit status, $2 = combined output -> green|harness
   case "$2" in
     *ModuleNotFoundError*|*"No module named"*|*ImportError*|\
     *"Cannot find module"*|*"cannot find module"*|*ERR_MODULE_NOT_FOUND*|*TS2307*|\
-    *"Could not resolve"*|*"cannot find package"*|*"unresolved import"*|*E0432*|\
+    *"Could not resolve"*|*"cannot find package"*|*"no required module provides package"*|\
+    *"unresolved import"*|*E0432*|\
     *package*"does not exist"*|*"cannot load such file"*)
       printf 'import\n'; return 0 ;;
   esac
@@ -687,9 +698,6 @@ gate_options() {
       'pr	Open a pull request	The PR is opened first, then the gate is disarmed. That order is load-bearing: disarming on an uncommitted tree makes the review gate fire on every turn.' \
       'continue	Keep iterating	Stay in Phase 5. Anything that changes from here gets reviewed exactly like the last round did.' \
       'disarm	Disarm and leave it	The phase gate stops and the working tree is what you are left with. The review gate goes back to firing every turn while anything is uncommitted.' ;;
-    scaffold) printf '%s\n' \
-      'approve	Create the new files	Phase 2 is widened to create files that do not exist yet - and only those. Nothing already tracked can be edited, so no existing behaviour changes. This is what lets Phase 3 tests fail on an assertion instead of on a missing import, which is the only failure that proves a test asserts anything.' \
-      'decline	Go straight to the tests	Phase 3 begins with nothing created. Tests against a module that does not exist all fail identically whatever they assert, so the RED check cannot tell a real test from an empty one.' ;;
     skip) printf '%s\n' \
       'approve	Skip the phases between	You are giving up the approvals in the phases being jumped over — spec approval, or reading the tests fail, or both. Nothing later asks for them again. Choose this only if you already know what those phases would have shown you.' \
       'decline	Go one phase at a time	The workflow advances normally and each gate is asked in its turn.' ;;
