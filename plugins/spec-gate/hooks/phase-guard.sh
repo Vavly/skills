@@ -96,7 +96,7 @@ fi
 # A corrupt state file used to fall through to exit 0, silently disabling the
 # gate — the same fail-open bug as a missing parser. It now fails closed, with a
 # reason that says how to recover.
-PHASE=$(sed -n 's/^phase=//p' "$STATE" | head -1)
+PHASE=$(sed -n 's/^phase=//p' "$STATE" 2>/dev/null | head -1)
 case "$PHASE" in
   1|2|3|4|5) ;;
   "") [ -n "$SPLIT" ] || deny "phase-guard: .claude/.spec-phase is unreadable. Failing closed." ;;
@@ -161,8 +161,19 @@ lex_command() {
         }
         if (c == SQ) { q = 1; have = 1; i++; continue }
         if (c == DQ) { q = 2; have = 1; i++; continue }
-        if (c == BS) { w = w substr(line, i+1, 1); have = 1; i += 2; continue }
+        if (c == BS) {
+          # A backslash at end of line continues the logical line. Copying the
+          # character past the end emitted an empty WORD that swallowed the
+          # pending redirect, and the newline then ended the segment — so the
+          # target on the next line was filed as an ordinary argument.
+          if (i >= n) { cont = 1; i += 2; continue }
+          w = w substr(line, i+1, 1); have = 1; i += 2; continue
+        }
         if (c == " " || c == "\t") { flush(); i++; continue }
+        # A `#` starting a word begins a comment; the rest of the line is not
+        # shell. Without this an apostrophe in a comment opened a quote that
+        # never closed, and every later line was absorbed into it.
+        if (c == "#" && !have) break
         if (c == "<") {
           flush()
           if (substr(line, i+1, 2) == "<<") { print "SEP"; i += 3; continue }
@@ -180,7 +191,10 @@ lex_command() {
                 i++
               } else { d = d c; i++ }
             }
-            hd_tail++; hd_d[hd_tail] = d; hd_s[hd_tail] = strip
+            # `$((1<<3))` is an arithmetic shift, not a heredoc. Its "delimiter"
+            # parses as `3))`, which no line ever matches, so the rest of the
+            # command was swallowed as body and nothing in it was scanned.
+            if (d != "" && d !~ /[()$]/) { hd_tail++; hd_d[hd_tail] = d; hd_s[hd_tail] = strip }
             continue
           }
           i++; continue                       # plain input redirect: reads, never writes
@@ -206,6 +220,7 @@ lex_command() {
         if (c == ";" || c == "|" || c == "&") { flush(); print "SEP"; i++; continue }
         w = w c; have = 1; i++
       }
+      if (cont) { cont = 0; next }             # continued line: same word, same segment
       if (q != 0) { w = w " "; next }         # a quoted string spanning lines
       flush(); print "SEP"
       if (!hd_active) nexthd()
@@ -223,7 +238,7 @@ lex_command() {
 # `pytest tests/ex -s`, `bin/ex -s` and `cat notes/patch` into denials, because a
 # path whose basename happens to be `ex` or `patch` is not a command.
 finish_segment() {
-  local seg=$SEGW t verb='' last='' ed='' ipe='' expect_verb=1
+  local seg=$SEGW t verb='' last='' ed='' ipe='' expect_verb=1 payload=''
   SEGW=''
   [ -z "$seg" ] && return 0
   while IFS= read -r t; do
@@ -247,6 +262,9 @@ finish_segment() {
     case "$t" in
       -exec|-execdir|-ok) expect_verb=1; continue ;;
     esac
+    case "${t##*/}" in
+      sed|perl|awk) ed=${t##*/}; continue ;;
+    esac
     case "$ed" in
       sed|perl) case "$t" in -i|-i[!-]*|-[!-]*i*|--in-place*) ipe=$ed ;; esac ;;
       ex)       case "$t" in -s|-[!-]*s*) ipe=ex ;; esac ;;
@@ -267,7 +285,7 @@ finish_segment() {
       sh|bash|zsh|ksh|dash|eval)
         case "$t" in
           -*) ;;
-          *)  NESTED="$NESTED$t"$'\n' ;;
+          *)  payload="$payload $t" ;;
         esac ;;
     esac
     case "$verb" in
@@ -277,6 +295,7 @@ finish_segment() {
     esac
   done <<< "$seg"
   [ -n "$last" ] && CAND="$CAND$last"$'\n'
+  [ -n "${payload# }" ] && NESTED="$NESTED${payload# }"$'\n'
   [ -n "$ipe" ] && deny "spec-driven: in-place editing (sed -i, perl -i, patch, awk -i inplace) is blocked because phase-guard cannot reliably tell which file it targets. Use Edit instead — the gate can evaluate that exactly."
   return 0
 }
@@ -327,6 +346,10 @@ case "$TOOL" in
   *) exit 0 ;;
 esac
 
+if [ -n "$CMD" ] && ! awk 'BEGIN{exit 0}' </dev/null >/dev/null 2>&1; then
+  deny "phase-guard cannot read the command: awk is missing or not working, and the Bash write scan is written in it. Failing closed, because a scan that cannot run must not read as permission. Install awk, or ask the user to run phase.sh off to disable the phase gate."
+fi
+
 # --- A task armed in another worktree ----------------------------------------
 # There is no local phase to enforce, so the only question is whether this call
 # would write into a tree the armed gate cannot judge.
@@ -341,13 +364,27 @@ if [ -n "$SPLIT" ]; then
   case "$TOOL" in
     Edit|Write|NotebookEdit) deny "$SPLIT_MSG" ;;
     Bash)
-      case "$CMD" in
-        *phase.sh*) exit 0 ;;        # the escape hatch; phase.sh refuses on its own
-      esac
+      # No special case for phase.sh. Matching the name — as a substring or even
+      # anchored as a word — let `echo x > src/x.ts # phase.sh` and
+      # `cat .claude/hooks/phase.sh > src/x.ts` skip the check, because naming a
+      # command is not running it. What actually matters is whether this call
+      # writes anything: `phase.sh status` writes nothing the scanner can see, so
+      # it passes on its own merits, and phase.sh refuses across a split by
+      # itself anyway.
       collect_write_targets "$CMD"
+      PROOT=$(spec_realpath "${PROJECT_DIR%/}")
       while IFS= read -r P; do
         [ -z "$P" ] && continue
         in_project "$P" && deny "$SPLIT_MSG"
+        case "$P" in
+          /*) PN=$(spec_norm_path "$P")
+              while IFS= read -r WTREE; do
+                [ -n "$WTREE" ] || continue
+                WTREE=$(spec_realpath "$WTREE")
+                [ -n "$WTREE" ] || continue
+                case "$PN" in "$WTREE"/*) deny "$SPLIT_MSG" ;; esac
+              done <<< "$(spec_worktrees "$PROJECT_DIR")" ;;
+        esac
       done <<< "$CAND"
       ;;
   esac
@@ -470,6 +507,10 @@ if [ -n "$CMD" ] && printf '%s' "$CMD" | grep -qE '(^|[^[:alnum:]_.+-])phase\.sh
           deny "The user approved the spec, but chose the plain approval rather than 'Approve, and create the files first'. Scaffolding is not part of what they accepted. Go to Phase 3, or show them why the surface has to exist first and ask again: phase.sh ask spec" ;;
         decline)
           deny "The user sent the spec back, so there is no approved surface to scaffold. Revise the spec and ask again: phase.sh ask spec" ;;
+        stale)
+          deny "The spec has changed since the user answered, so their approval does not cover the surface now described in docs/specs/. Show them the spec as it stands and ask again: phase.sh ask spec" ;;
+        expired)
+          deny "That answer was given at a different point in this task — another phase or slice — so it does not decide this one. Ask again: phase.sh ask spec" ;;
         *)
           # No receipt to read. Under Claude Code that means the question was
           # never put; under Cursor it means it never can be — there is no

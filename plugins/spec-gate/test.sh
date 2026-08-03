@@ -164,6 +164,13 @@ expect_b "patch as a commit subject"  ALLOW 'git commit -m patch'
 # ...while the real invocations stay denied, including through a dispatcher.
 expect_b "sed -i through find -exec"  DENY  'find . -name "*.ts" -exec sed -i s/a/b/ {} ;'
 expect_b "sed -i through xargs"       DENY  'ls | xargs sed -i s/a/b/'
+# The original regex scanned raw text, so a wrapper taking its own operand made
+# no difference. Keying off the verb lost these: sudo consumes `-u`, then `root`
+# becomes the verb and everything after it is an argument.
+expect_b "sed -i behind sudo -u"      DENY  'sudo -u root sed -i s/a/b/ src/x.ts'
+expect_b "sed -i behind timeout N"    DENY  'timeout 5 sed -i s/a/b/ src/x.ts'
+expect_b "sed -i behind nice -n"      DENY  'nice -n 10 sed -i s/a/b/ src/x.ts'
+expect_b "perl -i behind env VAR="    DENY  'env FOO=1 perl -pi -e s/a/b/ src/x.ts'
 expect_b "patch as the verb"          DENY  'patch -p1 < fix.diff'
 
 # None of that may cost a genuine redirect. These are the cases the scanner
@@ -187,6 +194,23 @@ expect_b ">&file with no space"            DENY  'echo hi >&src/y.ts'
 # `>|` overrides noclobber. Leaving the bar unconsumed made it read as a pipe,
 # which ended the segment and discarded the target that was pending on it.
 expect_b "noclobber override is a write"   DENY  'echo hi >| src/y.ts'
+# A backslash at end of line ran off the end of the string, emitted a spurious
+# empty word that swallowed the pending redirect, and the newline then ended the
+# segment — so the target on the next line was filed as an ordinary argument.
+# Continuing a line before a long path is idiomatic, not adversarial.
+expect_b "continuation before a target"    DENY  "$(printf 'echo hi > \\\n  src/y.ts')"
+expect_b "continuation with no space"      DENY  "$(printf 'echo hi >\\\nsrc/y.ts')"
+expect_b "continuation before a cp dest"   DENY  "$(printf 'cp /tmp/e \\\n  src/x.ts')"
+# Two more ways to desynchronise the lexer and take everything after it with
+# them. `$((1<<3))` was read as a heredoc opening with delimiter `3))`, which
+# never matches, so every later line was swallowed as body. An apostrophe in a
+# comment opened a quote that never closed. Both were caught by the raw-text
+# scanner this replaced.
+expect_b "arithmetic shift is not a heredoc" DENY "$(printf 'echo $((1<<3))\necho x > src/y.ts')"
+expect_b "an apostrophe in a comment"        DENY "$(printf "ls # don't\necho x > src/y.ts")"
+expect_b "a comment does not eat the line"   ALLOW "$(printf 'ls -la   # writes nothing > here')"
+expect_b "a hash inside a word is not one"   DENY  'echo a#b > src/y.ts'
+expect_b "a real heredoc still works"        ALLOW "$(printf 'cat > docs/specs/p.md <<HD\nbody\nHD')"
 expect_b "1> is a write"                   DENY  'echo hi 1> src/y.ts'
 expect_b "&> is a write"                   DENY  'echo hi &> src/y.ts'
 
@@ -251,6 +275,17 @@ fi
 got=$(guard "$(pl_bash "echo \"$BIG\" > src/y.ts")")
 [ "$got" = DENY ] && ok "a long command with a real redirect is still denied" \
                   || bad "length defeated the scan: got $got"
+
+# The tokenizer runs in awk, so awk joined jq/python3 as something the guard
+# needs. A dead hook emits no decision and no decision reads as no opinion, so an
+# unusable awk was a silent, total fail-open of the Bash gate.
+mkdir -p "$WORK/fakebin"; printf '#!/bin/sh\nexit 127\n' > "$WORK/fakebin/awk"; chmod +x "$WORK/fakebin/awk"
+got=$(printf '%s' "$(pl_bash 'echo hi > src/y.ts')" | PATH="$WORK/fakebin:$PATH" .claude/hooks/phase-guard.sh 2>/dev/null \
+  | python3 -c 'import json,sys
+t=sys.stdin.read().strip(); print("ALLOW" if not t else json.loads(t)["hookSpecificOutput"]["permissionDecision"].upper())')
+[ "$got" = DENY ] && ok "an unusable awk fails closed" \
+                  || bad "with awk broken the Bash gate vanished: got $got"
+rm -rf "$WORK/fakebin"
 
 group "Heredoc bodies are data, not commands"
 # Phase 3 is where the plan document gets written, and a plan names the files it
@@ -2586,6 +2621,16 @@ printf '%s' "$reason" | grep -qi 'do not exist' \
 # of one, so it must not degrade into a prompt that asks again.
 answer spec 'Approve the spec'
 expect_b "a plain approval is still a refusal" DENY '.claude/hooks/phase.sh scaffold'
+# `stale` and `expired` are answers, not the absence of one, and every other gate
+# in the guard spells them out as denials. The fallback must not turn them into a
+# fresh prompt — re-asking until the answer changes is not consent.
+answer spec 'Approve, and create the files first'
+printf 'and one more requirement nobody approved\n' >> docs/specs/newfeature.md
+expect_b "a stale answer is not re-prompted"   DENY '.claude/hooks/phase.sh scaffold'
+answer spec 'Approve, and create the files first'
+printf 'phase=2\ntask=newfeature\nslice=1/2\n' > .claude/.spec-phase
+expect_b "an expired answer is not re-prompted" DENY '.claude/hooks/phase.sh scaffold'
+printf 'phase=2\ntask=newfeature\nslice=1/1\n' > .claude/.spec-phase
 .claude/hooks/phase.sh scaffold >/dev/null 2>&1
 [ -f .claude/.spec-scaffold ] && ok "scaffold mode is recorded on disk" \
                              || bad "phase.sh scaffold left no marker"
@@ -2684,6 +2729,17 @@ expect_b "nor is git status"                  ALLOW 'git status'
 expect_b "nor running the suite"              ALLOW 'npm test'
 expect_b "and status stays reachable"         ALLOW '.claude/hooks/phase.sh status'
 expect_b "but a write through Bash is denied" DENY  'echo x > src/x.ts'
+# in_project is a prefix test against THIS tree, so an absolute path into the
+# armed tree scored as "not our business" — the same fail-open the split check
+# exists to close, from the mirror direction. The third one disarms the gate.
+expect_b "a write INTO the armed tree"       DENY  "echo x > $MAIN/src/x.ts"
+expect_b "a cp INTO the armed tree"          DENY  "cp /tmp/e $MAIN/src/x.ts"
+expect_b "rewriting the armed tree's state"  DENY  "printf 'phase=5' > $MAIN/.claude/.spec-phase"
+# The escape hatch matched *phase.sh* anywhere in the command, so naming it in a
+# comment or a string skipped the check entirely.
+expect_b "phase.sh in a comment is not it"   DENY  'echo x > src/x.ts # phase.sh'
+expect_b "phase.sh in a string is not it"    DENY  'echo "phase.sh" > src/x.ts'
+expect_b "reading phase.sh into a file"      DENY  'cat .claude/hooks/phase.sh > src/x.ts'
 reason=$(guard_reason "$(pl_write "$WT/src/x.ts")")
 printf '%s' "$reason" | grep -qF "$MAIN" && printf '%s' "$reason" | grep -qF "$WT" \
   && ok "the refusal names both trees" \
