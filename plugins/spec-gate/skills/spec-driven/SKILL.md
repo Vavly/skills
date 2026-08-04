@@ -143,6 +143,42 @@ Phase state lives in `.claude/.spec-phase`, not in your context. Re-read it with
 assume you are unsure. `status` also tells you who owns the next transition. Never
 edit the state file: every command that names it is denied, in every phase.
 
+## A gate is not a finished task
+
+This workflow spends most of its time ending turns. Phase 1 ends on the blocking
+unknowns; `2 → 3` and `3 → 4` end on the question the gate printed; a refusal
+above ends on a decision only the user can make; close-out ends on three answers.
+**None of those is the task being done.** The task is done once, at the end, and
+everything before it is a pause with a question attached.
+
+Say which it is, because some harnesses cannot tell. A background job, a queue
+runner, anything reporting a session's state to somebody who is not watching it,
+works out *waiting* from *finished* by reading your message text — not your tool
+output, not a pending `AskUserQuestion`. So a turn that stops at a gate without
+saying it is waiting gets filed as finished, and the user who is owed a question
+never finds out they are owed one. The task stalls at Phase 2 looking exactly
+like a task that completed.
+
+| Your turn ends on | Which is |
+| --- | --- |
+| blocking unknowns, or any `phase.sh ask` question | waiting on the user |
+| a refusal only they can resolve — split worktree, `off` denied, a declined answer | waiting on the user |
+| `status`, asked and answered | an answer delivered |
+| `phase.sh` not found | failed; the gate is not installed here |
+| close-out acted on — PR opened, or `off` run because they said so | the task, finished |
+
+In whatever form that harness reads. Claude Code background jobs read
+`needs input:` and `result:` on their own line; another harness may read
+something else, or nothing, and where nothing reads for it this section costs you
+a sentence you can drop.
+
+**`result:` is the one to get right**, because it is true exactly once per task
+and every phase transition looks like a smaller version of it. A spec approved is
+not a task finished. [Closing out](#closing-out) is what finishes a task, it
+happens after the review log is on screen, and it is the user's to decide — so
+reporting a phase transition as a finished task decides on their behalf that it
+is over.
+
 ## Standing commitments
 
 These hold in every phase:

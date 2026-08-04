@@ -456,6 +456,9 @@ case "${1:-status}" in
       echo "  Reword it and the answer records nothing, so you would be asking twice."
       echo "  Everything you want to say about the decision goes in your own message"
       echo "  above the question, where it belongs — not in the question."
+      echo "  This turn ends waiting on them, not with the task finished. If your"
+      echo "  harness reads your message text to tell those apart — a background"
+      echo "  job does — say which one it is there. 'needs input:', not 'result:'."
     } >&2
     ;;
 
