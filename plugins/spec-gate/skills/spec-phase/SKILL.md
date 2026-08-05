@@ -1,7 +1,7 @@
 ---
 name: spec-phase
 description: Inspect or advance the spec-driven phase gate.
-argument-hint: "[status | start <task> | red | ask <gate> | slices <n> | 1-5 | 4 --force | off]"
+argument-hint: "[status | brief | start <task> | red | ask <gate> | slices <n> | 1-5 | 4 --force | off]"
 disable-model-invocation: true
 allowed-tools: Bash
 ---
@@ -63,10 +63,15 @@ forward that skips the asking. What it can never do is tell your Bash call from
 one the user's slash command made — which is why the answer, not the call, is what
 moves anything.
 
+**If the request is `brief`** — run it and report the output verbatim. It
+reconstructs an active task from disk for a session that has lost it, which is
+also what the `SessionStart` hook runs by itself after compaction or `/clear`.
+Typing it changes nothing; it only reads.
+
 **Otherwise** — run `.claude/hooks/phase.sh $ARGUMENTS` and report the output
-verbatim. These are yours outright: `status`, `red`, `ask`, any retreat to a lower
-phase, 1 → 2, and 4 → 5. `ask` only prints a question; the answer is what moves
-anything, and the answer is the user's.
+verbatim. These are yours outright: `status`, `brief`, `red`, `ask`, `journal`,
+`validation`, any retreat to a lower phase, 1 → 2, and 4 → 5. `ask` only prints a
+question; the answer is what moves anything, and the answer is the user's.
 
 `off` is never something you reach for unasked, even here. This skill only runs
 because the user typed it, so running it is fine — but if you arrived at `off`

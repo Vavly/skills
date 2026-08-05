@@ -143,6 +143,46 @@ Phase state lives in `.claude/.spec-phase`, not in your context. Re-read it with
 assume you are unsure. `status` also tells you who owns the next transition. Never
 edit the state file: every command that names it is denied, in every phase.
 
+## What survives this session, and what you have to write down
+
+Sessions end. Compaction fires mid-turn without asking, `/clear` happens, and a
+sliced task routinely outlives the conversation that started it. **The workflow
+is built to survive that, and most of it already does** — the phase is in
+`.claude/.spec-phase`, the spec and the plan are on disk, every reviewer verdict
+is in `.claude/review-log.jsonl`, and what shipped is in git.
+
+A `SessionStart` hook runs `phase.sh brief` on startup, on resume, after `/clear`
+and after compaction, so a session that has lost the task is handed it back
+without the user having to explain it a second time. **If you ever find yourself
+in a repo with an active task you do not remember, run `phase.sh brief`** — that
+is the entire recovery procedure, and it costs one command.
+
+What `brief` cannot reconstruct is anything you only *said*. Exactly three things
+fall in that gap, and each has a command that puts it on disk:
+
+| Write down | With | Or else |
+| --- | --- | --- |
+| the Phase 4 validation report | `phase.sh validation` | `4 → 5` refuses |
+| findings acted on, findings declined, and why | `phase.sh journal` | the next session re-litigates a finding you already dismissed |
+| how far through the plan Execute got | `phase.sh journal` | the next session re-derives it, or redoes it |
+
+Both read the entry from stdin, and stamp it with the phase and slice:
+
+```bash
+phase.sh journal <<'EOF'
+Declined finding 2 (add a cache): the reviewer assumed 10k rows, and Phase 1
+established at most 200. Recorded rather than fixed.
+EOF
+```
+
+**None of this goes in the spec.** Two things break at once if it does. The
+`spec-adversary` reads the spec — cold, from slice 2 on — so an execution log
+folded into it feeds the design reviewer exactly the diff-level history this
+workflow withholds from it. And the spec is a *tracked* file, so writing to it
+dirties the tree, re-arms the review gate, and buys a review round whose only
+finding is the entry describing the previous one. The journal lives in
+`.claude/spec-journal.md`, gitignored, where the gate structurally cannot see it.
+
 ## A gate is not a finished task
 
 This workflow spends most of its time ending turns. Phase 1 ends on the blocking
@@ -546,7 +586,24 @@ predates your change rather than asserting it, and what each report line buys th
 reviewer — including `Not covered`, which is the line the reviewer reads first and
 the one you will be tempted to leave blank.
 
-**Exit:** plan complete, repo validations green, output shown, report written —
+Then **record it with `phase.sh validation`**, which reads it from stdin, rather
+than only printing it in your message:
+
+```bash
+phase.sh validation <<'EOF'
+Commands: <exactly what you ran>
+Source:   <where you got them>
+Result:   <per command: pass, plus its summary line>
+Not covered: <what this repo does not check at all>
+EOF
+```
+
+`4 → 5` refuses without one, for the reason `3 → 4` refuses without a RED
+receipt. Phase 5's first act is handing this report to a reviewer, and a report
+that lives only in this conversation is one the next session cannot hand over and
+nobody can check was ever run.
+
+**Exit:** plan complete, repo validations green, output shown, report recorded —
 then run
 `phase.sh 5` **yourself**. This transition is yours: advancing
 submits your work for adversarial review, so taking it costs you nothing and
@@ -640,6 +697,12 @@ One entry per round, so the sequence is visible: what it found, what you changed
 what it said about that change. The last round's verdict is not a summary of the
 review — **a finding the reviewer closed and a finding it never re-checked look
 identical in a log that only records the end**, and only one of them is done.
+
+**Put each round's entry through `phase.sh journal` as well as on screen.** The
+reviewer's half of this is already durable — `review-log.jsonl` records every
+verdict — but your half is not, and your half is the one that stops the next
+session reopening a finding you declined on grounds it no longer has. A sliced
+task will outlive this conversation; write for the session that arrives after it.
 
 ### If the task is sliced, this is a boundary, not the end
 

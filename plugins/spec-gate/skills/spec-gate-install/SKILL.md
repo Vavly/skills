@@ -87,7 +87,7 @@ to verify anything, and 3 → 4 then rests on an assertion instead of on output.
 
 ## 5. `.gitignore`
 
-Six entries, and each one is state the gate writes about itself:
+Eight entries, and each one is state the gate writes about itself:
 
 ```
 .claude/.spec-phase
@@ -95,6 +95,8 @@ Six entries, and each one is state the gate writes about itself:
 .claude/.spec-red
 .claude/.spec-approval*
 .claude/.spec-scaffold
+.claude/.spec-validation
+.claude/spec-journal.md
 .claude/review-log.jsonl
 ```
 
@@ -110,16 +112,21 @@ writes its own bookkeeping.
     "ask": [
       "Bash(.claude/hooks/phase.sh 3*)",
       "Bash(.claude/hooks/phase.sh 4*)",
+      "Bash(.claude/hooks/phase.sh 5 --force*)",
       "Bash(.claude/hooks/phase.sh off*)"
     ]
   }
 }
 ```
 
+`5 --force` is listed and a bare `5` is not, on purpose: advancing into review is
+the model's own transition and prompting on it would be noise, but the `--force`
+spelling skips the validation report the reviewer is about to be handed.
+
 **Merge into any existing `.claude/settings.json`; never replace it.** The `ask`
 array goes inside whatever `permissions` object is already there, and everything
-else in the file stays untouched. Read it first, and if it already has these
-three, say so and skip.
+else in the file stays untouched. Read it first, and if it already has these,
+say so and skip.
 
 These are a backstop, not the main gate. `phase-guard.sh` matches `phase.sh` with
 no path anchor, so it asks in every normal permission mode wherever the script
@@ -129,8 +136,8 @@ shim gives every project the same one.
 
 **Do not copy the plugin's `hooks` block into settings.** The plugin registers
 its own hooks through `hooks/hooks.json`; a second copy pointing at
-`$CLAUDE_PROJECT_DIR/.claude/hooks/*.sh` would name five scripts a plugin install
-does not have.
+`$CLAUDE_PROJECT_DIR/.claude/hooks/*.sh` would name scripts a plugin install does
+not have.
 
 ## 7. Report
 

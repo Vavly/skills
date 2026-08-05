@@ -40,13 +40,23 @@ setup_repo() {
   # Must stay identical to the install block in README.md. An untracked state
   # file is work the review gate considers owed, so a name missing here is a gate
   # that arms itself every time it writes its own bookkeeping.
-  printf '.claude/.spec-phase\n.claude/.spec-baseline\n.claude/.spec-red\n.claude/.spec-approval*\n.claude/.spec-scaffold\n.claude/review-log.jsonl\n' > .gitignore
+  printf '.claude/.spec-phase\n.claude/.spec-baseline\n.claude/.spec-red\n.claude/.spec-approval*\n.claude/.spec-scaffold\n.claude/.spec-validation\n.claude/spec-journal.md\n.claude/review-log.jsonl\n' > .gitignore
   git add -A >/dev/null 2>&1; git commit -qm init
   export CLAUDE_PROJECT_DIR="$PWD"
   rm -f .git/claude-review-gate
 }
 
-phase() { .claude/hooks/phase.sh "$@" >/dev/null 2>&1; }
+# `phase 5` here is setup, never the thing under test. 4 -> 5 refuses without a
+# recorded validation report, so a bare `phase 5` would otherwise silently leave
+# every Phase 5 test standing in Phase 4 — which is exactly how four of them
+# failed rather than telling us the tripwire worked. The tripwire has its own
+# tests below; this one only needs to arrive.
+phase() {
+  case "${1:-}" in
+    5) .claude/hooks/phase.sh 5 --force >/dev/null 2>&1 ;;
+    *) .claude/hooks/phase.sh "$@" >/dev/null 2>&1 ;;
+  esac
+}
 
 # Build payloads with python3 so command strings with quotes survive intact.
 pl_write() { python3 -c 'import json,sys; print(json.dumps({"tool_name":sys.argv[2],"tool_input":{"file_path":sys.argv[1]}}))' "$1" "${2:-Write}"; }
@@ -2857,6 +2867,103 @@ if [ -f "$MANIFEST" ]; then
   [ "$PNAME" = "spec-gate" ] && ok "and it names itself spec-gate" \
     || bad "plugin.json name is '$PNAME', not spec-gate"
 fi
+
+################################################################################
+# The validation report and the journal. Phase 5 hands the repo's own checks to a
+# reviewer, so a report that exists only in the conversation is one the session
+# after this one cannot hand over — hence a tripwire shaped like the RED one.
+group "4 -> 5 refuses without a recorded validation report"
+setup_repo
+phase start jrnl; phase 2; phase 3; phase 4 --force
+
+.claude/hooks/phase.sh 5 >/dev/null 2>&1 \
+  && bad "4 -> 5 advanced with no validation report on record" \
+  || ok "4 -> 5 refused without a validation report"
+VP=$(sed -n 's/^phase=//p' .claude/.spec-phase | head -1)
+[ "$VP" = 4 ] && ok "and the refusal left the phase at 4" \
+  || bad "refused but the phase moved to '$VP'"
+
+printf 'Commands: make test\nSource: the Makefile\nResult: pass\nNot covered: types\n' \
+  | .claude/hooks/phase.sh validation >/dev/null 2>&1 \
+  && ok "phase.sh validation records the report" \
+  || bad "phase.sh validation failed inside Phase 4"
+[ -f .claude/.spec-validation ] && ok "and writes the marker" \
+  || bad "no .spec-validation marker was written"
+grep -q 'VALIDATION REPORT' .claude/spec-journal.md 2>/dev/null \
+  && ok "and the report lands in the journal" \
+  || bad "the journal has no VALIDATION REPORT entry"
+grep -q 'make test' .claude/spec-journal.md 2>/dev/null \
+  && ok "with the body it was handed" || bad "the journal entry lost its body"
+
+.claude/hooks/phase.sh 5 >/dev/null 2>&1 \
+  && ok "4 -> 5 goes through once the report is recorded" \
+  || bad "4 -> 5 still refused with a report on record"
+
+# The marker is spent by the phase it described, exactly like the RED receipt.
+[ -f .claude/.spec-validation ] \
+  && bad "the validation marker survived the phase change" \
+  || ok "the marker is cleared by the phase change"
+phase 4 --force
+.claude/hooks/phase.sh 5 >/dev/null 2>&1 \
+  && bad "a second 4 -> 5 rode the earlier report" \
+  || ok "a retreat into 4 cannot ride the earlier report"
+grep -q 'VALIDATION REPORT' .claude/spec-journal.md 2>/dev/null \
+  && ok "the journal itself survives a phase change" \
+  || bad "the journal was cleared by a phase change"
+
+phase 2
+printf 'x\n' | .claude/hooks/phase.sh validation >/dev/null 2>&1 \
+  && bad "a validation report was accepted outside Phase 4" \
+  || ok "phase.sh validation is refused outside Phase 4"
+
+group "phase.sh brief — handing the task back to a session that lost it"
+setup_repo
+BOUT=$(.claude/hooks/phase.sh brief 2>&1)
+[ -z "$BOUT" ] && ok "brief says nothing at all when no task is armed" \
+  || bad "brief spoke with no task armed: '$BOUT'"
+
+phase start resumable
+printf '# spec\n' > docs/specs/resumable.md
+BOUT=$(.claude/hooks/phase.sh brief 2>&1)
+printf '%s' "$BOUT" | grep -q 'ACTIVE spec-driven task' \
+  && ok "brief announces an active task" || bad "brief did not announce the task"
+printf '%s' "$BOUT" | grep -q 'resumable' \
+  && ok "and names it" || bad "brief did not name the task"
+printf '%s' "$BOUT" | grep -q 'docs/specs/resumable.md' \
+  && ok "and points at the spec" || bad "brief did not point at the spec"
+printf '%s' "$BOUT" | grep -q 'did NOT survive' \
+  && ok "and says the reviewer sessions did not survive" \
+  || bad "brief did not say the reviewer sessions are gone"
+
+# A spec that is not there is named as missing rather than quietly printed as a
+# path, because the path alone reads as a file the resuming session can open.
+rm -f docs/specs/resumable.md
+# Captured first, never piped straight into grep -q: this file runs under
+# pipefail, and grep -q exits on the first match, which SIGPIPEs the command
+# feeding it. The pipeline then reports 141 and the assertion fails while the
+# text it was looking for is sitting right there in the output.
+BOUT=$(.claude/hooks/phase.sh brief 2>&1)
+printf '%s' "$BOUT" | grep -q 'NOT FOUND' \
+  && ok "a missing spec is called out as missing" \
+  || bad "brief was quiet about a spec that is not there"
+printf '# spec\n' > docs/specs/resumable.md
+
+printf 'declined finding 2, the scale was 200 rows\n' \
+  | .claude/hooks/phase.sh journal >/dev/null 2>&1
+BOUT=$(.claude/hooks/phase.sh brief 2>&1)
+printf '%s' "$BOUT" | grep -q 'declined finding 2' \
+  && ok "the journal reaches the briefing" \
+  || bad "brief did not surface the journal"
+
+# A new task inheriting the last one's findings is a briefing that lies.
+phase start another
+[ -s .claude/spec-journal.md ] \
+  && bad "a new task inherited the previous task's journal" \
+  || ok "start clears the journal"
+printf 'x\n' | .claude/hooks/phase.sh journal >/dev/null 2>&1
+phase off
+[ -f .claude/spec-journal.md ] \
+  && bad "off left the journal behind" || ok "off clears the journal"
 
 ################################################################################
 printf '\n%s%d passed, %d failed%s\n' "$B" "$PASS" "$FAIL" "$N"

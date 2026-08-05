@@ -9,7 +9,8 @@
 #
 # Install: .claude/hooks/phase.sh  (chmod +x), or via the spec-gate-install skill
 # Add .claude/.spec-phase, .claude/.spec-baseline, .claude/.spec-red,
-# .claude/.spec-approval* and .claude/.spec-scaffold to .gitignore
+# .claude/.spec-approval*, .claude/.spec-scaffold, .claude/.spec-validation
+# and .claude/spec-journal.md to .gitignore
 
 set -uo pipefail
 
@@ -26,6 +27,8 @@ BASELINE="$STATE_DIR/.spec-baseline"
 RECEIPT="$STATE_DIR/.spec-red"
 APPROVAL="$STATE_DIR/.spec-approval"
 SCAFFOLD="$STATE_DIR/.spec-scaffold"
+VALIDATION="$STATE_DIR/.spec-validation"
+JOURNAL="$STATE_DIR/spec-journal.md"
 TEST_CMD_FILE="$STATE_DIR/spec-gate-test-cmd"
 
 # tree_snapshot comes from phase-policy.sh, shared with review-gate.sh so the
@@ -246,6 +249,58 @@ red_tripwire() {
   esac
 }
 
+# --- The journal --------------------------------------------------------------
+# Almost everything this workflow produces already survives a lost session: the
+# phase is in the state file, the spec and the plan are on disk, every reviewer
+# verdict is in review-log.jsonl, and what shipped is in git. Exactly three
+# things were only ever said out loud — the validation report, which findings
+# were acted on and which were declined, and how far through the plan Execute
+# had got. Those are what a resuming session cannot reconstruct unless they were
+# written down, so this is the whole of what the journal is for.
+#
+# It lives in .claude/ and is gitignored for a reason beyond tidiness. The review
+# gate collects what is owed from `git diff HEAD` and `git status --porcelain`,
+# so a journal kept in the spec — or anywhere else tracked — would dirty the tree
+# every time it was written, re-arm the gate, and demand a review round whose
+# only finding would be the entry describing the previous one.
+journal_append() {
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 1
+  JP=$(sed -n 's/^phase=//p' "$STATE" 2>/dev/null | head -1)
+  { printf '\n## %s — phase %s, slice %s/%s%s\n\n' \
+      "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "${JP:-?}" \
+      "$(slice_current)" "$(slice_total)" "${1:+ — $1}"
+    cat
+    printf '\n'
+  } >> "$JOURNAL"
+}
+
+# 0 = go ahead, 1 = refuse. Consulted by `phase.sh 5`.
+#
+# The mirror of red_tripwire, for the mirror reason. Phase 4 cannot exit without
+# the repo's own checks passing, and Phase 5's first act is handing that report
+# to a reviewer — so a report that exists only in the conversation is one the
+# next session cannot hand over and nobody can check was ever run. The marker is
+# cleared by every phase change, exactly like the RED receipt, so it can only
+# describe the Phase 4 that just ended.
+validation_tripwire() {
+  cur=$(sed -n 's/^phase=//p' "$STATE" | head -1)
+  [ "$cur" = "4" ] || return 0          # only 4 -> 5 asserts a report
+  [ -f "$VALIDATION" ] && return 0
+  echo "spec-driven: REFUSED — no validation report on record for this Phase 4."
+  echo "  Phase 5 hands the repo's own checks to the reviewer. A report that"
+  echo "  exists only in this conversation cannot be handed over by the session"
+  echo "  that resumes after this one, and nobody can check it was ever run."
+  echo "  Run what this repo gates on, then record it:"
+  echo "    phase.sh validation <<'EOF'"
+  echo "    Commands: <exactly what you ran>"
+  echo "    Source:   <where you got them>"
+  echo "    Result:   <per command: pass, plus its summary line>"
+  echo "    Not covered: <what this repo does not check at all>"
+  echo "    EOF"
+  echo "  Override with: phase.sh 5 --force"
+  return 1
+}
+
 # review_pending_paths now lives in phase-policy.sh — phase-guard.sh gates the
 # 5 -> 3 slice boundary on it, and the two layers have to agree on what is owed.
 # It is still reported by `status` and `off` here, because the surprising part of
@@ -394,7 +449,10 @@ case "${1:-status}" in
     # A newline in the task name would inject extra lines into the state file.
     T=$(printf '%s' "${2:-unnamed}" | tr -d '\n\r')
     write_state 1 "$T" "1/1"
-    rm -f "$RECEIPT" "$APPROVAL" "$SCAFFOLD"
+    # The journal goes too: a new task inheriting the last one's validation report
+    # and findings is a briefing that lies, and it lies most convincingly to the
+    # session that was not here for either task.
+    rm -f "$RECEIPT" "$APPROVAL" "$SCAFFOLD" "$VALIDATION" "$JOURNAL"
     snapshot_baseline
     echo "spec-driven: started '${T}' at phase 1 (Clarify)"
     ;;
@@ -500,6 +558,114 @@ case "${1:-status}" in
     esac
     ;;
 
+  journal)
+    [ -f "$STATE" ] || { echo "spec-driven: not started. Run: phase.sh start <task>" >&2; exit 1; }
+    journal_append "${2:-}" || { echo "spec-driven: could not write $JOURNAL" >&2; exit 1; }
+    echo "spec-driven: recorded in .claude/spec-journal.md"
+    ;;
+
+  validation)
+    [ -f "$STATE" ] || { echo "spec-driven: not started. Run: phase.sh start <task>" >&2; exit 1; }
+    P=$(sed -n 's/^phase=//p' "$STATE" | head -1)
+    if [ "$P" != 4 ]; then
+      echo "spec-driven: the validation report belongs to Phase 4, and you are at $(phase_name "$P")."
+      echo "  It records the repo's own checks passing on the finished plan, which"
+      echo "  is what Phase 4 cannot exit without."
+      exit 1
+    fi
+    journal_append "VALIDATION REPORT" || { echo "spec-driven: could not write $JOURNAL" >&2; exit 1; }
+    T=$(sed -n 's/^task=//p' "$STATE" | head -1)
+    { printf '# spec-gate validation marker — written by phase.sh validation, never by hand\n'
+      printf 'task=%s\nslice=%s/%s\n' "$T" "$(slice_current)" "$(slice_total)"
+    } > "$VALIDATION"
+    echo "spec-driven: validation report recorded — 4 -> 5 is clear."
+    echo "  It is in .claude/spec-journal.md, which is where Phase 5 hands it to the"
+    echo "  reviewer from, and where the next session finds it if this one ends first."
+    ;;
+
+  brief)
+    # The read side of all of the above, and the only command here written to be
+    # run by a hook rather than by a person. SessionStart calls it on startup,
+    # resume, clear and compact, and for those events stdout is added to the
+    # model's context — so it says nothing at all when no task is armed, and stays
+    # bounded when one is. A briefing that grew without limit would spend exactly
+    # the context it exists to save.
+    [ -f "$STATE" ] || exit 0
+    if [ -n "$FOREIGN" ]; then
+      echo "spec-driven: a task is armed in ANOTHER WORKTREE ($FOREIGN), not this one."
+      echo "  Run 'phase.sh status' before writing anything you expect the gate to see."
+      exit 0
+    fi
+    BP=$(sed -n 's/^phase=//p' "$STATE" | head -1)
+    BT=$(sed -n 's/^task=//p' "$STATE" | head -1)
+    echo "spec-driven: this repo has an ACTIVE spec-driven task."
+    echo "You did not start this conversation with it, so everything below was read"
+    echo "off disk rather than remembered. Treat it as the state of the work."
+    echo
+    echo "  task:  ${BT:-unnamed}"
+    echo "  phase: $(phase_name "$BP")"
+    [ "$(slice_total)" -gt 1 ] && echo "  slice: $(slice_current) of $(slice_total)"
+    if [ -n "$BT" ] && [ -f "$PROJECT_DIR/docs/specs/$BT.md" ]; then
+      echo "  spec:  docs/specs/$BT.md"
+    else
+      echo "  spec:  docs/specs/${BT:-<task>}.md — NOT FOUND; find it before trusting the rest"
+    fi
+    # Each of these is reported only where it bears on the next move. "RED: not
+    # verified" at Phase 1 is true, useless, and trains the reader to skim the
+    # lines that are not.
+    case "$BP" in
+      3|4|5)
+        case "$(red_receipt_status)" in
+          valid) echo "  RED:   verified" ;;
+          stale) echo "  RED:   receipt STALE — the tests changed since; re-run 'phase.sh red'" ;;
+          *)     echo "  RED:   not verified" ;;
+        esac ;;
+    esac
+    case "$BP" in
+      4|5)
+        if [ -f "$VALIDATION" ]; then
+          echo "  checks: a validation report is recorded for this Phase 4"
+        else
+          echo "  checks: none recorded — 4 -> 5 will refuse until 'phase.sh validation' runs"
+        fi ;;
+    esac
+    for g in $(gate_list); do
+      A=$(approval_status "$g")
+      case "$A" in
+        none|stale|unverifiable) ;;
+        *) echo "  answered: the user has already answered the '$g' gate: $A" ;;
+      esac
+    done
+    echo
+    # Where Execute got to is the one part of "where was I" that git answers
+    # better than any journal, so it is read live rather than recorded.
+    N=$( (cd "$PROJECT_DIR" 2>/dev/null && git status --porcelain 2>/dev/null) | wc -l | tr -d ' ')
+    if [ "${N:-0}" != 0 ]; then
+      echo "Uncommitted right now — $N path(s), first 10:"
+      (cd "$PROJECT_DIR" 2>/dev/null && git status --porcelain 2>/dev/null) | head -10 | sed 's/^/  /'
+      echo
+    fi
+    if [ -s "$JOURNAL" ]; then
+      echo "Journal tail — .claude/spec-journal.md, read it in full before deciding anything:"
+      tail -40 "$JOURNAL" | sed 's/^/  /'
+      echo
+    else
+      echo "Journal: empty. Nothing has been recorded for this task yet."
+      echo
+    fi
+    if [ -s "$STATE_DIR/review-log.jsonl" ] && command -v jq >/dev/null 2>&1; then
+      echo "Reviewer verdicts already on record, oldest first:"
+      tail -5 "$STATE_DIR/review-log.jsonl" \
+        | jq -r '"  \(.t) \(.agent): \(((.msg // "") | split("\n") | map(select(length > 0)) | first // "")[0:160])"' \
+          2>/dev/null
+      echo
+    fi
+    echo "Your reviewer sessions did NOT survive. Spawn fresh ones and record in the"
+    echo "evidence log that the round started cold — a reviewer that has forgotten its"
+    echo "own findings cannot tell you whether a fix landed."
+    echo "Then run 'phase.sh status' for what you may write and who owns the next move."
+    ;;
+
   1|2|3|4|5)
     [ -f "$STATE" ] || { echo "spec-driven: not started. Run: phase.sh start <task>"; exit 1; }
     if [ "$1" = 4 ]; then
@@ -508,6 +674,14 @@ case "${1:-status}" in
           echo "spec-driven: --force — skipping the RED tripwire on your assertion." ;;
         *)
           red_tripwire || exit 1 ;;
+      esac
+    fi
+    if [ "$1" = 5 ]; then
+      case "${2:-}" in
+        --force)
+          echo "spec-driven: --force — advancing with no validation report recorded." ;;
+        *)
+          validation_tripwire || exit 1 ;;
       esac
     fi
     T=$(sed -n 's/^task=//p' "$STATE" | head -1)
@@ -531,7 +705,11 @@ case "${1:-status}" in
     # one phase and spent in it. It is also pinned to the phase it was answered
     # in, so this delete is the second of two locks — cheap, and the kind of
     # redundancy worth having on the file that says the user said yes.
-    rm -f "$RECEIPT" "$APPROVAL" "$SCAFFOLD"
+    # The validation marker rides with the RED receipt for the same reason: it
+    # describes one Phase 4, and every phase change ends that Phase 4 — including
+    # a retreat back into it. The journal itself survives; it is the history, and
+    # the history is what a resuming session has instead of a memory.
+    rm -f "$RECEIPT" "$APPROVAL" "$SCAFFOLD" "$VALIDATION"
     snapshot_baseline
     echo "spec-driven: -> $(phase_name "$1")"
     if [ "$ADVANCED" = 1 ]; then
@@ -540,7 +718,7 @@ case "${1:-status}" in
     ;;
 
   off)
-    rm -f "$STATE" "$BASELINE" "$RECEIPT" "$APPROVAL" "$SCAFFOLD"
+    rm -f "$STATE" "$BASELINE" "$RECEIPT" "$APPROVAL" "$SCAFFOLD" "$VALIDATION" "$JOURNAL"
     echo "spec-driven: phase gate off"
     echo "  This ends the phase workflow. It does not stop review — with no phase"
     echo "  file the Stop gate returns to its default and runs EVERY turn."
@@ -548,12 +726,20 @@ case "${1:-status}" in
     ;;
 
   *)
-    echo "usage: phase.sh [status | start <task> | ask <gate> | red | scaffold | slices <n> | 1..5 | off]"
+    echo "usage: phase.sh [status | brief | start <task> | ask <gate> | red | scaffold |"
+    echo "                slices <n> | journal | validation | 1..5 | off]"
     echo "       phase.sh ask <gate>  print the question for a gate as an"
     echo "                            AskUserQuestion payload: spec | red | close-out"
     echo "       phase.sh red         run the Phase 3 tests and record RED if they fail"
     echo "       phase.sh slices <n>  set how many slices this task lands in"
+    echo "       phase.sh brief       reconstruct the task from disk, for a session"
+    echo "                            that has lost it — run by the SessionStart hook"
+    echo "       phase.sh journal [label] < entry"
+    echo "                            append a stamped entry to .claude/spec-journal.md"
+    echo "       phase.sh validation < report"
+    echo "                            record the Phase 4 validation report; 4 -> 5 needs it"
     echo "       phase.sh 4 --force   advance without the RED check"
+    echo "       phase.sh 5 --force   advance without a recorded validation report"
     exit 1
     ;;
 esac

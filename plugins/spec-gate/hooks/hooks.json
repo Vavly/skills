@@ -1,6 +1,18 @@
 {
-  "description": "The spec-gate enforcement wiring. Five registrations: a PreToolUse guard that blocks writes the current phase does not allow, a Stop gate that refuses to end a turn on an unreviewed diff, a PostToolUse receipt that records the user's approval answers, and a SubagentStart/Stop bookmark that tracks what each reviewer session has already seen. Paths resolve through ${CLAUDE_PLUGIN_ROOT}; all state stays in the target repo under $CLAUDE_PROJECT_DIR/.claude/.",
+  "description": "The spec-gate enforcement wiring. Six registrations: a PreToolUse guard that blocks writes the current phase does not allow, a Stop gate that refuses to end a turn on an unreviewed diff, a PostToolUse receipt that records the user's approval answers, a SubagentStart/Stop bookmark that tracks what each reviewer session has already seen, and a SessionStart brief that hands an active task back to a session which has lost it — on startup, resume, /clear and after compaction. Paths resolve through ${CLAUDE_PLUGIN_ROOT}; all state stays in the target repo under $CLAUDE_PROJECT_DIR/.claude/.",
   "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/phase.sh\" brief",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Edit|Write|NotebookEdit|Bash",

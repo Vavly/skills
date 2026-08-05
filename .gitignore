@@ -2,4 +2,6 @@
 .claude/.spec-phase
 .claude/.spec-baseline
 .claude/.spec-red
+.claude/.spec-validation
+.claude/spec-journal.md
 .claude/review-log.jsonl
