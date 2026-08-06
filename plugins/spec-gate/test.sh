@@ -456,7 +456,13 @@ fi
 
 # The hook's `ask` is not documented to survive bypassPermissions, so
 # settings.json must carry an explicit ask rule for both approval gates.
-for t in 3 4 off; do
+#
+# Every command that widens what may be written belongs here, not just the two
+# numbered transitions: `scaffold` opens Phase 2 to new files, and `5 --force`
+# enters review with the repo's checks unrun. Both were added to settings.json
+# without this loop noticing, which is how `5 --force` shipped gated by a
+# permission rule alone while every comparable override had a receipt gate.
+for t in scaffold 3 4 "5 --force" off; do
   if python3 -c '
 import json,sys
 d=json.load(open(".claude/settings.json"))
@@ -465,6 +471,23 @@ sys.exit(0 if any("phase.sh "+sys.argv[1] in r for r in rules) else 1)' "$t" 2>/
     ok "settings.json ask rule for phase.sh $t covers bypassPermissions"
   else
     bad "settings.json has no permissions.ask rule for phase.sh $t"
+  fi
+  # settings.json is what a manual install copies and the README block is what a
+  # human retypes under a plugin install, where settings.json is not read at all.
+  # A rule in one and not the other is a gate that exists for half its users.
+  if grep -qF "phase.sh $t" "$SRC/README.md"; then
+    ok "and the README's permissions.ask block lists phase.sh $t"
+  else
+    bad "the README permissions.ask block is missing phase.sh $t"
+  fi
+  # The third copy, and the one that decides what real installs actually get:
+  # spec-gate-install writes this array into the target repo. It was missing
+  # `scaffold` while settings.json had it, so every installed repo was a rule
+  # short of the shipped default.
+  if grep -qF "phase.sh $t" "$SRC/skills/spec-gate-install/SKILL.md"; then
+    ok "and the install skill writes an ask rule for phase.sh $t"
+  else
+    bad "the install skill's permissions.ask block is missing phase.sh $t"
   fi
 done
 
@@ -2267,11 +2290,29 @@ fi
 # The install block in the README is the only thing that puts it there, so the
 # fixture and the docs have to agree or this test proves nothing about a real
 # install.
-for n in .spec-phase .spec-baseline .spec-red .spec-approval; do
+for n in .spec-phase .spec-baseline .spec-red .spec-approval .spec-scaffold \
+         .spec-validation spec-journal.md review-log.jsonl; do
   if grep -qF "$n" .gitignore && grep -qF "$n" "$SRC/README.md"; then
     ok "$n is gitignored by the documented install"
   else
     bad "$n is missing from .gitignore or from the README install block"
+  fi
+  # The install skill is the third copy of this list and the one users actually
+  # run, so it has to carry every name too. Two of these were added to the
+  # fixture and the README and missed here, which is the drift this catches.
+  if grep -qF "$n" "$SRC/skills/spec-gate-install/SKILL.md"; then
+    ok "$n is in the install skill's .gitignore block"
+  else
+    bad "$n is missing from the install skill's .gitignore block"
+  fi
+  # And this repo's own .gitignore, which is not a copy of the docs but a real
+  # install of them. It shipped without .spec-scaffold for two releases: the
+  # gate then treats its own untracked state as work owed review, arms on it,
+  # and cannot be cleared by any commit because the path is ignored by design.
+  if grep -qF "$n" "$SRC/../../.gitignore"; then
+    ok "$n is gitignored in spec-gate's own repository"
+  else
+    bad "$n is missing from this repository's .gitignore — the gate will arm on it"
   fi
 done
 
@@ -2916,6 +2957,166 @@ printf 'x\n' | .claude/hooks/phase.sh validation >/dev/null 2>&1 \
   && bad "a validation report was accepted outside Phase 4" \
   || ok "phase.sh validation is refused outside Phase 4"
 
+################################################################################
+# The validation marker is what 4 -> 5 rests on, so it is state in the sense that
+# .spec-red is state: everything that keeps the model away from the RED receipt
+# has to keep it away from this one, or the gate is a suggestion.
+group "the validation marker is phase state, not the model's to write"
+setup_repo
+phase start vstate; phase 2; phase 3; phase 4 --force
+
+expect_w "Write to the validation marker denied"  DENY  .claude/.spec-validation
+expect_w "Edit to it denied too"                  DENY  .claude/.spec-validation Edit
+expect_b "forging the marker from bash denied"    DENY  'printf x > .claude/.spec-validation'
+expect_b "and removing it is denied"              DENY  'rm -f .claude/.spec-validation'
+# The command that legitimately writes it must still get through, or the only
+# way past the gate is the override.
+expect_b "phase.sh validation is still allowed"   ALLOW '.claude/hooks/phase.sh validation'
+
+# An empty report used to write the marker and clear 4 -> 5, which is the gate
+# certifying that nothing was run — a receipt worse than no receipt, because the
+# next session reads it as evidence and stops asking.
+printf '' | .claude/hooks/phase.sh validation >/dev/null 2>&1 \
+  && bad "an empty validation report was accepted" \
+  || ok "an empty validation report is refused"
+[ -f .claude/.spec-validation ] \
+  && bad "the empty report still wrote the marker" \
+  || ok "and it wrote no marker"
+printf '   \n\n  \n' | .claude/hooks/phase.sh validation >/dev/null 2>&1 \
+  && bad "a whitespace-only validation report was accepted" \
+  || ok "a whitespace-only report is refused too"
+.claude/hooks/phase.sh 5 >/dev/null 2>&1 \
+  && bad "4 -> 5 cleared on a refused report" \
+  || ok "4 -> 5 still refuses after a refused report"
+# Same rule for the journal: a stamped header with nothing under it reads as an
+# entry describing work that happened.
+printf '' | .claude/hooks/phase.sh journal >/dev/null 2>&1 \
+  && bad "an empty journal entry was accepted" \
+  || ok "an empty journal entry is refused"
+
+# The marker records the task and slice it was written for. Those fields existed
+# from the start and nothing read them, so a report survived a re-slice that
+# redrew the scope it was describing.
+group "a validation report is pinned to the slice it was written for"
+setup_repo
+phase start vpin; phase 2; phase 3; phase 4 --force
+.claude/hooks/phase.sh slices 2 >/dev/null 2>&1
+printf 'Commands: make test\nResult: pass\n' \
+  | .claude/hooks/phase.sh validation >/dev/null 2>&1
+grep -q '^slice=1/2$' .claude/.spec-validation \
+  && ok "the marker records the slice it was written on" \
+  || bad "the marker does not carry the slice: $(cat .claude/.spec-validation)"
+.claude/hooks/phase.sh slices 3 >/dev/null 2>&1
+.claude/hooks/phase.sh 5 >/dev/null 2>&1 \
+  && bad "a report written for slice 1/2 cleared 4 -> 5 after a re-slice" \
+  || ok "re-slicing voids a report written against the old shape"
+VOUT=$(.claude/hooks/phase.sh 5 2>&1)
+printf '%s' "$VOUT" | grep -q 'different point in this task' \
+  && ok "and the refusal says why rather than claiming none was recorded" \
+  || bad "the stale-report refusal is indistinguishable from a missing one"
+
+################################################################################
+# 5 --force and 4 --force are spelled the same and skip different checks. One
+# question standing for both meant an answer about unlocking production code was
+# redeemable for entering review unvalidated, and vice versa.
+group "5 --force has its own gate, not the RED one"
+setup_repo
+phase start vforce; phase 2; phase 3; phase 4 --force
+
+expect_b "5 --force is denied until the user is asked" \
+  DENY '.claude/hooks/phase.sh 5 --force'
+FR=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh 5 --force')")
+printf '%s' "$FR" | grep -qi 'phase 5' \
+  && ok "and the reason names Phase 5, not Phase 4" \
+  || bad "the 5 --force reason does not mention Phase 5: '$FR'"
+printf '%s' "$FR" | grep -qi 'force-validation' \
+  && ok "and points at the force-validation gate" \
+  || bad "the 5 --force reason does not name its gate: '$FR'"
+
+# The load-bearing half: the two gates do not redeem each other. Before they were
+# split, this answer allowed the transition below — the user having been asked
+# about unlocking production code, and that answer spent on entering review with
+# the checks unrun.
+answer force 'Unlock without RED'
+expect_b "an answer to the RED force gate does not clear 5 --force" \
+  DENY '.claude/hooks/phase.sh 5 --force'
+answer force-validation 'Review it unvalidated'
+expect_b "its own answer does clear it" \
+  ALLOW '.claude/hooks/phase.sh 5 --force'
+
+setup_repo
+phase start vforce2; phase 2; phase 3
+answer force-validation 'Review it unvalidated'
+expect_b "and does not clear 4 --force in exchange" \
+  DENY '.claude/hooks/phase.sh 4 --force'
+answer force-validation 'Run the checks first'
+setup_repo; phase start vforce3; phase 2; phase 3; phase 4 --force
+answer force-validation 'Run the checks first'
+expect_b "declining force-validation denies rather than asks again" \
+  DENY '.claude/hooks/phase.sh 5 --force'
+
+################################################################################
+# An untracked state file counts as work owed review, so a name the install
+# forgot to gitignore arms the gate on the gate's own bookkeeping — and nothing
+# clears it, because the path is meant to be ignored and cannot be committed.
+group "the gate does not arm on its own state files"
+setup_repo
+# Deliberately the pre-fix .gitignore: this is the install that shipped, and the
+# exclusion has to hold without it.
+printf '.claude/.spec-phase\n.claude/.spec-baseline\n.claude/.spec-red\n' > .gitignore
+git add -A >/dev/null 2>&1; git commit -qm base >/dev/null 2>&1
+phase start vexcl; phase 2
+
+# Each marker is checked at a phase where it is actually on disk. Every
+# transition deletes most of them, so a single checkpoint at the end would be
+# asserting that files which no longer exist are not listed — which passes
+# whatever the exclusion list says, and proves nothing.
+printf 'the spec\n' > docs/specs/vexcl.md
+answer spec 'Approve the spec'
+.claude/hooks/phase.sh scaffold >/dev/null 2>&1
+printf 'a note\n' | .claude/hooks/phase.sh journal >/dev/null 2>&1
+printf '{"t":"now","agent":"adversary","msg":"x"}\n' > .claude/review-log.jsonl
+for n in .spec-scaffold .spec-approval spec-journal.md review-log.jsonl; do
+  [ -e ".claude/$n" ] && ok "$n exists, so the pending check below is not vacuous" \
+    || bad "$n was never created — the check below would pass on nothing"
+done
+# review_pending_paths is what the Stop gate and the 5 -> 3 boundary both read,
+# so it is asked directly rather than through a command that summarises it.
+PEND=$( . "$SRC/hooks/phase-policy.sh"; PROJECT_DIR="$PWD" review_pending_paths )
+for n in .spec-scaffold .spec-approval spec-journal.md review-log.jsonl; do
+  printf '%s' "$PEND" | grep -q "$n" \
+    && bad "$n is owed review — the gate armed on its own bookkeeping" \
+    || ok "$n does not arm the review gate even when ungitignored"
+done
+
+phase 3; phase 4 --force
+printf 'Commands: make test\nResult: pass\n' \
+  | .claude/hooks/phase.sh validation >/dev/null 2>&1
+[ -e .claude/.spec-validation ] && ok ".spec-validation exists, so the check below is not vacuous" \
+  || bad ".spec-validation was never created"
+PEND=$( . "$SRC/hooks/phase-policy.sh"; PROJECT_DIR="$PWD" review_pending_paths )
+printf '%s' "$PEND" | grep -q '.spec-validation' \
+  && bad ".spec-validation is owed review" \
+  || ok ".spec-validation does not arm the review gate even when ungitignored"
+
+# The other side of the same coin, and the reason this is a list of exact names
+# rather than a hole in .claude/: ordinary files there are still work.
+printf 'x\n' > .claude/settings-note.txt
+PEND=$( . "$SRC/hooks/phase-policy.sh"; PROJECT_DIR="$PWD" review_pending_paths )
+printf '%s' "$PEND" | grep -q 'settings-note.txt' \
+  && ok "and an ordinary untracked file in .claude/ is still owed review" \
+  || bad "the exclusion swallowed a file that is not the gate's own state"
+rm -f .claude/settings-note.txt
+
+# End to end, through the hook that actually ends turns: with nothing dirty but
+# the gate's own state, Phase 5 must let the turn finish. This is the failure
+# that has no exit — those paths are gitignored by design, so there is no commit
+# a human can make to satisfy a gate that is asking for them.
+phase 5
+expect_gate "the Stop gate is quiet when only the gate's own state is dirty" 0
+printf 'real work\n' > src/x.ts
+expect_gate "and still blocks on actual work" 2
+
 group "phase.sh brief — handing the task back to a session that lost it"
 setup_repo
 BOUT=$(.claude/hooks/phase.sh brief 2>&1)
@@ -2929,11 +3130,27 @@ printf '%s' "$BOUT" | grep -q 'ACTIVE spec-driven task' \
   && ok "brief announces an active task" || bad "brief did not announce the task"
 printf '%s' "$BOUT" | grep -q 'resumable' \
   && ok "and names it" || bad "brief did not name the task"
-printf '%s' "$BOUT" | grep -q 'docs/specs/resumable.md' \
-  && ok "and points at the spec" || bad "brief did not point at the spec"
+
+# Every line below is asserted where it can be true and asserted ABSENT where it
+# cannot. The negative half is the half that matters: each of these lines was
+# once printed unconditionally, and a briefing that reports "RED: not verified"
+# at a phase that deletes the RED receipt is not merely noisy — it tells a
+# resuming session that verified work is unverified, which is the one failure a
+# briefing cannot survive.
+printf '%s' "$BOUT" | grep -q 'NOT FOUND' \
+  && bad "brief called the spec missing at Phase 1, where writing it is still Phase 2's job" \
+  || ok "no missing-spec warning at Phase 1, where there is not meant to be one"
 printf '%s' "$BOUT" | grep -q 'did NOT survive' \
-  && ok "and says the reviewer sessions did not survive" \
-  || bad "brief did not say the reviewer sessions are gone"
+  && bad "brief warned about lost reviewer sessions at Phase 1, before any exist" \
+  || ok "no reviewer-session warning at Phase 1"
+printf '%s' "$BOUT" | grep -q 'RED:' \
+  && bad "brief reported RED status at Phase 1" || ok "no RED line at Phase 1"
+
+phase 2
+BOUT=$(.claude/hooks/phase.sh brief 2>&1)
+printf '%s' "$BOUT" | grep -q 'docs/specs/resumable.md' \
+  && ok "and points at the spec once Phase 2 owns one" \
+  || bad "brief did not point at the spec"
 
 # A spec that is not there is named as missing rather than quietly printed as a
 # path, because the path alone reads as a file the resuming session can open.
@@ -2948,12 +3165,45 @@ printf '%s' "$BOUT" | grep -q 'NOT FOUND' \
   || bad "brief was quiet about a spec that is not there"
 printf '# spec\n' > docs/specs/resumable.md
 
+# Phase 3 is the only phase where the RED receipt can still exist: every
+# transition deletes it, so at 4 and 5 the line could only ever read "not
+# verified" whatever actually happened.
+phase 3
+BOUT=$(.claude/hooks/phase.sh brief 2>&1)
+printf '%s' "$BOUT" | grep -q 'RED:' \
+  && ok "the RED line appears at Phase 3, where the receipt can be true" \
+  || bad "brief dropped the RED line at Phase 3"
+
+phase 4 --force
+BOUT=$(.claude/hooks/phase.sh brief 2>&1)
+printf '%s' "$BOUT" | grep -q 'RED:' \
+  && bad "brief reported RED at Phase 4, where entering deleted the receipt" \
+  || ok "no RED line at Phase 4, where it could only ever say 'not verified'"
+printf '%s' "$BOUT" | grep -q 'checks:' \
+  && ok "the checks line appears at Phase 4, where the marker can be true" \
+  || bad "brief dropped the checks line at Phase 4"
+
 printf 'declined finding 2, the scale was 200 rows\n' \
   | .claude/hooks/phase.sh journal >/dev/null 2>&1
 BOUT=$(.claude/hooks/phase.sh brief 2>&1)
 printf '%s' "$BOUT" | grep -q 'declined finding 2' \
   && ok "the journal reaches the briefing" \
   || bad "brief did not surface the journal"
+# The journal is the only thing in the briefing the model wrote itself, and the
+# only part that can be confidently wrong. It is labelled as testimony rather
+# than as state, and this asserts the labelling did not quietly go away.
+printf '%s' "$BOUT" | grep -qi 'not verified state' \
+  && ok "and is marked as the previous session's notes, not as verified state" \
+  || bad "the journal is presented without saying it is unverified testimony"
+
+phase 5
+BOUT=$(.claude/hooks/phase.sh brief 2>&1)
+printf '%s' "$BOUT" | grep -q 'did NOT survive' \
+  && ok "the reviewer-session warning appears at Phase 5, where reviewers exist" \
+  || bad "brief did not say the reviewer sessions are gone at Phase 5"
+printf '%s' "$BOUT" | grep -q 'checks:' \
+  && bad "brief reported checks at Phase 5, where entering deleted the marker" \
+  || ok "no checks line at Phase 5, where it could only ever say 'none recorded'"
 
 # A new task inheriting the last one's findings is a briefing that lies.
 phase start another

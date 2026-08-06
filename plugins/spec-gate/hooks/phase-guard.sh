@@ -399,8 +399,8 @@ fi
 # phase state through `phase.sh status`, never through the file.
 if [ -n "$CMD" ]; then
   case "$CMD" in
-    *.spec-phase*|*.spec-baseline*|*.spec-red*|*.spec-approval*|*.spec-scaffold*)
-      deny "The phase state is not yours to edit, move or remove — .spec-red and .spec-approval included, because a receipt you could write by hand would assert RED without running anything, or record an approval the user never gave. Change phases with phase.sh <n>, verify RED with phase.sh red, ask the user with phase.sh ask <gate>, and read the current phase with phase.sh status." ;;
+    *.spec-phase*|*.spec-baseline*|*.spec-red*|*.spec-approval*|*.spec-scaffold*|*.spec-validation*)
+      deny "The phase state is not yours to edit, move or remove — .spec-red, .spec-approval and .spec-validation included, because a receipt you could write by hand would assert RED without running anything, record an approval the user never gave, or claim this repo's checks passed with none of them run. Change phases with phase.sh <n>, verify RED with phase.sh red, record the Phase 4 checks with phase.sh validation, ask the user with phase.sh ask <gate>, and read the current phase with phase.sh status." ;;
   esac
 fi
 if [ -n "$PATHS" ] && is_phase_state "$PATHS"; then
@@ -476,9 +476,21 @@ if [ -n "$CMD" ] && printf '%s' "$CMD" | grep -qE '(^|[^[:alnum:]_.+-])phase\.sh
   # which is why it is the one flag the model may never supply on its own. It is
   # still not the model's: what changed is that the user can now answer for it
   # here instead of leaving the session, and the answer is what allows it.
+  #
+  # Two flags share the spelling and skip different checks at different costs, so
+  # they cannot share a question. `4 --force` unlocks production code with nothing
+  # shown to fail; `5 --force` enters review with the repo's own checks unrun, at
+  # a point where the code is already written. Routing both to the `force` gate
+  # asked the user about unlocking production code in order to decide something
+  # else entirely — and worse, one answer was then redeemable for the other,
+  # since the receipt records the gate and not the transition. ARG is the token
+  # after phase.sh, so it names the destination phase exactly.
   case "$CMD" in
     *--force*)
-      gated_advance force "advancing to Phase 4 with --force, which skips the RED check entirely and unlocks production code without anything having been shown to fail" ;;
+      case "$ARG" in
+        5) gated_advance force-validation "advancing to Phase 5 with --force, which enters adversarial review with no record that this repo's own build, lint or test commands were ever run against the finished work" ;;
+        *) gated_advance force "advancing to Phase 4 with --force, which skips the RED check entirely and unlocks production code without anything having been shown to fail" ;;
+      esac ;;
   esac
 
   case "$ARG" in

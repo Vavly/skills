@@ -145,7 +145,7 @@ Then, from the root of **each** repo you want gated:
 **The plugin installs once; that command runs per project.** Everything the gate
 keeps — the spec, the slice position, the phase, the approvals — is per repo, so
 a central install cannot carry any of it. `spec-gate-install` writes the shim,
-creates `docs/specs/`, adds the five `.gitignore` entries, merges
+creates `docs/specs/`, adds the eight `.gitignore` entries, merges
 `permissions.ask` into any existing `.claude/settings.json`, and works out the
 RED test command from what the repo already has rather than asking cold. It is
 idempotent, and it is also the repair step after a plugin update.
@@ -155,24 +155,27 @@ plugin install used to end up with phase state on disk and no `phase.sh` to read
 it.
 
 **A plugin install cannot carry `permissions.ask`**, and that is a real gap, not a
-detail. The three entries in `settings.json` are what make the agent stop and ask
-before it runs `phase.sh 3`, `4`, or `off` on its own — without them the phase is
-still enforced, but the agent can advance itself through it. There is no plugin
-equivalent, so add them to the target repo's `.claude/settings.json` by hand:
+detail. The five entries in `settings.json` are what make the agent stop and ask
+before it runs `phase.sh scaffold`, `3`, `4`, `5 --force`, or `off` on its own —
+without them the phase is still enforced, but the agent can advance itself
+through it. There is no plugin equivalent, so add them to the target repo's
+`.claude/settings.json` by hand:
 
 ```json
 {
   "permissions": {
     "ask": [
+      "Bash(.claude/hooks/phase.sh scaffold*)",
       "Bash(.claude/hooks/phase.sh 3*)",
       "Bash(.claude/hooks/phase.sh 4*)",
+      "Bash(.claude/hooks/phase.sh 5 --force*)",
       "Bash(.claude/hooks/phase.sh off*)"
     ]
   }
 }
 ```
 
-**Those three rules match a literal path, and under a plugin install it is the
+**Those five rules match a literal path, and under a plugin install it is the
 wrong one.** A plugin install has no `.claude/hooks/`, so the skills resolve
 `phase.sh` to the plugin cache — see [Where phase.sh
 lives](#where-phasesh-lives) — and a rule written against `.claude/hooks/…` never
@@ -206,21 +209,21 @@ files as reviewable** — correctly, since new files are usually the actual work
 so leaving `.claude/` uncommitted makes the gate fire on its own tooling.
 
 `settings.json` needs **merging, not copying**, if the target already has one.
-Two top-level keys are involved: the five event keys go inside the single
+Two top-level keys are involved: the six event keys go inside the single
 existing `hooks` object as siblings of whatever is there, and the `permissions.ask`
-entry goes into any existing `permissions` object. Replacing either object
+entries go into any existing `permissions` object. Replacing either object
 wholesale silently drops what was there.
 
 `hooks/hooks.json` is the plugin's copy of that same wiring, differing only in how
 it resolves paths — `${CLAUDE_PLUGIN_ROOT}` instead of `$CLAUDE_PROJECT_DIR`. Two
-copies of the same facts drift, so `test.sh` asserts they register the same five
+copies of the same facts drift, so `test.sh` asserts they register the same six
 events with the same matchers, scripts and timeouts. Change one, change the other.
 
 ### Either way
 
 Hooks are re-read by a file watcher, so no session restart is needed. Confirm
-registration with `/hooks` — all five should appear under `PreToolUse`,
-`PostToolUse`, `Stop`, `SubagentStart`, and `SubagentStop`.
+registration with `/hooks` — all six should appear under `SessionStart`,
+`PreToolUse`, `PostToolUse`, `Stop`, `SubagentStart`, and `SubagentStop`.
 
 ### Central install, per-project state
 
@@ -497,7 +500,7 @@ files depend on, and it is the one worth keeping in step.
 /adversarial-review <ref>     ...against a ref or path you name
 ```
 
-**You never type a path.** That is the whole surface: eight gates, all answered
+**You never type a path.** That is the whole surface: nine gates, all answered
 in-conversation, and nothing that sends you to a shell to run a script. The same
 commands work one-shot from outside a session —
 
@@ -1473,13 +1476,13 @@ you read it.
 
 Builds a throwaway git repo in a temp dir, installs the hooks into it, and drives
 them with synthetic hook payloads. Nothing touches the repo you run it from.
-417 cases: the phase policy, every write vector, the advance-transition matrix,
+742 cases: the phase policy, every write vector, the advance-transition matrix,
 RED verification and the receipt's staleness rules, the approval questions and
 everything the receipt hook refuses to record, fail-closed behavior, the review
 gate with its index-invariance and its between-rounds delta, the slice position
 and its boundary rules, the phase scan with its baseline, every internal link
 in every skill — target file and heading anchor both — and the two install paths,
-which must register the same five events with the same matchers, scripts and
+which must register the same six events with the same matchers, scripts and
 timeouts, since `settings.json` and `hooks/hooks.json` are two copies of one fact.
 
 The approval cases lean hard on the *negative* ones, and that is the point:

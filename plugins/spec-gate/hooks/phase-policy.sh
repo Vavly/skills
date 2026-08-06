@@ -80,9 +80,16 @@ is_gate_config() {
 # .spec-approval is in here for the sharpest version of that reason. It records
 # an answer the *user* gave, and a model that could write it could approve its
 # own spec — which is bug #1 from the review list arriving through a new door.
+#
+# .spec-validation is the same shape as .spec-red one phase later: it is what
+# 4 -> 5 rests on, and a marker the model could touch is a marker that asserts
+# the repo's own checks passed without any of them having run. Note the asymmetry
+# with the journal, which is NOT here — the journal holds prose the model wrote
+# itself, so denying it would protect the model's notes from their own author.
+# What must not be forgeable is the thing a *gate* reads, and that is this file.
 is_phase_state() {
   case "$1" in
-    *.spec-phase|*.spec-baseline|*.spec-red|*.spec-approval|*.spec-scaffold) return 0 ;;
+    *.spec-phase|*.spec-baseline|*.spec-red|*.spec-approval|*.spec-scaffold|*.spec-validation) return 0 ;;
   esac
   return 1
 }
@@ -315,8 +322,32 @@ in_project() {
 # to them rather than replacing them. They are configuration for the gate, not
 # work the gate should judge — and left uncommitted they arm it, so writing a
 # config file would otherwise demand a review of having written a config file.
+#
+# The gate's own state files are excluded on the same terms and for a sharper
+# reason. The documented install gitignores every one of them, which would make
+# this redundant — but a name missing from the target repo's .gitignore is
+# exactly the failure this has to survive, and that is not hypothetical: this
+# repo shipped two releases with .spec-scaffold absent from its own. An
+# untracked state file counts as work owed review, so the gate arms itself on
+# having recorded that it was armed, and nothing clears it: the paths are
+# gitignored-by-intent, so there is no commit a human can make to satisfy the
+# 5 -> 3 boundary or the close-out. Correctness here cannot rest on an install
+# step having been done properly.
+spec_state_list() {
+  printf '%s\n' \
+    '.claude/.spec-phase' \
+    '.claude/.spec-baseline' \
+    '.claude/.spec-red' \
+    '.claude/.spec-approval' \
+    '.claude/.spec-scaffold' \
+    '.claude/.spec-validation' \
+    '.claude/spec-journal.md' \
+    '.claude/review-log.jsonl'
+}
+
 review_exclude_list() {
   gate_config_list
+  spec_state_list
 
   f="${PROJECT_DIR%/}/.claude/spec-gate-review-exclude"
   if [ -r "$f" ]; then
@@ -619,7 +650,7 @@ write_review_marker() {   # $1 = fingerprint text
 # missing from any one of them is a question whose answer nothing redeems, which
 # looks exactly like a user who was never asked. Adding a gate means adding it
 # here and nowhere else.
-gate_list() { printf 'spec red close-out skip abandon leave-review restart force\n'; }
+gate_list() { printf 'spec red close-out skip abandon leave-review restart force force-validation\n'; }
 
 # The last five replaced a terminal. They existed as "go run this in your own
 # shell" for one stated reason: a PreToolUse hook cannot tell a Bash call the
@@ -642,6 +673,7 @@ gate_header() {
     leave-review) printf 'Leave review' ;;
     restart)      printf 'Discard task' ;;
     force)        printf 'Force unlock' ;;
+    force-validation) printf 'Skip checks' ;;
   esac
 }
 
@@ -666,6 +698,14 @@ gate_question() {
     leave-review) printf 'Leave Phase 5 with a diff that is still owed review?' ;;
     restart)      printf 'Discard the task in progress and re-arm at Phase 1?' ;;
     force)        printf 'Unlock production code without verified failing tests?' ;;
+    # Deliberately not the `force` wording. Both flags are called --force and
+    # both skip a check, but they skip different ones at different costs: `force`
+    # unlocks production code on nothing having been shown to fail, while this
+    # one enters review with the repo's own checks unrun. Routing both to one
+    # question meant the user was asked about unlocking production code at a
+    # point where production code was already written — an answer given about
+    # the wrong risk, and one the receipt would then honour.
+    force-validation) printf 'Enter adversarial review with no validation report recorded?' ;;
   esac
 }
 
@@ -697,22 +737,25 @@ gate_options() {
                printf '%s\n' \
       'pr	Open a pull request	The PR is opened first, then the gate is disarmed. That order is load-bearing: disarming on an uncommitted tree makes the review gate fire on every turn.' \
       'continue	Keep iterating	Stay in Phase 5. Anything that changes from here gets reviewed exactly like the last round did.' \
-      'disarm	Disarm and leave it	The phase gate stops and the working tree is what you are left with. The review gate goes back to firing every turn while anything is uncommitted.' ;;
+      'disarm	Disarm and leave it	The phase gate stops and the working tree is what you are left with. The review gate goes back to firing every turn while anything is uncommitted, and the journal is deleted along with the rest of the state.' ;;
     skip) printf '%s\n' \
       'approve	Skip the phases between	You are giving up the approvals in the phases being jumped over — spec approval, or reading the tests fail, or both. Nothing later asks for them again. Choose this only if you already know what those phases would have shown you.' \
       'decline	Go one phase at a time	The workflow advances normally and each gate is asked in its turn.' ;;
     abandon) printf '%s\n' \
-      'approve	Turn the gate off	Before Phase 4 the gate is what blocks production code, so turning it off here is the same as unlocking Phase 4 without a spec or a failing test. The review gate then fires on every turn while the tree is dirty.' \
+      'approve	Turn the gate off	Before Phase 4 the gate is what blocks production code, so turning it off here is the same as unlocking Phase 4 without a spec or a failing test. The review gate then fires on every turn while the tree is dirty, and the journal is deleted — it is gitignored, so it does not come back.' \
       'decline	Keep the gate on	The task stays where it is. Retreating to an earlier phase is always available and does not need this.' ;;
     leave-review) printf '%s\n' \
       'approve	Leave the review behind	Phases 1 to 4 suppress the review gate, so moving there parks a diff nothing will look at again — it gets folded into the next baseline as though it had been reviewed.' \
       'decline	Stay in Phase 5	The diff keeps being owed review until it is reviewed and committed.' ;;
     restart) printf '%s\n' \
-      'approve	Discard it and restart	The task in progress is thrown away: phase, slice position and every approval already given. The working tree is untouched, so whatever was built stays, unreviewed and no longer tracked by the gate.' \
+      'approve	Discard it and restart	The task in progress is thrown away: phase, slice position, every approval already given, and the journal — the validation report, which findings were acted on, and how far Execute got. The journal is gitignored, so that part is gone for good rather than recoverable from git. The working tree is untouched, so whatever was built stays, unreviewed and no longer tracked by the gate.' \
       'decline	Keep the current task	The task continues from where it is.' ;;
     force) printf '%s\n' \
       'approve	Unlock without RED	The check refused: the new tests either passed with no implementation written, or no test files changed at all. Either way nothing has been shown to fail, so Phase 4 unlocks production code on your word rather than on evidence.' \
       'decline	Fix the tests first	Phase 3 continues. Run the RED check again once the tests fail for the reason the spec expects.' ;;
+    force-validation) printf '%s\n' \
+      'approve	Review it unvalidated	No report of this repo checks passing exists for the work Phase 4 just finished. Phase 5 hands the reviewer a diff whose build and test status nobody has established, and the session that resumes after this one has nothing to hand over either.' \
+      'decline	Run the checks first	Phase 4 continues. Run what this repo gates on, record it with phase.sh validation, and 4 -> 5 clears on its own.' ;;
   esac
 }
 
@@ -769,7 +812,11 @@ gate_subject() {
     # skipping ahead from Phase 2 is spent in Phase 2 and nowhere else — plus a
     # re-check at the point of use, which is where `force` re-reads the RED
     # receipt and `leave-review` re-reads what is owed.
-    close-out|skip|abandon|leave-review|restart|force) : ;;
+    # force-validation is here rather than left to fall through the case. An
+    # unlisted gate produces the same empty subject and would behave correctly by
+    # accident, which is the kind of correct that stops being true the moment a
+    # default is added below.
+    close-out|skip|abandon|leave-review|restart|force|force-validation) : ;;
   esac
 }
 

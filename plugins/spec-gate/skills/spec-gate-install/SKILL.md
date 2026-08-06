@@ -110,6 +110,7 @@ writes its own bookkeeping.
 {
   "permissions": {
     "ask": [
+      "Bash(.claude/hooks/phase.sh scaffold*)",
       "Bash(.claude/hooks/phase.sh 3*)",
       "Bash(.claude/hooks/phase.sh 4*)",
       "Bash(.claude/hooks/phase.sh 5 --force*)",
