@@ -1531,15 +1531,30 @@ Where that leaves the design:
   not depend on the guard's spelling list being complete.
 - **The key is under `.git/`, not in the working tree**, so the commands that
   wipe every state file (`git clean -fdx`, `git stash --all`, `rm -rf .claude`)
-  do not reach it. Anything that can *read* the key can mint a marker; this
-  raises the cost of forgery, it does not make it impossible.
-- **An interpreter payload is checked by substring, not parsed.** `python3 -c`
-  and `node -e` take code this hook cannot lex. It refuses one that names a state
-  file; it cannot see through obfuscation, and does not claim to.
-- **Running out of scan budget is a denial.** A hook that gets killed emits no
-  JSON, and no JSON reads as *no decision* — so a command large enough to outrun
-  the timeout would be allowed by default. The scan is bounded and refuses when
-  it hits the bound, which makes slowness a denial rather than a bypass.
+  do not reach it, and the guard refuses any command naming it at any phase.
+  That last part is load-bearing and was missing at first: a model does not need
+  to *read* the key to forge a marker, it only needs to **replace** it, and a
+  marker signed with a key of your own choosing verifies perfectly. Reading it is
+  equally fatal. Both are refused by the same check; neither is made impossible
+  by it.
+- **An interpreter payload is checked by substring, not parsed.** `python3 -c`,
+  `node -e` and a heredoc fed to either take code this hook cannot lex. It
+  refuses one that names a state file; it cannot see through obfuscation, and
+  does not claim to.
+- **What the guard cannot resolve, it refuses.** A verb the shell computes
+  (`P=…; $P 4 --force`) and a shell whose script arrives on stdin (`bash -s <
+  file`, `cat file | bash`) are not skipped as unrecognised — they are denied,
+  because a command this hook cannot read could be any command. That is the rule
+  that replaced "add another spelling to the list" for whole channels.
+- **Running out of scan budget is a denial, and the denial can be delivered.**
+  A hook that gets killed emits no JSON, and no JSON reads as *no decision* — so
+  a command large enough to outrun the timeout would be allowed by default. The
+  scan is bounded on three axes (tokens, bytes, and nested payloads, since one
+  200 KB token costs everything while the token count stays at 1) and refuses at
+  the bound. The subtlety that cost a round: `deny` is printf-then-exit, so a
+  refusal raised inside `$( )` lands in the captured string and exits only the
+  subshell — the hook then prints nothing, and the bypass is the refusal itself.
+  Nothing that can refuse runs inside a command substitution.
 - **Phases 4–5 do not protect the gate's own code.** `.claude/hooks/*` and
   `.claude/settings.json` are writable there, by the same rule that returns those
   phases to the normal permission flow. A model at Phase 5 can rewrite the Stop
@@ -1585,7 +1600,7 @@ you read it.
 
 Builds a throwaway git repo in a temp dir, installs the hooks into it, and drives
 them with synthetic hook payloads. Nothing touches the repo you run it from.
-830 cases: the phase policy, every write vector, the advance-transition matrix,
+873 cases: the phase policy, every write vector, the advance-transition matrix,
 RED verification and the receipt's staleness rules, the approval questions and
 everything the receipt hook refuses to record, fail-closed behavior, the review
 gate with its index-invariance and its between-rounds delta, the slice position

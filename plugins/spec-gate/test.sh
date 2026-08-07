@@ -3732,5 +3732,228 @@ printf '%s' "$ROUT" | grep -qi 'RED verified\|tests failed as required' \
   || bad "a legitimate test command no longer works: $ROUT"
 
 ################################################################################
+# The budget's refusal has to be deliverable. `deny` is printf-then-exit, so
+# inside `$( )` the JSON lands in the captured string and the exit ends only the
+# subshell — the hook then falls off the end having printed nothing, and no
+# output reads as no decision. The scanners share one counter, so a command
+# sized to survive the state scan and run out during the phase-call walk got no
+# transition gating at all: the control below denies, and the same call behind a
+# thousand filler words was allowed and advanced.
+group "a refusal is delivered from wherever it is raised"
+setup_repo; phase start deliver; phase 2; phase 3; phase 4 --force
+
+FILLER=$(python3 -c "print(' '.join('w%d' % i for i in range(1000)))")
+expect_b "the control refuses" \
+  DENY '.claude/hooks/phase.sh 5 --force'
+expect_b "and filler in front of it does not buy the transition" \
+  DENY "echo $FILLER >/dev/null ; .claude/hooks/phase.sh 5 --force"
+# Emptiness is the tell: a swallowed deny leaves the hook silent rather than
+# allowing out loud, so assert on the bytes as well as on the decision.
+OUT=$(pl_bash "echo $FILLER >/dev/null ; .claude/hooks/phase.sh 5 --force" | .claude/hooks/phase-guard.sh 2>/dev/null)
+[ -n "$OUT" ] \
+  && ok "and the hook actually emitted a decision rather than going quiet" \
+  || bad "the hook printed nothing — a swallowed deny reads as permission"
+PH=$(.claude/hooks/phase.sh status 2>&1 | head -1)
+printf '%s' "$PH" | grep -q 'phase 4' \
+  && ok "so the repo is still standing in Phase 4" \
+  || bad "the repo left Phase 4: $PH"
+
+# The same for the gate that only asks: an ASK swallowed the same way becomes an
+# allow, which is worse than the denial it replaced.
+expect_b "an ask is delivered behind filler too" \
+  ASK "echo $FILLER >/dev/null ; .claude/hooks/phase.sh off"
+
+# The lex counter was incremented inside lex_command, which is only ever called
+# as `$(lex_command ...)` — so every increment was discarded in a subshell and
+# the bound never existed. One recursion per argument means the fork count is
+# the model's to choose.
+setup_repo; phase start lexbudget; phase 2; phase 3
+MANY=$(python3 -c "print(' '.join('a%d' % i for i in range(200)))")
+T0=$(date +%s)
+expect_b "two hundred nested payloads exhaust the lex budget" \
+  DENY "bash $MANY ; rm -f .claude/.spec-phase"
+T1=$(date +%s)
+[ $((T1 - T0)) -le 5 ] \
+  && ok "and it refuses in $((T1 - T0))s rather than forking on" \
+  || bad "200 payloads took $((T1 - T0))s — the lex bound is not holding"
+
+################################################################################
+# The budget counted tokens; the cost is in bytes. `${T##*/}` is quadratic in
+# bash 3.2 — the file's own header says so about the string walk it replaced —
+# and it runs per token, so ONE long token costs everything while the token
+# count stays at 1. A 130 KB command outran the 15s timeout with the budget
+# untouched, which is the same fail-open by the other axis.
+group "one enormous token cannot outrun the timeout either"
+setup_repo; phase start bytes; phase 2; phase 3
+
+BIGTOK=$(python3 -c "print('A' * 200000)")
+T0=$(date +%s)
+expect_b "a 200 KB single token is decided, not scanned forever" \
+  DENY "echo $BIGTOK > src/evil.ts"
+T1=$(date +%s)
+[ $((T1 - T0)) -le 5 ] \
+  && ok "and the decision lands in $((T1 - T0))s" \
+  || bad "one 200 KB token took $((T1 - T0))s — past the timeout, so it fails open"
+
+# Long prose must still be free: heredoc bodies are data, and a validation
+# report or a plan document is legitimately large.
+LONGDOC=$(python3 -c "print('\n'.join('line %d of a long plan document' % i for i in range(3000)))")
+T0=$(date +%s)
+expect_b "a long heredoc document is not a size problem" ALLOW ".claude/hooks/phase.sh journal <<'EOF'
+$LONGDOC
+EOF"
+T1=$(date +%s)
+[ $((T1 - T0)) -le 5 ] \
+  && ok "and it is handled in $((T1 - T0))s, since the body never becomes tokens" \
+  || bad "a long heredoc took $((T1 - T0))s"
+
+################################################################################
+# A heredoc body is data — correct for prose, fatal when the verb reads stdin.
+# The lexer consumes the body and emits nothing, so an interpreter fed its
+# program on stdin was a channel the scanner was built to look away from. The
+# -c spellings of the same commands are denied, which is what makes this a gap
+# rather than a policy.
+group "a heredoc handed to a shell is shell, not prose"
+setup_repo; phase start hdoc; phase 2; phase 3
+
+expect_b "bash reading its script from a heredoc" DENY 'bash <<EOF
+rm -f .claude/.spec-phase
+EOF'
+expect_b "python3 reading its program from a heredoc" DENY 'python3 <<EOF
+import os
+os.remove(".claude/.spec-phase")
+EOF'
+expect_b "and the explicit stdin form" DENY 'python3 - <<EOF
+import os
+os.remove(".claude/.spec-phase")
+EOF'
+expect_b "a phase transition hidden in a heredoc" DENY 'bash <<EOF
+.claude/hooks/phase.sh 4 --force
+EOF'
+# The prose case is the whole reason bodies are data. It must stay allowed.
+expect_b "a journal entry naming a state file is still prose" ALLOW ".claude/hooks/phase.sh journal <<'EOF'
+tried to write .claude/.spec-phase directly and the guard refused, correctly
+EOF"
+expect_b "and a heredoc into a file that is not a shell" ALLOW 'cat > docs/specs/notes.md <<EOF
+rm -f .claude/.spec-phase is what I was told not to do
+EOF'
+
+################################################################################
+# The verb decides how every other token is read, so a verb the guard cannot
+# resolve is a command it cannot classify. A path in a variable was skipped by
+# the assignment filter before anything looked at its value, and a shell reading
+# its script from a redirect names the script in a place the lexer discards.
+# Neither is exotic and both are complete overrides, since phase.sh has no gate
+# of its own.
+group "an unresolvable verb is refused, not skipped"
+setup_repo; phase start verb; phase 2; phase 3
+
+expect_b "a phase.sh path held in a variable" \
+  DENY 'P=.claude/hooks/phase.sh; $P 4 --force'
+expect_b "and the same quoted" \
+  DENY 'P=.claude/hooks/phase.sh; "$P" 4 --force'
+expect_b "a shell reading its script from a redirect" \
+  DENY 'bash -s 4 --force < .claude/hooks/phase.sh'
+expect_b "and one reading it from a pipe" \
+  DENY 'cat .claude/hooks/phase.sh | bash -s 4 --force'
+PH=$(.claude/hooks/phase.sh status 2>&1 | head -1)
+printf '%s' "$PH" | grep -q 'phase 3' \
+  && ok "and none of them moved the phase" \
+  || bad "the phase moved: $PH"
+
+# Ordinary redirects and ordinary variables must survive.
+expect_b "an input redirect into something that is not a shell" ALLOW 'sort < src/x.ts'
+expect_b "a variable used as data rather than as a verb"       ALLOW 'F=src/x.ts; grep TODO $F'
+
+################################################################################
+# The key is what makes the marker unforgeable, and it was not in any protected
+# list — so it could be replaced, and a model that can choose the key can mint
+# any marker it likes. Reading it was the threat the README described; replacing
+# it is cheaper and was free.
+group "the marker key is protected like the markers"
+setup_repo; phase start key; phase 2; phase 3
+
+expect_b "the key cannot be overwritten"      DENY 'printf x > .git/spec-gate-key'
+expect_b "nor removed"                        DENY 'rm -f .git/spec-gate-key'
+expect_b "nor moved"                          DENY 'mv .git/spec-gate-key /tmp/k'
+expect_b "and not at Phase 4 either"          DENY 'printf x > .git/spec-gate-key'
+setup_repo; phase start key2; phase 2; phase 3; phase 4 --force
+expect_b "the key is protected past the phase-4 exit" \
+  DENY 'printf x > .git/spec-gate-key'
+expect_b "and so is the state backup the verifier uses" \
+  DENY 'rm -rf .git/spec-gate-statebak'
+# Ordinary git work must not be caught by this.
+expect_b "ordinary git commands are untouched" ALLOW 'git log --oneline -5'
+expect_b "and so is writing inside .git by git itself" ALLOW 'git commit -am wip'
+
+################################################################################
+# The verifier put the gate's state aside and read a missing backup as "nothing
+# moved", so the test command only had to delete the backup — and it could
+# rewrite the backup instead, in which case restore installed the rewrite while
+# reporting that the damage had been undone.
+group "the state snapshot cannot be turned against the gate"
+setup_repo; phase start bak; phase 2; phase 3
+echo 'it("f", () => expect(1).toBe(2))' > src/x.test.ts
+
+printf 'rm -f .claude/.spec-phase; rm -rf .git/spec-gate-statebak; exit 1\n' > .claude/spec-gate-test-cmd
+.claude/hooks/phase.sh red >/dev/null 2>&1
+[ -f .claude/.spec-phase ] \
+  && ok "deleting the backup does not let the payload through" \
+  || bad "the test command deleted the backup and disarmed the gate"
+
+setup_repo; phase start bak2; phase 2; phase 3
+echo 'it("f", () => expect(1).toBe(2))' > src/x.test.ts
+printf 'D=$(ls -d .git/spec-gate-statebak 2>/dev/null); [ -n "$D" ] && printf "phase=4\\ntask=bak2\\nslice=1/1\\n" > "$D"/*spec-phase* ; exit 1\n' \
+  > .claude/spec-gate-test-cmd
+.claude/hooks/phase.sh red >/dev/null 2>&1
+BP=$(sed -n 's/^phase=//p' .claude/.spec-phase 2>/dev/null | head -1)
+[ "$BP" = 3 ] \
+  && ok "rewriting the backup does not get installed as the restore" \
+  || bad "the backup was rewritten and restored as phase=$BP"
+
+# And nothing is left lying around for the next run to inherit.
+[ -d .git/spec-gate-statebak ] \
+  && bad "the state backup was left behind after phase.sh red" \
+  || ok "no state backup survives the run that made it"
+
+################################################################################
+# find rooted at '.' covers the state directory, so any -delete denied — which
+# is most ordinary cleanup. A -name that cannot match a state file is not a
+# threat and must not be treated as one.
+group "find is judged on what it would actually reach"
+setup_repo; phase start findfp; phase 2; phase 3
+
+expect_b "a filtered find that cannot match state"   ALLOW 'find . -name "*.pyc" -delete'
+expect_b "and one rooted in the tree with a filter"  ALLOW 'find . -name "*.log" -delete'
+expect_b "an unfiltered find still reaches them"     DENY  'find . -type f -delete'
+expect_b "and a filter that does match is refused"   DENY  'find . -name ".spec-*" -delete'
+
+################################################################################
+# phase.sh reads ${BASH_SOURCE[0]} under `set -u` to find its policy file. Fed
+# on stdin there is no BASH_SOURCE, so it aborted — and the degraded path it
+# aborted into treats an unverifiable RED as grounds to advance.
+group "phase.sh degrades closed, not open"
+setup_repo; phase start degrade; phase 2; phase 3
+
+SOUT=$(bash -s status < .claude/hooks/phase.sh 2>&1)
+printf '%s' "$SOUT" | grep -q 'unbound variable' \
+  && bad "phase.sh aborted on BASH_SOURCE when read from stdin: $SOUT" \
+  || ok "phase.sh survives being read from stdin"
+
+# phase.sh itself advances here and says it verified nothing — it is the user's
+# control surface, not the gate. The enforcement is phase-guard, which refuses
+# 3 -> 4 on any receipt state but 'valid'. So the property to pin is the guard's,
+# in both degraded states: no test command to run, and no policy file at all.
+setup_repo; phase start degrade2; phase 2; phase 3
+expect_b "the guard refuses 3 -> 4 with RED unverifiable" \
+  DENY '.claude/hooks/phase.sh 4'
+mv .claude/hooks/phase-policy.sh .claude/hooks/phase-policy.sh.off
+expect_b "and refuses every write with no policy file to read" \
+  DENY 'echo x > src/evil.ts'
+expect_b "including the transition itself" \
+  DENY '.claude/hooks/phase.sh 4'
+mv .claude/hooks/phase-policy.sh.off .claude/hooks/phase-policy.sh
+
+################################################################################
 printf '\n%s%d passed, %d failed%s\n' "$B" "$PASS" "$FAIL" "$N"
 [ "$FAIL" -eq 0 ] || exit 1

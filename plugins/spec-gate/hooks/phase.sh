@@ -34,7 +34,7 @@ TEST_CMD_FILE="$STATE_DIR/spec-gate-test-cmd"
 # tree_snapshot comes from phase-policy.sh, shared with review-gate.sh so the
 # baseline and the scan that reads it are computed the same way. Without it this
 # script still reports and clears state; only the baseline is skipped.
-HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 if [ -r "$HOOK_DIR/phase-policy.sh" ]; then
   # shellcheck source=phase-policy.sh
   . "$HOOK_DIR/phase-policy.sh"
@@ -169,18 +169,38 @@ verify_red() {
   # afterwards. This command is model-authored shell that the guard deliberately
   # allows in every phase, so without this the shortest route out of the workflow
   # was to write `rm -f .claude/.spec-phase` here and run the verifier.
-  spec_state_save
+  if ! spec_state_save; then
+    echo "spec-driven: REFUSED — could not put this gate's state aside before running"
+    echo "  the configured test command, so there is nothing to restore it from if"
+    echo "  the command touches it. Refusing rather than running unprotected."
+    return 1
+  fi
+  # A killed run must not leave the snapshot behind: it is the thing a later
+  # payload would go looking for.
+  trap 'spec_state_discard' EXIT INT TERM
   out=$(
     cd "$PROJECT_DIR" 2>/dev/null || exit 0
     SPEC_GATE_TEST_FILES="$files" bash -c "set -o pipefail; $cmd" 2>&1
   )
   rc=$?
-  if ! spec_state_restore; then
+  spec_state_restore; sr=$?
+  trap - EXIT INT TERM
+  if [ "$sr" != 0 ]; then
     printf '%s\n' "$out"
     echo
     rm -f "$RECEIPT"
     echo "spec-driven: REFUSED — the configured test command changed this gate's own"
-    echo "  state while it ran. Whatever it did to $STATE_DIR_REL has been undone."
+    echo "  state while it ran."
+    if [ "$sr" = 2 ]; then
+      # Deliberately not "has been undone": the snapshot was altered or removed,
+      # so restoring from it would have installed whatever it now contains.
+      echo "  It also reached the snapshot taken to undo that, so the state has NOT"
+      echo "  been restored — nothing here can be trusted to put it back. Check"
+      echo "  $STATE_DIR_REL by hand, and run 'phase.sh status'; if the phase is wrong,"
+      echo "  'phase.sh off' and start the task again."
+    else
+      echo "  Whatever it did to $STATE_DIR_REL has been undone."
+    fi
     echo "  A test command runs the repo's tests; one that rewrites the phase, the"
     echo "  receipts or the approval is doing something else, and nothing it printed"
     echo "  is evidence about anything."
@@ -272,7 +292,14 @@ red_tripwire() {
   verify_red
   case $? in
     0) return 0 ;;
-    2) return 0 ;;                      # unverifiable: advance on the assertion
+    # Deliberately an advance, and deliberately not the enforcement. This script
+    # is the user's control surface: run in a terminal it reports and proceeds,
+    # having said plainly that nothing was verified. What refuses is phase-guard,
+    # which denies 3 -> 4 on any receipt state but `valid` — including this one,
+    # and including the case where phase-policy.sh is missing entirely, where the
+    # guard refuses every write rather than degrading. Making this refuse too
+    # would only stop the user from doing what they already decided to do.
+    2) return 0 ;;
     *) echo "  Override with: phase.sh 4 --force"
        return 1 ;;
   esac

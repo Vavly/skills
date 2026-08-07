@@ -31,6 +31,12 @@ STATE_DIR_REL=.claude
 # This is not protection against someone with a shell and patience: anything that
 # can read the key can mint a marker. It closes the gap between "the guard missed
 # a spelling" and "the gate is gone", which is the gap that kept reopening.
+#
+# `--git-dir`, not `--git-common-dir`: in a linked worktree this resolves to
+# .git/worktrees/<name>, so each worktree signs with its own key. That is
+# deliberate — a marker minted for the task in one worktree should not clear the
+# gate for a different task in another, and the markers themselves are per-tree
+# already. Do not "fix" this to the common dir.
 spec_key_path() {
   d=$(git rev-parse --git-dir 2>/dev/null) || return 1
   [ -n "$d" ] || return 1
@@ -52,14 +58,27 @@ spec_key() {
 # $1 = message. Prints a hex digest, or fails if the host has no hasher — in
 # which case every caller treats the marker as unverifiable and refuses, since a
 # gate that cannot check its own receipt must not accept it.
+#
+# The key wraps the message on both sides rather than only prefixing it. Plain
+# H(k ‖ m) is length-extendable: an attacker who never sees the key can still
+# append to a signed body and produce a valid tag. Nothing here is exploitable
+# today only because the readers take the FIRST `task=` line, so an appended one
+# loses — which is a property of the reader, not of the construction, and would
+# quietly become a hole the day a reader changed to last-match-wins. Separators
+# keep the two key halves from merging with the body.
 spec_mac() {
   _k=$(spec_key) || return 1
+  _m=$(printf '%s\x1f%s\x1f%s' "$_k" "$1" "$_k")
+  if command -v openssl >/dev/null 2>&1; then
+    printf '%s' "$1" | openssl dgst -sha256 -hmac "$_k" 2>/dev/null | sed 's/.*= *//' | grep -q . && {
+      printf '%s' "$1" | openssl dgst -sha256 -hmac "$_k" 2>/dev/null | sed 's/.*= *//'
+      return 0
+    }
+  fi
   if command -v shasum >/dev/null 2>&1; then
-    printf '%s' "$_k$1" | shasum -a 256 | cut -d' ' -f1
+    printf '%s' "$_m" | shasum -a 256 | cut -d' ' -f1
   elif command -v sha256sum >/dev/null 2>&1; then
-    printf '%s' "$_k$1" | sha256sum | cut -d' ' -f1
-  elif command -v openssl >/dev/null 2>&1; then
-    printf '%s' "$_k$1" | openssl dgst -sha256 | sed 's/.*= *//'
+    printf '%s' "$_m" | sha256sum | cut -d' ' -f1
   else
     return 1
   fi
@@ -108,46 +127,94 @@ validation_marker_status() {   # $1 = marker path, $2 = task, $3 = slice
 # so the state is snapshotted under .git/ instead and restored afterwards. That
 # holds whatever the command does — obfuscated, nested, or spawned — because it
 # is checked on the way out rather than predicted on the way in.
-spec_state_backup_dir() {
-  d=$(git rev-parse --git-dir 2>/dev/null) || return 1
-  [ -n "$d" ] || return 1
-  case "$d" in /*) ;; *) d="${PROJECT_DIR%/}/$d" ;; esac
-  printf '%s/spec-gate-statebak\n' "$d"
+# The backup lives outside the repo, at a path held only in this variable. It
+# used to sit at a fixed, guessable path under .git/, which the executed command
+# could reach: deleting it made restore report "nothing moved", and rewriting it
+# made restore install the rewrite while announcing the damage had been undone.
+# Both were the snapshot being turned against the gate it protects.
+SPEC_BAK=""
+SPEC_BAK_SIG=""
+
+# One name per state path, hashed rather than punched through `tr`, so two paths
+# cannot collapse onto one backup file as the list grows.
+spec_bak_name() {
+  if command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1
+  elif command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$1" | sha256sum | cut -d' ' -f1
+  else
+    printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'
+  fi
+}
+
+# A signature over the backup itself, kept in memory. Comparing it afterwards is
+# what makes a rewritten backup detectable — the on-disk copy alone can be
+# edited by the very command it exists to survive.
+spec_bak_sig() {
+  [ -d "$1" ] || return 1
+  ( cd "$1" 2>/dev/null || exit 1
+    for f in *; do
+      [ -f "$f" ] || continue
+      if command -v shasum >/dev/null 2>&1; then printf '%s ' "$f"; shasum -a 256 "$f"
+      elif command -v sha256sum >/dev/null 2>&1; then printf '%s ' "$f"; sha256sum "$f"
+      else printf '%s %s\n' "$f" "$(wc -c < "$f")"
+      fi
+    done ) 2>/dev/null | sort
 }
 
 spec_state_save() {
-  b=$(spec_state_backup_dir) || return 1
-  rm -rf "$b" 2>/dev/null
-  mkdir -p "$b" || return 1
+  SPEC_BAK=$(mktemp -d 2>/dev/null) || return 1
+  [ -n "$SPEC_BAK" ] || return 1
   while IFS= read -r s; do
     [ -z "$s" ] && continue
     f="${PROJECT_DIR%/}/$s"
     [ -f "$f" ] || continue
-    cp "$f" "$b/$(printf '%s' "$s" | tr '/' '_')" 2>/dev/null
+    cp "$f" "$SPEC_BAK/$(spec_bak_name "$s")" || { spec_state_discard; return 1; }
   done <<< "$(spec_state_list)"
+  SPEC_BAK_SIG=$(spec_bak_sig "$SPEC_BAK")
   return 0
 }
 
-# 0 if nothing moved, 1 if anything had to be put back.
+spec_state_discard() {
+  [ -n "$SPEC_BAK" ] && rm -rf "$SPEC_BAK" 2>/dev/null
+  SPEC_BAK=""; SPEC_BAK_SIG=""
+  return 0
+}
+
+# 0 = nothing moved. 1 = something moved and has been put back. 2 = the backup
+# itself is gone or altered, so nothing was put back and the caller must not
+# claim otherwise.
+#
+# The 2 case is why the signature is checked before anything is copied. A
+# rewritten backup restored on top of the live files installs the rewrite while
+# the message says the damage was undone — the tamper laundered through the
+# mechanism built to catch it. A backup that cannot be trusted is not used at
+# all; the refusal says so and points at recovery.
 spec_state_restore() {
-  b=$(spec_state_backup_dir) || return 0
-  [ -d "$b" ] || return 0
+  [ -n "$SPEC_BAK" ] || return 2
+  if [ ! -d "$SPEC_BAK" ]; then SPEC_BAK=""; SPEC_BAK_SIG=""; return 2; fi
+  if [ "$(spec_bak_sig "$SPEC_BAK")" != "$SPEC_BAK_SIG" ]; then
+    spec_state_discard
+    return 2
+  fi
   touched=0
   while IFS= read -r s; do
     [ -z "$s" ] && continue
     f="${PROJECT_DIR%/}/$s"
-    k="$b/$(printf '%s' "$s" | tr '/' '_')"
+    k="$SPEC_BAK/$(spec_bak_name "$s")"
     if [ -f "$k" ]; then
       if [ ! -f "$f" ] || ! cmp -s "$k" "$f"; then
+        touched=1
         mkdir -p "$(dirname "$f")" 2>/dev/null
-        cp "$k" "$f" 2>/dev/null && touched=1
+        cp "$k" "$f" 2>/dev/null || { spec_state_discard; return 2; }
       fi
     elif [ -f "$f" ]; then
       # Nothing was there before, so whatever wrote this invented it.
-      rm -f "$f" 2>/dev/null && touched=1
+      rm -f "$f" 2>/dev/null
+      touched=1
     fi
   done <<< "$(spec_state_list)"
-  rm -rf "$b" 2>/dev/null
+  spec_state_discard
   [ "$touched" = 0 ]
 }
 
