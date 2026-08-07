@@ -1542,16 +1542,34 @@ Where that leaves the design:
   refuses one that names a state file; it cannot see through obfuscation, and
   does not claim to.
 - **What the guard cannot resolve, it refuses.** A verb the shell computes
-  (`P=…; $P 4 --force`) and a shell whose script arrives on stdin (`bash -s <
-  file`, `cat file | bash`) are not skipped as unrecognised — they are denied,
-  because a command this hook cannot read could be any command. That is the rule
-  that replaced "add another spelling to the list" for whole channels.
+  (`P=…; $P 4 --force`), a `phase.sh` argument it computes (`F=--force; phase.sh
+  5 $F`), an argument list built by `xargs`, and a shell whose script arrives on
+  stdin (`bash -s < file`, `cat file | bash`, `bash <<< '…'`) are not skipped as
+  unrecognised — they are denied, because a command this hook cannot read could
+  be any command. That is the rule that replaced "add another spelling to the
+  list" for whole channels. Assignments the command makes itself *are* resolved,
+  so `V=.claude/.spec-phase; rm -f $V` is refused on what `$V` holds — while a
+  variable this hook cannot see the value of, like `> $LOGFILE`, stays allowed.
+- **A refusal outranks a permission, and is checked first.** `decide` exits, so
+  whichever check speaks first speaks for the whole command. The write scan runs
+  ahead of the phase walk for that reason: with the order reversed, `phase.sh
+  status ; echo pwned > src/x.ts` was allowed on the strength of the status call,
+  and an explicit hook `allow` bypasses the permission system rather than merely
+  skipping a phase.
+- **A heredoc body belongs to the verb that opened it.** Prose into `phase.sh
+  journal` is data and costs nothing; a script into `bash` or `python3` is a
+  program and is scanned. The lexer holds every separator raised after a heredoc
+  is registered until the body has been consumed, so `bash <<EOF | cat` cannot
+  hand the body to `cat` and have it read as prose.
 - **Running out of scan budget is a denial, and the denial can be delivered.**
   A hook that gets killed emits no JSON, and no JSON reads as *no decision* — so
   a command large enough to outrun the timeout would be allowed by default. The
-  scan is bounded on three axes (tokens, bytes, and nested payloads, since one
-  200 KB token costs everything while the token count stays at 1) and refuses at
-  the bound. The subtlety that cost a round: `deny` is printf-then-exit, so a
+  scan is bounded on four axes — tokens, bytes, nested payloads, and the length
+  of a single physical line, checked *inside* the lexer, since the lexer builds
+  each word a character at a time and that cost is paid in full before any
+  counter on the shell side can move. Heredoc body lines are exempt from the
+  line bound: they are read whole, never character by character, which is what
+  keeps a long plan document cheap. The subtlety that cost a round: `deny` is printf-then-exit, so a
   refusal raised inside `$( )` lands in the captured string and exits only the
   subshell — the hook then prints nothing, and the bypass is the refusal itself.
   Nothing that can refuse runs inside a command substitution.
@@ -1600,7 +1618,7 @@ you read it.
 
 Builds a throwaway git repo in a temp dir, installs the hooks into it, and drives
 them with synthetic hook payloads. Nothing touches the repo you run it from.
-873 cases: the phase policy, every write vector, the advance-transition matrix,
+913 cases: the phase policy, every write vector, the advance-transition matrix,
 RED verification and the receipt's staleness rules, the approval questions and
 everything the receipt hook refuses to record, fail-closed behavior, the review
 gate with its index-invariance and its between-rounds delta, the slice position

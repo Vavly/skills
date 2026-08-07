@@ -57,6 +57,7 @@ decide() {  # $1 = allow|deny|ask, $2 = reason
 
 deny() { decide deny "$1"; }
 
+
 # `ask` forces a confirmation prompt instead of refusing outright. Used for the
 # one checkpoint where in-band approval is proportionate — see the advance policy
 # below. Note that a hook's `ask` is NOT documented to survive
@@ -159,6 +160,11 @@ SCAN_LEX_BUDGET=64
 SCAN_BYTE_BUDGET=262144
 MAX_TOKEN_BYTES=65536
 BASENAME_MAX=256
+# One physical line of shell. The lexer builds words a character at a time, so
+# this bounds the quadratic directly and is checked inside awk before the work
+# is done. Heredoc BODY lines are exempt — they are read whole, never scanned
+# character by character, which is why a long plan document stays cheap.
+MAX_LINE_BYTES=65536
 OVERSIZE_MSG="This command is too large for phase-guard to evaluate: it exceeds the scan budget, and a scan that cannot finish inside the hook timeout would emit no decision at all, which reads as permission. Refusing is the only safe answer. Split it into separate commands, or use Write/Edit for file changes so the target is a structured field instead of something to parse out of shell."
 
 # Every one of these must be reached from the CURRENT shell. `deny` is
@@ -183,6 +189,15 @@ budget_lex() {
   return 0
 }
 
+# Checked before the text is handed to the lexer, because the lexer is where the
+# cost is. Every budget above counts tokens the lexer has already produced, so
+# none of them can fire until the expensive part is over — which is how 700 KB
+# in one word took 23s with the token count standing at 1.
+budget_input() {
+  [ "${#1}" -gt "$SCAN_BYTE_BUDGET" ] && deny "$OVERSIZE_MSG"
+  return 0
+}
+
 # Each top-level scan gets its own allowance; recursion inside one shares it.
 # A single counter across all of them meant an ordinary command could spend the
 # state scan's budget and leave the phase-call walk to run out — which is how a
@@ -203,11 +218,20 @@ tok_base() {   # sets TB
 }
 
 lex_command() {
-  printf '%s' "$1" | awk '
+  printf '%s' "$1" | awk -v MAXLINE="$MAX_LINE_BYTES" '
     BEGIN { SQ = sprintf("%c", 39); DQ = sprintf("%c", 34); BS = sprintf("%c", 92)
             hd_head = 1 }   # awk zero-inits, and hd_d[0] is a delimiter that never matches
+    # Output is buffered from the moment a heredoc is registered until its body
+    # has been consumed, then replayed after it. Without that, an operator later
+    # on the same line closed the segment before the body arrived — `bash <<EOF |
+    # cat` handed the body to `cat`, and a body whose verb looks harmless is
+    # discarded as prose. Holding only the end-of-line SEP was not enough,
+    # because `|` and `&&` end a segment too.
+    function out(s) {
+      if (defer) buf = buf s "\n"; else print s
+    }
     function flush() {
-      if (have) print "WORD\t" w
+      if (have) out("WORD\t" w)
       w = ""; have = 0
     }
     function nexthd() {
@@ -222,19 +246,22 @@ lex_command() {
       # program. So the body is emitted as HBODY rather than discarded, and the
       # caller decides based on the verb it already knows. Discarding it made an
       # interpreter reading stdin a channel this scanner looked away from.
-      #
-      # The SEP that ends the line is held back until the body is consumed, so
-      # the body arrives while the verb of that segment is still current.
       # (No apostrophes in here: this whole program is one single-quoted string.)
       if (hd_active) {
         t = $0
         if (hd_strip) sub(/^\t+/, "", t)
         if (t == hd_delim) {
           nexthd()
-          if (!hd_active && pending_sep) { print "SEP"; pending_sep = 0 }
+          if (!hd_active) { defer = 0; printf "%s", buf; buf = "" }
         } else print "HBODY\t" t
         next
       }
+      # Each word is built one character at a time, which is quadratic, so a
+      # single enormous word is the whole cost of the scan and it is paid here,
+      # before any counter on the bash side can move. 700 KB in one word took
+      # 23s against a 15s timeout, and a killed hook emits no decision at all.
+      # Refusing on length is the only check that can run before the work does.
+      if (MAXLINE > 0 && length($0) > MAXLINE) { print "OVER"; exit }
       line = $0; n = length(line); i = 1
       while (i <= n) {
         c = substr(line, i, 1)
@@ -261,7 +288,12 @@ lex_command() {
         if (c == "#" && !have) break
         if (c == "<") {
           flush()
-          if (substr(line, i+1, 2) == "<<") { print "SEP"; i += 3; continue }
+          # `<<<` is a herestring: the word after it is the text fed to the
+          # command as stdin. Treated as a separator, that text became an
+          # ordinary word opening a new segment, never re-read as shell and
+          # never seen as stdin — so `bash <<< script` was a blind spot with
+          # neither a redirect nor a pipe for the stdin check to notice.
+          if (substr(line, i+1, 2) == "<<") { out("OPHERE"); i += 3; continue }
           if (substr(line, i+1, 1) == "<") {
             i += 2; strip = 0
             if (substr(line, i, 1) == "-") { strip = 1; i++ }
@@ -279,13 +311,13 @@ lex_command() {
             # `$((1<<3))` is an arithmetic shift, not a heredoc. Its "delimiter"
             # parses as `3))`, which no line ever matches, so the rest of the
             # command was swallowed as body and nothing in it was scanned.
-            if (d != "" && d !~ /[()$]/) { hd_tail++; hd_d[hd_tail] = d; hd_s[hd_tail] = strip }
+            if (d != "" && d !~ /[()$]/) { hd_tail++; hd_d[hd_tail] = d; hd_s[hd_tail] = strip; defer = 1 }
             continue
           }
           # A plain input redirect writes nothing, but it decides what a shell
           # RUNS: `bash -s < script` never names the script anywhere the scanner
           # can see. Emitted so the caller can refuse the combination.
-          print "OPIN"
+          out("OPIN")
           i++; continue
         }
         if (c == ">") {
@@ -304,23 +336,25 @@ lex_command() {
             }
             i++
           }
-          print "OP\t" op; continue
+          out("OP\t" op); continue
         }
         # A pipe ends a segment like `;` does, but it also decides where stdin
         # for the NEXT segment comes from — `cat script | bash -s` runs a script
         # nothing in the token stream names. Marked so the caller can tell the
         # two apart; readers that only match KIND=SEP are unaffected.
-        if (c == "|") { flush(); print "SEP\tpipe"; i++; continue }
-        if (c == ";" || c == "&") { flush(); print "SEP"; i++; continue }
+        if (c == "|") { flush(); out("SEP\tpipe"); i++; continue }
+        if (c == ";" || c == "&") { flush(); out("SEP"); i++; continue }
         w = w c; have = 1; i++
       }
       if (cont) { cont = 0; next }             # continued line: same word, same segment
       if (q != 0) { w = w " "; next }         # a quoted string spanning lines
       flush()
+      out("SEP")
       if (!hd_active) nexthd()
-      if (hd_active) pending_sep = 1; else print "SEP"
     }
-    END { flush(); if (pending_sep) print "SEP" }
+    # An unterminated heredoc leaves the buffer unflushed; emit it rather than
+    # dropping the segment on the floor.
+    END { flush(); if (buf != "") printf "%s", buf }
   '
 }
 
@@ -398,11 +432,14 @@ finish_segment() {
 
 scan_command() {
   local KIND VAL
+  budget_input "$1"
+  [ "${SCAN_DEPTH:-0}" = 0 ] && budget_reset
   budget_lex
   WANT_TARGET=0
   SEGW=''
   while IFS=$'\t' read -r KIND VAL; do
     case "$KIND" in
+      OVER) deny "$OVERSIZE_MSG" ;;
       OP)   WANT_TARGET=1 ;;
       SEP)  finish_segment; WANT_TARGET=0 ;;
       WORD)
@@ -425,7 +462,12 @@ collect_write_targets() {
   CAND=""
   NESTED=""
   local depth=0 queue payload
+  # Its own allowance, like the other two top-level scanners. Without this the
+  # write scan started from whatever the phase walk had already spent, which
+  # silently halved it.
+  SCAN_DEPTH=0
   scan_command "$1"
+  SCAN_DEPTH=1
   while [ -n "$NESTED" ] && [ "$depth" -lt 4 ]; do
     queue=$NESTED; NESTED=""
     depth=$((depth + 1))
@@ -615,9 +657,70 @@ names_state_file() {
 # exited.
 names_gate_key() {
   case "$1" in
-    *spec-gate-key*|*spec-gate-statebak*) return 0 ;;
+    *spec-gate-key*) return 0 ;;
+  esac
+  # A glob reaches it without naming it: `rm -f .git/spec-gate-*` expands to the
+  # key and matches no literal above. Deliberately narrow — `.claude/spec-gate-*`
+  # must keep matching spec-gate-test-cmd, which is writable in every phase by
+  # design, so the pattern is tried against the key path rather than the reverse.
+  case "$1" in
+    *'*'*|*'?'*|*'['*)
+      k=$(spec_key_path 2>/dev/null) || k=""
+      # shellcheck disable=SC2254
+      [ -n "$k" ] && case "$k" in $1) return 0 ;; esac
+      # shellcheck disable=SC2254
+      case ".git/spec-gate-key" in $1) return 0 ;; esac ;;
   esac
   return 1
+}
+
+# `rm -rf .git` takes the key with everything else.
+covers_git_dir() {
+  local p=$1
+  p=${p%/}; p=${p#./}
+  [ -z "$p" ] && return 0
+  case "$p" in
+    .|..|.git) return 0 ;;
+  esac
+  return 1
+}
+
+# --- Variables the command sets for itself -----------------------------------
+# The verb filter skipped an assignment token whole, so nothing ever read its
+# value — and a redirect target that is only `$V` names nothing and has no
+# literal prefix to test, so the computed-target rule found nothing either. Past
+# the phase-4 exit, where the write scan no longer runs, that left every state
+# file writable through one variable.
+#
+# Only assignments this same command makes are resolved. The environment is not
+# consulted: a variable this hook cannot see the value of stays unresolved, which
+# is what keeps `> $LOGFILE` working.
+VARS=""
+
+vars_record() {   # $1 = NAME=VALUE token
+  case "${1%%=*}" in
+    ''|*[!A-Za-z0-9_]*) return 0 ;;
+  esac
+  VARS="$VARS$1"$'\n'
+  return 0
+}
+
+resolve_tok() {   # sets RT to the token with a known whole-token expansion applied
+  RT=$1
+  local n line
+  case "$RT" in
+    '$'*) n=${RT#\$} ;;
+    *) return 0 ;;
+  esac
+  case "$n" in
+    '{'*'}') n=${n#\{}; n=${n%\}} ;;
+  esac
+  case "$n" in ''|*[!A-Za-z0-9_]*) return 0 ;; esac
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    case "$line" in "$n="*) RT=${line#*=}; return 0 ;; esac
+  done <<< "$VARS"
+  return 0
 }
 
 GATE_KEY_MSG="That path is the gate's own authentication material — the key the Phase 4 validation marker is signed with, or the state snapshot phase.sh red restores from. Neither is yours to write, move or remove: a marker signed with a key you chose proves nothing, and a snapshot you can edit is not a snapshot. Nothing in this workflow requires touching either."
@@ -625,13 +728,15 @@ GATE_KEY_MSG="That path is the gate's own authentication material — the key th
 scan_state_tokens() {
   local KIND VAL T TB IS_VERB VERB='' EXPECT_VERB=1 GITCLEAN=0 GITSTASH=0
   local FINDDIR=0 WANT_TARGET=0 HDOC='' STDIN_TAKEN=0 PIPED=0
-  local FINDNAMED=0 FINDHIT=0 FINDPAT=0
+  local FINDNAMED=0 FINDHIT=0 FINDPAT=0 WAS_TARGET=0 RT
   local depth=${2:-0} cwd=${3:-} CDNEXT=0
   [ "$depth" -gt 4 ] && deny "$OVERSIZE_MSG"
   [ "$depth" = 0 ] && budget_reset
+  budget_input "$1"
   budget_lex
   while IFS=$'\t' read -r KIND VAL; do
     case "$KIND" in
+      OVER) deny "$OVERSIZE_MSG" ;;
       # A cd survives a `;` or `&&`, so cwd deliberately does NOT reset here.
       SEP)
         # A heredoc is prose or a program depending on who is reading it, and
@@ -689,8 +794,17 @@ scan_state_tokens() {
     # exists in, so the marker gating 4 -> 5 was writable through one `$(...)`.
     # Here it runs at every phase, narrowed to targets that name state, so
     # ordinary Phase 4 work like `> $LOGFILE` is untouched.
+    WAS_TARGET=0
     if [ "$WANT_TARGET" = 1 ]; then
       WANT_TARGET=0
+      WAS_TARGET=1
+      # A variable this command set for itself is resolved first: `> $V` names
+      # nothing on its own, and past the phase-4 exit nothing else looked.
+      resolve_tok "$T"
+      if [ "$RT" != "$T" ]; then
+        state_token_hits "$RT" "$cwd" && deny "$STATE_MSG"
+        names_gate_key "$RT" && deny "$GATE_KEY_MSG"
+      fi
       case "$T" in
         *'$'*|*'`'*)
           # Two ways a computed target gives itself away. It spells a state name
@@ -708,7 +822,7 @@ scan_state_tokens() {
     fi
 
     IS_VERB=0
-    if [ "$EXPECT_VERB" = 1 ]; then
+    if [ "$EXPECT_VERB" = 1 ] && [ "$WAS_TARGET" = 0 ]; then
       # The verb decides how every other token in the segment is read, so a verb
       # this hook cannot resolve is a command it cannot classify at all. A path
       # held in a variable was skipped by the assignment filter before anything
@@ -723,7 +837,7 @@ scan_state_tokens() {
       # to `b`, which matches no assignment pattern, so the env prefix became
       # the verb and the real command was never classified at all.
       case "$T" in
-        *=*) continue ;;
+        *=*) vars_record "$T"; continue ;;
       esac
       tok_base "$T"
       case "$TB" in
@@ -845,6 +959,13 @@ scan_state_tokens() {
 
     state_token_hits "$T" "$cwd" && deny "$STATE_MSG"
     names_gate_key "$T" && deny "$GATE_KEY_MSG"
+    # The same token with this command's own assignments applied. `rm -f $V`
+    # names a state file only once V is read back.
+    resolve_tok "$T"
+    if [ "$RT" != "$T" ]; then
+      state_token_hits "$RT" "$cwd" && deny "$STATE_MSG"
+      names_gate_key "$RT" && deny "$GATE_KEY_MSG"
+    fi
 
     # A token carrying a substitution cannot be matched as a path — `` `echo
     # .claude/.spec-phase` `` splits into words that each end or begin with a
@@ -862,7 +983,8 @@ scan_state_tokens() {
       rm|unlink|shred|rmdir|mv)
         case "$T" in
           -*) ;;
-          *) covers_state_dir "$T" && deny "$STATE_MSG" ;;
+          *) covers_state_dir "$T" && deny "$STATE_MSG"
+             covers_git_dir "$T" && deny "$GATE_KEY_MSG" ;;
         esac ;;
     esac
   done <<< "$(lex_command "$1")"
@@ -920,13 +1042,15 @@ fi
 # reads as no decision, so the refusal became permission. Nothing that can refuse
 # may run inside a command substitution.
 phase_walk() {
-  local KIND VAL T TB IN=0 ACC='' VERB='' EXPECT_VERB=1 HDOC=''
+  local KIND VAL T TB IN=0 ACC='' VERB='' EXPECT_VERB=1 HDOC='' XARGS=0 RT
   local depth=${2:-0}
   [ "$depth" -gt 4 ] && deny "$OVERSIZE_MSG"
   [ "$depth" = 0 ] && budget_reset
+  budget_input "$1"
   budget_lex
   while IFS=$'\t' read -r KIND VAL; do
     case "$KIND" in
+      OVER) deny "$OVERSIZE_MSG" ;;
       SEP)
         [ "$IN" = 1 ] && eval_phase_call "$ACC"
         # A phase.sh call inside a heredoc handed to a shell is a phase.sh call.
@@ -935,7 +1059,7 @@ phase_walk() {
             sh|bash|zsh|ksh|dash|eval) phase_walk "$HDOC" "$((depth + 1))" ;;
           esac
         fi
-        IN=0; ACC=''; VERB=''; EXPECT_VERB=1; HDOC=''; continue ;;
+        IN=0; ACC=''; VERB=''; EXPECT_VERB=1; HDOC=''; XARGS=0; continue ;;
       OP|OPIN) continue ;;
       HBODY)
         case "$VERB" in
@@ -948,10 +1072,13 @@ phase_walk() {
     budget_token "$T"
 
     if [ "$EXPECT_VERB" = 1 ]; then
-      case "$T" in *=*) continue ;; esac
+      case "$T" in *=*) vars_record "$T"; continue ;; esac
       tok_base "$T"
       case "$TB" in
-        sudo|env|command|nohup|time|xargs|exec) continue ;;
+        # xargs builds the argument list from stdin, so a phase.sh reached
+        # through it is a call whose arguments this hook cannot see at all.
+        xargs) XARGS=1; continue ;;
+        sudo|env|command|nohup|time|exec) continue ;;
         -*) continue ;;
       esac
       VERB=$TB; EXPECT_VERB=0
@@ -968,10 +1095,17 @@ phase_walk() {
 
     tok_base "$T"
     if [ "$TB" = phase.sh ]; then
+      [ "$XARGS" = 1 ] && deny "This reaches phase.sh through xargs, which builds its argument list from stdin — so which phase it would move to, and whether --force is among the arguments, is not visible here. A transition this gate cannot read is one it will not allow. Run phase.sh with its arguments written out."
       [ "$IN" = 1 ] && eval_phase_call "$ACC"
       IN=1; ACC=''; continue
     fi
-    [ "$IN" = 1 ] && ACC="$ACC $T"
+    # Arguments carry the destination phase and --force, so they are resolved
+    # the same way a path is. The verb was refused when it could not be read;
+    # the arguments were not, and `F=--force; phase.sh 5 $F` was the whole gate.
+    if [ "$IN" = 1 ]; then
+      resolve_tok "$T"
+      ACC="$ACC $RT"
+    fi
   done <<< "$(lex_command "$1")"
   [ "$IN" = 1 ] && eval_phase_call "$ACC"
   return 0
@@ -981,6 +1115,15 @@ phase_walk() {
 # one that decides wins — decide/deny/ask exit, and every caller is in this shell.
 eval_phase_call() {
   local ARGV=$1
+  # An argument this hook cannot read is a transition it cannot judge, and
+  # phase.sh has no gate of its own to fall back on. The verb was already
+  # refused when unresolvable; the arguments carry the destination phase and
+  # --force, so they get the same rule rather than being evaluated as if the
+  # unreadable part were absent.
+  case "$ARGV" in
+    *'$'*|*'`'*)
+      deny "This phase.sh call has an argument the shell computes at runtime ($ARGV), so which phase it would move to — and whether --force is among the arguments — cannot be read here. A transition this gate cannot evaluate is one it will not allow. Write the arguments out literally." ;;
+  esac
   # ARG has to name the destination, and a flag never does. Taking the first
   # token blindly read `phase.sh --force 5` as ARG=--force, which is not 5, so
   # the force dispatch below fell through to the Phase 4 question — asking the
@@ -1279,17 +1422,19 @@ eval_phase_call() {
   return 0
 }
 
-[ -n "$CMD" ] && phase_walk "$CMD"
-
-[ "$PHASE" -ge 4 ] && exit 0            # execute onward: normal permission flow
-
-if [ -n "$CMD" ]; then
+# The write scan comes first, and it can only ever DENY — it has no allow to
+# give. `decide` exits, so whichever check speaks first speaks for the whole
+# command: with the phase walk in front, `phase.sh status ; echo pwned >
+# src/x.ts` was allowed on the strength of the status call, and an explicit hook
+# allow bypasses the permission system rather than merely skipping a phase.
+# Ordering the refusals ahead of the decisions is what makes an allow mean "and
+# nothing else in this command objects".
+if [ "$PHASE" -lt 4 ] && [ -n "$CMD" ]; then
   collect_write_targets "$CMD"
   PATHS=$CAND
 fi
 
-
-[ -z "$PATHS" ] && exit 0
+run_write_scan() {
 
 while IFS= read -r P; do
   [ -z "$P" ] && continue
@@ -1333,5 +1478,11 @@ while IFS= read -r P; do
   is_phase_state "$P" && deny "The phase state is not yours to write."
   path_allowed_in_phase "$PHASE" "$P" || deny "$DENY_REASON"
 done <<< "$PATHS"
+  return 0
+}
+
+[ -n "$PATHS" ] && run_write_scan
+
+[ -n "$CMD" ] && phase_walk "$CMD"
 
 exit 0

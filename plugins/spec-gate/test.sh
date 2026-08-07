@@ -3880,8 +3880,14 @@ expect_b "and not at Phase 4 either"          DENY 'printf x > .git/spec-gate-ke
 setup_repo; phase start key2; phase 2; phase 3; phase 4 --force
 expect_b "the key is protected past the phase-4 exit" \
   DENY 'printf x > .git/spec-gate-key'
-expect_b "and so is the state backup the verifier uses" \
-  DENY 'rm -rf .git/spec-gate-statebak'
+expect_b "a glob that would expand onto the key" \
+  DENY 'rm -f .git/spec-gate-*'
+expect_b "and taking the whole directory it lives in" \
+  DENY 'rm -rf .git'
+# The .claude sibling must stay writable: spec-gate-test-cmd is gate config the
+# model has to be able to create, and it shares the spec-gate- prefix.
+expect_b "the test-command glob is not the key glob" \
+  ALLOW 'ls .claude/spec-gate-*'
 # Ordinary git work must not be caught by this.
 expect_b "ordinary git commands are untouched" ALLOW 'git log --oneline -5'
 expect_b "and so is writing inside .git by git itself" ALLOW 'git commit -am wip'
@@ -3911,10 +3917,25 @@ BP=$(sed -n 's/^phase=//p' .claude/.spec-phase 2>/dev/null | head -1)
   && ok "rewriting the backup does not get installed as the restore" \
   || bad "the backup was rewritten and restored as phase=$BP"
 
-# And nothing is left lying around for the next run to inherit.
+# The snapshot is held in memory, so there is nothing on disk for a payload to
+# find. A directory — even from mktemp — is walkable: deleting it was enough to
+# disarm the gate, however loudly the restore complained afterwards.
+setup_repo; phase start bak3; phase 2; phase 3
+echo 'it("f", () => expect(1).toBe(2))' > src/x.test.ts
+# TMPDIR is pointed at a scratch directory the payload then empties, so a
+# snapshot taken with mktemp -d would land there and be swept. Aimed at that
+# directory rather than at the real TMPDIR, which is where this suite keeps its
+# own fixture — the sweep would otherwise delete the repo under test.
+mkdir -p "$WORK/sweep"
+printf 'rm -f .claude/.spec-phase; rm -rf "${TMPDIR%%/}"/* 2>/dev/null; exit 1\n' \
+  > .claude/spec-gate-test-cmd
+TMPDIR="$WORK/sweep" .claude/hooks/phase.sh red >/dev/null 2>&1
+[ -f .claude/.spec-phase ] \
+  && ok "a payload sweeping TMPDIR cannot reach the snapshot" \
+  || bad "the snapshot was found on disk and the gate was disarmed"
 [ -d .git/spec-gate-statebak ] \
-  && bad "the state backup was left behind after phase.sh red" \
-  || ok "no state backup survives the run that made it"
+  && bad "a state backup directory was left on disk" \
+  || ok "and no backup directory exists to be found in the first place"
 
 ################################################################################
 # find rooted at '.' covers the state directory, so any -delete denied — which
@@ -3953,6 +3974,154 @@ expect_b "and refuses every write with no policy file to read" \
 expect_b "including the transition itself" \
   DENY '.claude/hooks/phase.sh 4'
 mv .claude/hooks/phase-policy.sh.off .claude/hooks/phase-policy.sh
+
+################################################################################
+# The verb filter skipped an assignment token whole, so nothing ever looked at
+# its value — and a redirect target that is only `$V` names no state and has no
+# literal prefix to test, so the computed-target rule found nothing either. Past
+# the phase-4 exit, where the write scan no longer runs, that made every state
+# file writable through one variable. The previous round tested the shape where
+# `.claude/` is still visible in the token; this is the other half.
+group "a path is judged after the variable holding it is resolved"
+setup_repo; phase start resolv; phase 2; phase 3; phase 4 --force
+
+expect_b "the whole path in a variable, as a redirect target" \
+  DENY 'V=.claude/.spec-phase; printf "phase=4\ntask=t\nslice=1/1\n" > $V'
+expect_b "the signing key the same way" \
+  DENY 'K=.git/spec-gate-key; printf deadbeef > $K'
+expect_b "and quoted" \
+  DENY 'V=.claude/.spec-validation; printf x > "$V"'
+expect_b "and in braces" \
+  DENY 'V=.claude/.spec-red; printf x > ${V}'
+expect_b "the same variable handed to rm" \
+  DENY 'V=.claude/.spec-phase; rm -f $V'
+# A variable that does not name state is ordinary work and must stay so.
+expect_b "an ordinary variable target is untouched" \
+  ALLOW 'L=build/out.log; echo hi > $L'
+expect_b "and an unset one is not assumed to be state" \
+  ALLOW 'echo hi > $LOGFILE'
+
+################################################################################
+# The verb was refused when it could not be resolved; the arguments were not.
+# phase.sh has no gate of its own, so the destination phase and --force arriving
+# through a variable meant the guard evaluated a call it had misread — and the
+# `case "$ARG"` had no default arm, so an unrecognised destination decided
+# nothing at all.
+group "a phase.sh call is refused when its arguments cannot be read"
+setup_repo; phase start argres; phase 2; phase 3; phase 4 --force
+
+expect_b "the control refuses"                DENY '.claude/hooks/phase.sh 5 --force'
+expect_b "--force through a variable"         DENY 'F=--force; .claude/hooks/phase.sh 5 $F'
+expect_b "the destination through a variable" DENY 'N=5; .claude/hooks/phase.sh $N --force'
+expect_b "a destination from a substitution"  DENY '.claude/hooks/phase.sh $(echo 5) --force'
+expect_b "arguments arriving on xargs stdin"  DENY 'printf %s "5 --force" | xargs .claude/hooks/phase.sh'
+PH=$(.claude/hooks/phase.sh status 2>&1 | head -1)
+printf '%s' "$PH" | grep -q 'phase 4' \
+  && ok "and none of them moved the phase" \
+  || bad "the phase moved: $PH"
+# Resolvable arguments still work, in both directions.
+setup_repo; phase start argres2; phase 2; phase 3
+expect_b "a resolvable variable is read, not just refused" \
+  DENY 'N=4; .claude/hooks/phase.sh $N'
+expect_b "and reading the phase is still free" \
+  ALLOW 'C=status; .claude/hooks/phase.sh $C'
+
+################################################################################
+# decide/deny/ask all exit, and the phase walk runs before the write scan — so
+# the first call that produced a decision ended the hook and spoke for the whole
+# command. The deny direction was fixed by judging every call; the allow and ask
+# directions were not, and an early one authorised everything after it.
+group "an allow speaks for one call, not for the command"
+setup_repo; phase start shortc; phase 2; phase 3
+
+expect_b "the write alone is refused" DENY 'echo pwned > src/evil.ts'
+expect_b "and a read-only phase call does not launder it" \
+  DENY '.claude/hooks/phase.sh status ; echo pwned > src/evil.ts'
+expect_b "nor does one that would be asked about" \
+  DENY '.claude/hooks/phase.sh slices 2 ; echo pwned > src/evil.ts'
+expect_b "nor a transition that is allowed on its own" \
+  DENY '.claude/hooks/phase.sh 2 ; echo pwned > src/evil.ts'
+# The allow itself must survive when nothing else in the command objects.
+expect_b "a lone allowed call is still allowed" ALLOW '.claude/hooks/phase.sh status'
+expect_b "and one beside harmless work"         ALLOW '.claude/hooks/phase.sh status ; ls src/'
+
+################################################################################
+# `<<<` was lexed as a plain segment separator, so the script after it became an
+# ordinary word in a new segment, was never re-read as shell, and the
+# reads-stdin refusal could not fire because neither a redirect nor a pipe was
+# involved.
+group "a herestring handed to a shell is shell"
+setup_repo; phase start herestr; phase 2; phase 3
+
+expect_b "a shell reading its script from a herestring" \
+  DENY "bash <<< 'rm -f .claude/.spec-phase; echo gone'"
+expect_b "a transition hidden in one" \
+  DENY "bash <<< '.claude/hooks/phase.sh 4 --force'"
+expect_b "a production write hidden in one" \
+  DENY "bash <<< 'echo pwned > src/evil.ts'"
+expect_b "and an interpreter given one" \
+  DENY "python3 <<< 'import os; os.remove(\".claude/.spec-phase\")'"
+# A herestring to something that is not a shell is data.
+expect_b "a herestring into grep is just input" ALLOW "grep -q orig <<< 'orig'"
+
+################################################################################
+# The SEP for an operator was emitted the moment the operator was seen, while
+# only the end-of-line SEP was held back for a pending heredoc. So on `bash
+# <<EOF | cat` the body arrived after the segment had already closed and the
+# verb had become `cat`, and the body was discarded as prose.
+group "a heredoc body belongs to the verb that opened it"
+setup_repo; phase start hdverb; phase 2; phase 3
+
+expect_b "a heredoc into a shell, piped onward" DENY 'bash <<EOF | cat
+rm -f .claude/.spec-phase
+EOF'
+expect_b "a transition in one" DENY 'bash <<EOF | cat
+.claude/hooks/phase.sh 4 --force
+EOF'
+expect_b "an interpreter heredoc, piped onward" DENY 'python3 <<EOF | cat
+import os
+os.remove(".claude/.spec-phase")
+EOF'
+expect_b "and one joined with &&" DENY 'bash <<EOF && echo done
+rm -f .claude/.spec-phase
+EOF'
+# Prose piped onward is still prose.
+expect_b "a journal entry piped onward is not a program" ALLOW ".claude/hooks/phase.sh journal <<'EOF' | cat
+tried to write .claude/.spec-phase and the guard refused, correctly
+EOF"
+
+################################################################################
+# The byte budget bounded the bash side, but the whole lexer runs first and
+# builds each word one character at a time, which is quadratic. The cost was
+# therefore paid in full before any counter moved: 700 KB in one word took 23s
+# against a 15s timeout, and a killed hook emits no decision.
+group "the cost is bounded before the lexer runs"
+setup_repo; phase start prelex; phase 2; phase 3
+
+for KB in 200 700; do
+  BIGW=$(python3 -c "print('A' * ($KB * 1000))")
+  T0=$(date +%s)
+  D=$(guard "$(pl_bash "echo '$BIGW' > src/evil.ts")")
+  T1=$(date +%s)
+  [ "$D" = DENY ] \
+    && ok "a ${KB} KB word is refused" \
+    || bad "a ${KB} KB word was $D"
+  [ $((T1 - T0)) -le 5 ] \
+    && ok "and decided in $((T1 - T0))s, not at the timeout" \
+    || bad "a ${KB} KB word took $((T1 - T0))s — past the timeout, so it fails open"
+done
+
+# Prose stays cheap: a heredoc body is read a line at a time, never a character
+# at a time, so a long document must not be caught by the same bound.
+LONGDOC=$(python3 -c "print('\n'.join('line %d of a long plan document' % i for i in range(3000)))")
+T0=$(date +%s)
+expect_b "a 3000-line journal entry is still prose" ALLOW ".claude/hooks/phase.sh journal <<'EOF'
+$LONGDOC
+EOF"
+T1=$(date +%s)
+[ $((T1 - T0)) -le 5 ] \
+  && ok "and costs $((T1 - T0))s" \
+  || bad "a long document took $((T1 - T0))s"
 
 ################################################################################
 printf '\n%s%d passed, %d failed%s\n' "$B" "$PASS" "$FAIL" "$N"

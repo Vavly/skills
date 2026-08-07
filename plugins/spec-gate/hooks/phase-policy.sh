@@ -66,19 +66,23 @@ spec_key() {
 # loses — which is a property of the reader, not of the construction, and would
 # quietly become a hole the day a reader changed to last-match-wins. Separators
 # keep the two key halves from merging with the body.
+#
+# One construction, deliberately, even though openssl could give a real HMAC.
+# Two constructions meant two different tags for the same input, so a host where
+# openssl was on PATH when the marker was written and absent when it was read
+# reported a genuinely recorded report as FORGED. It failed closed, but "your
+# validation report evaporated because a tool moved on PATH" is not a failure
+# anyone can act on. openssl would also have put the key on the command line,
+# where any local `ps` reads it.
 spec_mac() {
   _k=$(spec_key) || return 1
   _m=$(printf '%s\x1f%s\x1f%s' "$_k" "$1" "$_k")
-  if command -v openssl >/dev/null 2>&1; then
-    printf '%s' "$1" | openssl dgst -sha256 -hmac "$_k" 2>/dev/null | sed 's/.*= *//' | grep -q . && {
-      printf '%s' "$1" | openssl dgst -sha256 -hmac "$_k" 2>/dev/null | sed 's/.*= *//'
-      return 0
-    }
-  fi
   if command -v shasum >/dev/null 2>&1; then
     printf '%s' "$_m" | shasum -a 256 | cut -d' ' -f1
   elif command -v sha256sum >/dev/null 2>&1; then
     printf '%s' "$_m" | sha256sum | cut -d' ' -f1
+  elif command -v openssl >/dev/null 2>&1; then
+    printf '%s' "$_m" | openssl dgst -sha256 | sed 's/.*= *//'
   else
     return 1
   fi
@@ -124,95 +128,64 @@ validation_marker_status() {   # $1 = marker path, $2 = task, $3 = slice
 # workflow: write the payload, then run the gate's own verifier.
 #
 # A static scan of the payload would be the same losing game as the verb list,
-# so the state is snapshotted under .git/ instead and restored afterwards. That
-# holds whatever the command does — obfuscated, nested, or spawned — because it
-# is checked on the way out rather than predicted on the way in.
-# The backup lives outside the repo, at a path held only in this variable. It
-# used to sit at a fixed, guessable path under .git/, which the executed command
-# could reach: deleting it made restore report "nothing moved", and rewriting it
-# made restore install the rewrite while announcing the damage had been undone.
-# Both were the snapshot being turned against the gate it protects.
-SPEC_BAK=""
-SPEC_BAK_SIG=""
-
-# One name per state path, hashed rather than punched through `tr`, so two paths
-# cannot collapse onto one backup file as the list grows.
-spec_bak_name() {
-  if command -v shasum >/dev/null 2>&1; then
-    printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1
-  elif command -v sha256sum >/dev/null 2>&1; then
-    printf '%s' "$1" | sha256sum | cut -d' ' -f1
-  else
-    printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'
-  fi
-}
-
-# A signature over the backup itself, kept in memory. Comparing it afterwards is
-# what makes a rewritten backup detectable — the on-disk copy alone can be
-# edited by the very command it exists to survive.
-spec_bak_sig() {
-  [ -d "$1" ] || return 1
-  ( cd "$1" 2>/dev/null || exit 1
-    for f in *; do
-      [ -f "$f" ] || continue
-      if command -v shasum >/dev/null 2>&1; then printf '%s ' "$f"; shasum -a 256 "$f"
-      elif command -v sha256sum >/dev/null 2>&1; then printf '%s ' "$f"; sha256sum "$f"
-      else printf '%s %s\n' "$f" "$(wc -c < "$f")"
-      fi
-    done ) 2>/dev/null | sort
-}
+# so the state is snapshotted instead and restored afterwards. That holds
+# whatever the command does — obfuscated, nested, or spawned — because it is
+# checked on the way out rather than predicted on the way in.
+#
+# The snapshot is held in a shell variable, not on disk. A directory — even one
+# from mktemp — is findable: the executed test command can walk $TMPDIR, and
+# deleting the backup was enough to disarm the gate even though the restore
+# refused loudly afterwards. There is nothing on disk to find now, and nothing
+# for the payload to rewrite, so the whole "the snapshot was compromised" branch
+# disappears rather than being defended.
+#
+# Records are <path>FS<content>GS. Those two control characters cannot occur in
+# any of these files, all of which are line-oriented text.
+SPEC_SNAP=""
 
 spec_state_save() {
-  SPEC_BAK=$(mktemp -d 2>/dev/null) || return 1
-  [ -n "$SPEC_BAK" ] || return 1
+  SPEC_SNAP=""
   while IFS= read -r s; do
     [ -z "$s" ] && continue
     f="${PROJECT_DIR%/}/$s"
     [ -f "$f" ] || continue
-    cp "$f" "$SPEC_BAK/$(spec_bak_name "$s")" || { spec_state_discard; return 1; }
+    SPEC_SNAP="$SPEC_SNAP$s"$'\034'"$(cat "$f")"$'\035'
   done <<< "$(spec_state_list)"
-  SPEC_BAK_SIG=$(spec_bak_sig "$SPEC_BAK")
   return 0
 }
 
-spec_state_discard() {
-  [ -n "$SPEC_BAK" ] && rm -rf "$SPEC_BAK" 2>/dev/null
-  SPEC_BAK=""; SPEC_BAK_SIG=""
-  return 0
-}
+spec_state_discard() { SPEC_SNAP=""; return 0; }
 
-# 0 = nothing moved. 1 = something moved and has been put back. 2 = the backup
-# itself is gone or altered, so nothing was put back and the caller must not
-# claim otherwise.
-#
-# The 2 case is why the signature is checked before anything is copied. A
-# rewritten backup restored on top of the live files installs the rewrite while
-# the message says the damage was undone — the tamper laundered through the
-# mechanism built to catch it. A backup that cannot be trusted is not used at
-# all; the refusal says so and points at recovery.
+# 0 = nothing moved. 1 = something moved and has been put back. 2 = a restore
+# was needed and could not be written, so the caller must not claim the state
+# was recovered.
 spec_state_restore() {
-  [ -n "$SPEC_BAK" ] || return 2
-  if [ ! -d "$SPEC_BAK" ]; then SPEC_BAK=""; SPEC_BAK_SIG=""; return 2; fi
-  if [ "$(spec_bak_sig "$SPEC_BAK")" != "$SPEC_BAK_SIG" ]; then
-    spec_state_discard
-    return 2
-  fi
   touched=0
+  rest=$SPEC_SNAP
+  seen=""
+  while [ -n "$rest" ]; do
+    rec=${rest%%$'\035'*}
+    rest=${rest#*$'\035'}
+    [ -z "$rec" ] && continue
+    sp=${rec%%$'\034'*}
+    sc=${rec#*$'\034'}
+    f="${PROJECT_DIR%/}/$sp"
+    seen="$seen$sp"$'\n'
+    if [ ! -f "$f" ] || [ "$(cat "$f" 2>/dev/null)" != "$sc" ]; then
+      touched=1
+      mkdir -p "$(dirname "$f")" 2>/dev/null
+      printf '%s\n' "$sc" > "$f" 2>/dev/null || { spec_state_discard; return 2; }
+    fi
+  done
+  # Anything that was not there before and is now was invented while the command
+  # ran, so it goes.
   while IFS= read -r s; do
     [ -z "$s" ] && continue
+    case "$seen" in
+      *"$s"$'\n'*) continue ;;
+    esac
     f="${PROJECT_DIR%/}/$s"
-    k="$SPEC_BAK/$(spec_bak_name "$s")"
-    if [ -f "$k" ]; then
-      if [ ! -f "$f" ] || ! cmp -s "$k" "$f"; then
-        touched=1
-        mkdir -p "$(dirname "$f")" 2>/dev/null
-        cp "$k" "$f" 2>/dev/null || { spec_state_discard; return 2; }
-      fi
-    elif [ -f "$f" ]; then
-      # Nothing was there before, so whatever wrote this invented it.
-      rm -f "$f" 2>/dev/null
-      touched=1
-    fi
+    if [ -f "$f" ]; then rm -f "$f" 2>/dev/null; touched=1; fi
   done <<< "$(spec_state_list)"
   spec_state_discard
   [ "$touched" = 0 ]
