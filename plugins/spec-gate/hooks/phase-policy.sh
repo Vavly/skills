@@ -360,11 +360,17 @@ review_exclude_list() {
   fi
 }
 
+# The `.tmp.<pid>` arm covers the sibling a state file is written through.
+# .spec-approval is written atomically via .spec-approval.tmp.$$ and renamed, and
+# `.spec-approval.tmp.4321` is not `.spec-approval`, so a Stop scan landing
+# inside that window armed the gate on the act of recording an answer — the
+# failure this list exists to make impossible regardless of how the install
+# gitignored things.
 is_review_excluded() {
   p="$1"
   while IFS= read -r e; do
     [ -z "$e" ] && continue
-    case "$p" in "$e"|"$e"/*) return 0 ;; esac
+    case "$p" in "$e"|"$e"/*|"$e".tmp.*) return 0 ;; esac
   done <<< "$(review_exclude_list)"
   return 1
 }

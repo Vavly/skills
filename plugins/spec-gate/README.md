@@ -48,7 +48,8 @@ spec-gate/
 │   ├── approval-receipt.sh          → .claude/hooks/   PostToolUse hook
 │   ├── review-bookmark.sh           → .claude/hooks/   SubagentStart/Stop hook
 │   ├── phase-policy.sh              → .claude/hooks/   shared policy, sourced
-│   ├── phase.sh                     → .claude/hooks/   phase state CLI
+│   ├── phase.sh                     → .claude/hooks/   phase state CLI, and the
+│   │                                   SessionStart hook (`phase.sh brief`)
 │   ├── phase-shim.sh                → .claude/hooks/phase.sh on a PLUGIN install:
 │   │                                   a pointer to the central copy, no policy
 │   ├── cursor-guard.sh              → .claude/hooks/   Cursor adapter
@@ -1369,6 +1370,47 @@ shipping unexamined. The fingerprint includes content hashes of untracked files,
 so rewriting a brand-new file counts as a change — which is the common case,
 since new files are usually the actual work.
 
+## Surviving the conversation
+
+A sliced task outlives the conversation that started it. Compaction fires
+mid-turn without asking, `/clear` happens, and the session that comes back has
+no memory of the task while the repo is still mid-phase with the gates armed.
+
+Most of what a resuming session needs was already on disk — the phase, the spec,
+the plan, every reviewer verdict, and what shipped in git. Nothing read it back.
+
+**`phase.sh brief`** is a `SessionStart` hook (`startup`, `resume`, `clear`,
+`compact`) whose stdout is added to the model's context. It reports the task,
+the phase, the spec path, what is uncommitted, the answers already given, the
+journal, and the reviewer verdicts recorded since this task started. It is
+silent when no task is armed, and it prints each line only at the phases where
+that line can be true — a briefing that tells a resuming session its verified
+tests were unverified is worse than no briefing.
+
+Three things could previously only be said out loud, and so could not be handed
+over at all:
+
+| Command | Writes | Read back by |
+|---|---|---|
+| `phase.sh validation` | `.claude/.spec-validation` | the 4→5 gate, and `brief` |
+| `phase.sh journal` | `.claude/spec-journal.md` | `brief` |
+| — | `.claude/review-log.jsonl` | `brief` |
+
+Both commands take the body on **stdin** and refuse an empty one, so neither can
+record a header with nothing under it. `phase.sh validation` additionally clears
+the 4→5 gate, which is why it is phase state and not the model's to write.
+
+The journal is the one part of the briefing the model wrote itself, and it is
+labelled as testimony rather than as state — as are the reviewer verdicts, which
+are one agent's reading of a diff. Everything above those two lines was written
+by a hook the model cannot reach.
+
+**The journal is gitignored, so `off` and `start` destroy it unrecoverably.**
+Both say so, as do the restart, abandon and disarm options. The review log is
+*not* deleted — it is the only durable record that a review happened — but
+`brief` shows only the verdicts recorded since the current task started, so a
+new task does not open on the last one's findings.
+
 ## What is actually enforced
 
 `PreToolUse` hooks fire before the permission-mode check, in every mode
@@ -1379,9 +1421,13 @@ covered by a case in `test.sh`:
   per-call for `Edit`/`Write`/`NotebookEdit` and for the Bash write forms whose
   target can be parsed; caught per-turn by the phase scan for everything else.
 - **The model cannot advance its own phase** past the three approval gates, and
-  cannot touch any phase state file by any means — including the RED receipt and
-  the approval receipt. The transitions it may make either restrict it or
-  increase scrutiny.
+  cannot touch any phase state file — including the RED receipt, the approval
+  receipt and the Phase 4 validation marker. The transitions it may make either
+  restrict it or increase scrutiny. The check reads the *tokens the shell would
+  produce*, not the command text, so a quote-split path (`.spec-vali''dation`),
+  a glob (`rm -f .claude/.spec-*`), `rm -rf .claude`, and `git clean -x/-X` —
+  which removes every state file precisely because they are all gitignored — are
+  each denied. Reading the text alone allowed all four.
 - **An approval is an answer the user gave, not a claim the model makes.** The
   three gates allow on a receipt written by a `PostToolUse` hook from an
   `AskUserQuestion` response — a value that reaches the hook from the host, which
@@ -1419,6 +1465,14 @@ covered by a case in `test.sh`:
 - **A verified test cannot be edited on the way to Phase 4.** The RED receipt
   pins the content of every test file it saw fail, so verifying red and then
   quietly changing a test puts 3→4 back behind a denial.
+- **Phase 4 cannot be left without a recorded validation report.** `phase.sh 5`
+  is denied until `phase.sh validation` has written one, the same shape as 3→4
+  refusing without a RED receipt. An empty or whitespace-only report is refused
+  rather than recorded, so the marker cannot certify that nothing was run, and
+  the marker pins the task and slice it was written for — re-slicing voids it.
+  `5 --force` overrides this, through its own gate (`force-validation`) with its
+  own question: an answer about unlocking production code without RED is not
+  redeemable for entering review with the checks unrun.
 - **The workflow cannot end silently.** `phase.sh off` prompts from phases 4–5
   and is denied outright from 1–3, so the model cannot close out a task on its
   own judgment. Whether it *asks well* before that prompt is instructed, not

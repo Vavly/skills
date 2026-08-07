@@ -66,7 +66,19 @@ fi
 # The state file is written from exactly one place, so a field cannot be dropped
 # by a caller that forgot it existed. Adding `slice` to a `printf` in three
 # separate branches is how the task name would have gone missing on the fourth.
-write_state() { printf 'phase=%s\ntask=%s\nslice=%s\n' "$1" "$2" "$3" > "$STATE"; }
+#
+# `started` is carried forward rather than passed in, for the same reason: every
+# transition rewrites this file, and a caller that had to re-supply the stamp
+# would eventually reset it and silently re-date the task. `start` deletes the
+# file first, which is what makes a new task get a new stamp. An older install
+# has no stamp at all, and everything reading it treats absent as "unknown" and
+# falls back to today's behaviour.
+write_state() {
+  local S=''
+  [ -f "$STATE" ] && S=$(sed -n 's/^started=//p' "$STATE" 2>/dev/null | head -1)
+  [ -n "$S" ] || S=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+  printf 'phase=%s\ntask=%s\nslice=%s\nstarted=%s\n' "$1" "$2" "$3" "$S" > "$STATE"
+}
 
 # Indexing an array with an unvalidated value out of the state file used to
 # abort this script with "unbound variable" under set -u. A case is total.
@@ -528,6 +540,10 @@ case "${1:-status}" in
     mkdir -p "$STATE_DIR"
     # A newline in the task name would inject extra lines into the state file.
     T=$(printf '%s' "${2:-unnamed}" | tr -d '\n\r')
+    # Removed rather than overwritten, so write_state stamps a new `started`
+    # instead of carrying the previous task's forward. That stamp is what scopes
+    # the reviewer verdicts in `brief` to this task.
+    rm -f "$STATE"
     write_state 1 "$T" "1/1"
     # The journal goes too: a new task inheriting the last one's validation report
     # and findings is a briefing that lies, and it lies most convincingly to the
@@ -772,29 +788,57 @@ case "${1:-status}" in
       echo "Journal: empty. Nothing has been recorded for this task yet."
       echo
     fi
+    # The log is append-only and spans the repo, not the task. Printed whole, a
+    # brand-new task's briefing opened with a verdict about work it has nothing
+    # to do with — in the register this briefing reserves for facts read off
+    # disk. It is filtered rather than deleted: it is the only durable record
+    # that a review ever happened, and `start` throwing it away would destroy
+    # the audit trail to fix a display bug.
+    #
+    # SINCE empty (an install predating the stamp) means unfiltered, which is
+    # today's behaviour rather than an empty section.
+    SINCE=$(sed -n 's/^started=//p' "$STATE" 2>/dev/null | head -1)
     if [ -s "$STATE_DIR/review-log.jsonl" ]; then
-      echo "Reviewer verdicts on record — the last 5, oldest first:"
+      # Filtered first, THEN the last 5: taking the tail first meant five old
+      # entries hid two current ones. And the header is printed from the result
+      # rather than ahead of it — jq aborts the whole stream on the first
+      # malformed line, so a log torn by a killed hook produced the sentence
+      # "Reviewer verdicts on record" with nothing underneath it.
+      VERD=''
       if command -v jq >/dev/null 2>&1; then
-        tail -5 "$STATE_DIR/review-log.jsonl" \
-          | jq -r '"  \(.t) \(.agent): \(((.msg // "") | split("\n") | map(select(length > 0)) | first // "")[0:160])"' \
-            2>/dev/null
+        # -R with fromjson? skips a torn line instead of ending the stream.
+        VERD=$(jq -Rr --arg since "$SINCE" '
+          fromjson? // empty
+          | select($since == "" or (.t // "") >= $since)
+          | "  \(.t) \(.agent): \(((.msg // "") | split("\n") | map(select(length > 0)) | first // "")[0:160])"' \
+          "$STATE_DIR/review-log.jsonl" 2>/dev/null | tail -5)
       elif command -v python3 >/dev/null 2>&1; then
         # Same fallback phase-guard.sh already relies on. Silently skipping this
         # section on a machine without jq made a briefing with no reviewer
         # history look like a task that had never been reviewed.
-        tail -5 "$STATE_DIR/review-log.jsonl" | python3 -c '
+        VERD=$(python3 -c '
 import sys, json
+since = sys.argv[1]
 for line in sys.stdin:
     try: d = json.loads(line)
     except Exception: continue
+    if since and (d.get("t") or "") < since: continue
     msg = (d.get("msg") or "").split("\n")
     first = next((s for s in msg if s), "")
-    print("  %s %s: %s" % (d.get("t"), d.get("agent"), first[:160]))' 2>/dev/null
+    print("  %s %s: %s" % (d.get("t"), d.get("agent"), first[:160]))' \
+          "$SINCE" < "$STATE_DIR/review-log.jsonl" 2>/dev/null | tail -5)
       else
-        echo "  (neither jq nor python3 is installed, so the verdicts could not be read;"
-        echo "   they are in .claude/review-log.jsonl)"
+        VERD="  (neither jq nor python3 is installed, so the verdicts could not be read;
+   they are in .claude/review-log.jsonl)"
       fi
-      echo
+      if [ -n "$VERD" ]; then
+        echo "Reviewer verdicts on record for this task — the last 5, oldest first."
+        echo "Like the journal, these are a reviewer's claims about the work, not"
+        echo "verified state: a verdict of 'sound' is one agent's reading, and the"
+        echo "fixes it describes are only as done as the diff says they are."
+        printf '%s\n' "$VERD"
+        echo
+      fi
     fi
     # Only Phase 5 has reviewer sessions to have lost. Said at Phase 1 it is a
     # warning about something that does not exist yet, and the reader who learns

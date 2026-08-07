@@ -394,14 +394,142 @@ fi
 # --- Phase state is off limits, in every phase -------------------------------
 # Checked before the phase>=4 early exit below. Otherwise at Phase 5 the model
 # could write phase=4 and suppress the review gate, and at any phase it could
-# `rm` the state file to unlock production writes. Denying every command that
-# so much as mentions the file is blunt but breaks nothing: the model reads
-# phase state through `phase.sh status`, never through the file.
-if [ -n "$CMD" ]; then
-  case "$CMD" in
-    *.spec-phase*|*.spec-baseline*|*.spec-red*|*.spec-approval*|*.spec-scaffold*|*.spec-validation*)
-      deny "The phase state is not yours to edit, move or remove — .spec-red, .spec-approval and .spec-validation included, because a receipt you could write by hand would assert RED without running anything, record an approval the user never gave, or claim this repo's checks passed with none of them run. Change phases with phase.sh <n>, verify RED with phase.sh red, record the Phase 4 checks with phase.sh validation, ask the user with phase.sh ask <gate>, and read the current phase with phase.sh status." ;;
+# `rm` the state file to unlock production writes.
+#
+# This used to conclude on a substring of the raw command, and the raw command
+# is not what the shell runs. Every one of these was ALLOW:
+#
+#   printf x > .claude/.spec-vali''dation   same inode, no `.spec-validation`
+#   rm -f .claude/.spec-*                   names nothing until the glob expands
+#   git clean -fdx                          names nothing, removes all of them
+#   rm -rf .claude                          takes the directory instead
+#
+# The first is the 4 -> 5 marker at the only phase it exists in; the last two
+# sweep the whole gate away with no evasion in them at all. Concluding on text
+# also denied a journal entry for *describing* a state file, because a substring
+# cannot tell shell from a heredoc body — the same mistake in the other
+# direction. So the tokens the shell would actually produce are what decides
+# now, and a phase-state hit is denied wherever it appears, in any verb.
+#
+# Deliberately not gated behind a cheap `case "$CMD"` pre-filter. That is one
+# more list of spellings to be incomplete, which is the bug being fixed; one awk
+# pass on a command line is cheaper than the class of hole it closes.
+STATE_DIR_REL=.claude
+
+# True when a path, once normalised, is the directory holding the state files or
+# an ancestor of it. `rm -rf .claude` and `rm -rf .` remove every state file
+# without naming one.
+covers_state_dir() {
+  local p=$1
+  p=${p%/}; p=${p#./}
+  [ -z "$p" ] && return 0
+  case "$p" in
+    .|..) return 0 ;;
+    "$STATE_DIR_REL") return 0 ;;
+    /*) case "${PROJECT_DIR%/}/$STATE_DIR_REL" in
+          "$p"|"$p"/*) return 0 ;;
+        esac ;;
   esac
+  return 1
+}
+
+# A glob is matched the other way round from an ordinary path: the token is the
+# pattern and the state file is the subject, because that is what the shell will
+# do with it.
+glob_hits_state() {
+  local tok=$1 s
+  case "$tok" in
+    *'*'*|*'?'*|*'['*) ;;
+    *) return 1 ;;
+  esac
+  while IFS= read -r s; do
+    [ -z "$s" ] && continue
+    is_phase_state "$s" || continue
+    # shellcheck disable=SC2254
+    case "$s" in $tok) return 0 ;; esac
+    # shellcheck disable=SC2254
+    case "${PROJECT_DIR%/}/$s" in $tok) return 0 ;; esac
+  done <<< "$(spec_state_list)"
+  return 1
+}
+
+STATE_MSG="The phase state is not yours to edit, move or remove — .spec-red, .spec-approval and .spec-validation included, because a receipt you could write by hand would assert RED without running anything, record an approval the user never gave, or claim this repo's checks passed with none of them run. Change phases with phase.sh <n>, verify RED with phase.sh red, record the Phase 4 checks with phase.sh validation, ask the user with phase.sh ask <gate>, and read the current phase with phase.sh status."
+
+scan_state_tokens() {
+  local KIND VAL T IS_VERB VERB='' EXPECT_VERB=1 GITCLEAN=0
+  while IFS=$'\t' read -r KIND VAL; do
+    case "$KIND" in
+      SEP) VERB=''; EXPECT_VERB=1; GITCLEAN=0; continue ;;
+      OP)  continue ;;                    # the redirect target arrives as the next WORD
+    esac
+    T=$VAL
+    [ -z "$T" ] && continue
+
+    IS_VERB=0
+    if [ "$EXPECT_VERB" = 1 ]; then
+      case "${T##*/}" in
+        *=*|sudo|env|command|nohup|time|xargs|exec) continue ;;
+        -*) continue ;;
+      esac
+      VERB=${T##*/}
+      EXPECT_VERB=0
+      IS_VERB=1
+    else
+      case "$VERB" in
+        git) [ "$T" = clean ] && GITCLEAN=1 ;;
+      esac
+      # `git clean -x` and `-X` are the only ordinary commands that remove these
+      # files, and they do it precisely because the files are gitignored by
+      # design — so no commit can protect them and nothing else in this hook
+      # would ever see a path.
+      if [ "$GITCLEAN" = 1 ]; then
+        case "$T" in
+          --) ;;
+          -[!-]*) case "$T" in
+                    *x*|*X*) deny "git clean -x/-X removes ignored files, and every spec-gate state file is ignored by design — this would disarm the workflow silently, leaving no phase, no receipts and no record that a gate was ever armed. Clean specific paths instead, or run 'phase.sh off' if the intent is to end the task." ;;
+                  esac ;;
+        esac
+      fi
+    fi
+
+    # A quoted string handed to a shell is not data, it is shell. Re-read it,
+    # the way collect_write_targets already does for write targets — otherwise
+    # `bash -c "rm -f .claude/.spec-red"` is one opaque word to every check
+    # below. Reading the raw command text used to cover this by accident.
+    #
+    # Arguments only. Recursing on the verb re-read the word `bash` as a command
+    # whose verb is `bash`, forever, and the hook died on a stack overflow — a
+    # crashed PreToolUse hook produces no JSON, which Claude Code reads as no
+    # decision, so the fail-open was total.
+    if [ "$IS_VERB" = 0 ]; then
+      case "$VERB" in
+        sh|bash|zsh|ksh|dash|eval)
+          case "$T" in
+            -*) ;;
+            *) scan_state_tokens "$T" ;;
+          esac ;;
+      esac
+    fi
+
+    is_phase_state "$T" && deny "$STATE_MSG"
+    glob_hits_state "$T" && deny "$STATE_MSG"
+
+    # Removing the directory is removing the files in it. Restricted to verbs
+    # that destroy, because `.claude` also holds the hooks, the settings and the
+    # skills, and the model reads all three.
+    case "$VERB" in
+      rm|unlink|shred|rmdir|mv)
+        case "$T" in
+          -*) ;;
+          *) covers_state_dir "$T" && deny "$STATE_MSG" ;;
+        esac ;;
+    esac
+  done <<< "$(lex_command "$1")"
+  return 0
+}
+
+if [ -n "$CMD" ]; then
+  scan_state_tokens "$CMD"
 fi
 if [ -n "$PATHS" ] && is_phase_state "$PATHS"; then
   deny "The phase state is not yours to edit. Phases change by running phase.sh <n>, and the ones that are the user's change on an answer they gave — never by writing this file."
@@ -505,7 +633,15 @@ if [ -n "$CMD" ] && printf '%s' "$CMD" | grep -qE '(^|[^[:alnum:]_.+-])phase\.sh
   # since the receipt records the gate and not the transition. ARG is the first
   # non-flag token after phase.sh, so it names the destination phase whichever
   # side of the flag it was typed on.
-  case "$CMD" in
+  # Matched on ARGV, not on the whole command. Scanning the raw text meant the
+  # flag was "present" when it appeared in a heredoc body — and `journal` and
+  # `validation` exist to write prose about this workflow, which is prose that
+  # says --force. Recording that you forced the RED gate was itself denied, and
+  # the question the user got was about unlocking production code in order to
+  # save a note. `git push --force && phase.sh status` did the same from a
+  # command that has nothing to do with phases. ARGV is bounded to phase.sh's
+  # own segment and stops at the first line, so both are outside it.
+  case "$ARGV" in
     *--force*)
       case "$ARG" in
         5) gated_advance force-validation "advancing to Phase 5 with --force, which enters adversarial review with no record that this repo's own build, lint or test commands were ever run against the finished work" ;;
