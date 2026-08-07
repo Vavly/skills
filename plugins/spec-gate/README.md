@@ -1421,13 +1421,25 @@ covered by a case in `test.sh`:
   per-call for `Edit`/`Write`/`NotebookEdit` and for the Bash write forms whose
   target can be parsed; caught per-turn by the phase scan for everything else.
 - **The model cannot advance its own phase** past the three approval gates, and
-  cannot touch any phase state file — including the RED receipt, the approval
-  receipt and the Phase 4 validation marker. The transitions it may make either
-  restrict it or increase scrutiny. The check reads the *tokens the shell would
-  produce*, not the command text, so a quote-split path (`.spec-vali''dation`),
-  a glob (`rm -f .claude/.spec-*`), `rm -rf .claude`, and `git clean -x/-X` —
-  which removes every state file precisely because they are all gitignored — are
-  each denied. Reading the text alone allowed all four.
+  every phase.sh call in a command is judged rather than one of them — appending
+  `; phase.sh status` used to launder any transition. The transitions it may make
+  either restrict it or increase scrutiny.
+- **Writes to a phase state file are denied in the common spellings.** The check
+  reads the *tokens the shell would produce*, not the command text, so a
+  quote-split path (`.spec-vali''dation`), a glob (`rm -f .claude/.spec-*`), a
+  glob relative to a `cd`, `rm -rf .claude`, `find .claude -delete`, an
+  interpreter (`python3 -c "os.remove(...)"`), a nested or fused shell payload
+  (`bash -c'...'`), an env-assignment prefix, and `git clean -x/-X` and
+  `git stash --all` — which remove every state file precisely because they are
+  all gitignored — are each denied. A write target the shell computes at runtime
+  is denied at every phase when the computed text names state. This is a list of
+  spellings and is **not** claimed to be complete; see the threat model below.
+- **The Phase 4 validation marker is authenticated, not merely present.** It
+  carries a keyed hash of its own fields, with the key under `.git/` where no
+  working-tree wipe reaches it. A marker written by hand does not verify and is
+  treated as absent, so a missed write spelling costs a re-run rather than the
+  gate. `phase.sh red` also snapshots and restores the gate's state around the
+  configured test command, which is model-authored shell it must be free to write.
 - **An approval is an answer the user gave, not a claim the model makes.** The
   three gates allow on a receipt written by a `PostToolUse` hook from an
   `AskUserQuestion` response — a value that reaches the hook from the host, which
@@ -1494,6 +1506,49 @@ Two limits worth stating plainly, since both look like enforcement and are not:
 - Phase 4 exit and Phase 5 are unenforced between each other: if the user never
   advances to 5, the diff is never gated. The user *is* the checkpoint by design.
 
+## Threat model
+
+What this gate is for: **keeping a well-behaved model from drifting past a
+checkpoint.** Writing code before anyone agreed what it should do, calling tests
+verified without running them, advancing on its own judgment where the user was
+meant to decide, ending a task on an unreviewed diff. Against that it is
+effective, and the mechanical parts of it are hard to get around by accident.
+
+What it is **not**: a sandbox. It does not contain a model that is actively
+working to get out, and it cannot be made to. The Bash guard reads a command
+string and decides what the shell would do with it — that is an unbounded
+problem, and three review rounds have each found a spelling the previous one
+missed (`printf x > .claude/.spec-vali''dation`, then `git clean -fdx`, then
+`cd .claude && rm -f .spec-*`). Each was closed. The next round will find
+another, because the list is a list and the space is not.
+
+Where that leaves the design:
+
+- **Deletion is contained by the guard; forgery is contained by the marker.**
+  Removing a state file only re-arms a gate — the costly failure is *clearing*
+  one, so the marker that clears 4 → 5 carries a keyed hash and a file written by
+  hand is treated as absent. That is the property worth relying on, and it does
+  not depend on the guard's spelling list being complete.
+- **The key is under `.git/`, not in the working tree**, so the commands that
+  wipe every state file (`git clean -fdx`, `git stash --all`, `rm -rf .claude`)
+  do not reach it. Anything that can *read* the key can mint a marker; this
+  raises the cost of forgery, it does not make it impossible.
+- **An interpreter payload is checked by substring, not parsed.** `python3 -c`
+  and `node -e` take code this hook cannot lex. It refuses one that names a state
+  file; it cannot see through obfuscation, and does not claim to.
+- **Running out of scan budget is a denial.** A hook that gets killed emits no
+  JSON, and no JSON reads as *no decision* — so a command large enough to outrun
+  the timeout would be allowed by default. The scan is bounded and refuses when
+  it hits the bound, which makes slowness a denial rather than a bypass.
+- **Phases 4–5 do not protect the gate's own code.** `.claude/hooks/*` and
+  `.claude/settings.json` are writable there, by the same rule that returns those
+  phases to the normal permission flow. A model at Phase 5 can rewrite the Stop
+  gate that reviews it. This is a known gap, stated rather than closed, because
+  closing it means a never-writable list that the user also cannot edit in-band.
+
+If you need containment rather than a checkpoint, run the agent in a sandbox and
+use this for what it is good at.
+
 **Instructed only** — everything in the SKILL.md bodies and the gate's block
 message: showing real failure output, saying why each failure is the *expected*
 one, **sending the spec and the plan to `spec-adversary` before asking for
@@ -1530,7 +1585,7 @@ you read it.
 
 Builds a throwaway git repo in a temp dir, installs the hooks into it, and drives
 them with synthetic hook payloads. Nothing touches the repo you run it from.
-751 cases: the phase policy, every write vector, the advance-transition matrix,
+830 cases: the phase policy, every write vector, the advance-transition matrix,
 RED verification and the receipt's staleness rules, the approval questions and
 everything the receipt hook refuses to record, fail-closed behavior, the review
 gate with its index-invariance and its between-rounds delta, the slice position

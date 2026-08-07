@@ -1624,9 +1624,14 @@ done
 printf 'phase=3\ntask=t\n' > .claude/.spec-phase
 printf '%s' "$(st)" | grep -qi 'corrupt' \
   && bad "absent slice field reported as corrupt" || ok "absent slice field reads as 1/1"
+# Matched with `case` rather than a pipe into grep -q. This file runs under
+# pipefail, and grep -q exits on its first match, which SIGPIPEs the printf
+# feeding it: the pipeline then reports 141 and the assertion fails while the
+# text it wanted is sitting in the output. That race made this loop flaky —
+# observed failing on '1/2/3' alone, on a run where every other case passed.
 for junk in 'abc' '2/' '/5' '0/3' '4/2' '1/2/3'; do
   printf 'phase=3\ntask=t\nslice=%s\n' "$junk" > .claude/.spec-phase
-  if printf '%s' "$(st)" | grep -qi 'corrupt'; then
+  if grep -qi 'corrupt' <<< "$(st)"; then
     ok "slice='$junk' fails closed"
   else
     bad "slice='$junk' was accepted"
@@ -3456,6 +3461,275 @@ BOUT=$(.claude/hooks/phase.sh brief 2>&1)
 printf '%s' "$BOUT" | grep -q 'Reviewer verdicts on record' \
   && bad "brief asserted verdicts on record and listed none" \
   || ok "no verdict header when nothing could be read"
+
+################################################################################
+# The guard reads ARGV out of the command with a regex, and a regex over text is
+# the mistake this whole layer was rewritten to stop making. `.*phase\.sh` is
+# greedy, so on a line with two calls it matched the LAST one; `head -1` took the
+# first LINE. Either way the guard judged a call that was not the dangerous one
+# while the dangerous one still ran — every transition and every --force
+# reachable by appending a harmless second call.
+group "every phase.sh in the command is judged, not one of them"
+setup_repo; phase start decoy; phase 2; phase 3
+
+expect_b "the bare force is denied" \
+  DENY '.claude/hooks/phase.sh 4 --force'
+expect_b "a trailing decoy does not launder it" \
+  DENY '.claude/hooks/phase.sh 4 --force ; .claude/hooks/phase.sh status'
+expect_b "nor does one joined with &&" \
+  DENY '.claude/hooks/phase.sh 4 --force && .claude/hooks/phase.sh status'
+expect_b "nor a leading decoy on the line before" \
+  DENY '.claude/hooks/phase.sh status
+.claude/hooks/phase.sh 4 --force'
+expect_b "nor a leading decoy in the same segment list" \
+  DENY '.claude/hooks/phase.sh status ; .claude/hooks/phase.sh 4 --force'
+# A forward skip, not a retreat: 3 -> 2 is strictly more restrictive and is the
+# model's to take, so it would be allowed behind a decoy or not.
+expect_b "and a plain forward skip is covered the same way" \
+  DENY '.claude/hooks/phase.sh status ; .claude/hooks/phase.sh 5'
+
+# The end-to-end half: a decision the guard got right is worth nothing if the
+# phase moved anyway.
+PH_BEFORE=$(.claude/hooks/phase.sh status 2>&1 | head -1)
+[ "$(guard "$(pl_bash '.claude/hooks/phase.sh 4 --force ; .claude/hooks/phase.sh status')")" = DENY ] \
+  && ok "so the decoy transition never reaches phase.sh" \
+  || bad "the decoy transition was allowed through to phase.sh"
+printf '%s' "$PH_BEFORE" | grep -q 'phase 3' \
+  && ok "and the repo is still standing in Phase 3" \
+  || bad "the repo left Phase 3: $PH_BEFORE"
+
+# Two benign calls must stay benign, or the fix is just a different denial bug.
+expect_b "two reads in one command are still allowed" \
+  ALLOW '.claude/hooks/phase.sh status ; .claude/hooks/phase.sh status'
+expect_b "and an unrelated --force beside a read still is not a phase override" \
+  ALLOW 'git push --force && .claude/hooks/phase.sh status'
+
+################################################################################
+# A PreToolUse hook that is killed emits no JSON, and no JSON is read as no
+# decision — so the call proceeds. That makes "how long the guard takes" a
+# security property, not a performance one: any command that outruns the 15s
+# timeout in hooks.json is allowed by default. scan_state_tokens forked one awk
+# per argument with no budget, so the cost was linear in a number the model picks.
+group "a large command cannot outrun the hook's own timeout"
+setup_repo; phase start budget; phase 2; phase 3
+
+BIGARGS=$(python3 -c "print(' '.join('w%d' % i for i in range(6000)))")
+T0=$(date +%s)
+expect_b "a command with more tokens than the budget is refused, not scanned" \
+  DENY "bash $BIGARGS ; rm -f .claude/.spec-phase"
+T1=$(date +%s)
+[ $((T1 - T0)) -le 5 ] \
+  && ok "and the refusal lands in $((T1 - T0))s, well inside the 15s timeout" \
+  || bad "the guard took $((T1 - T0))s on 6000 tokens — past the timeout, so it fails open"
+
+# The same starvation without any shell verb: the phase policy's own segment
+# walk accumulated words into a string, which is quadratic in the word count.
+BIGW=$(python3 -c "print(' '.join('w%d' % i for i in range(20000)))")
+T0=$(date +%s)
+expect_b "and a production write behind a wall of words is still refused" \
+  DENY "echo $BIGW >/dev/null ; echo pwned > src/evil.ts"
+T1=$(date +%s)
+[ $((T1 - T0)) -le 5 ] \
+  && ok "and that refusal lands in $((T1 - T0))s too" \
+  || bad "the phase policy took $((T1 - T0))s on 20000 words — past the timeout"
+
+# The budget must not fire on ordinary work, or it becomes a denial-of-service on
+# the user instead of on the model.
+expect_b "an ordinary command is nowhere near the budget" \
+  ALLOW 'ls -la src/ && git status --porcelain'
+# A heredoc body is data, not tokens — the journal and validation reports are
+# prose and can be long, so length alone must never be the thing that refuses.
+LONGPROSE=$(python3 -c "print('\n'.join('finding %d: considered and declined, see spec' % i for i in range(400)))")
+expect_b "a long validation report is prose, not a token flood" ALLOW ".claude/hooks/phase.sh journal <<'EOF'
+$LONGPROSE
+EOF"
+
+################################################################################
+# The runtime-computed-target check sat inside the write-target loop, which is
+# below `[ \"\$PHASE\" -ge 4 ] && exit 0`. So at Phase 4 — the only phase the
+# validation marker exists in, and the phase whose exit the marker gates — a
+# target the shell computes was never examined at all. This is the same
+# structural mistake the token rewrite set out to fix, in the one path it did not
+# move.
+group "a target the shell computes is refused at every phase"
+setup_repo; phase start runtime; phase 2; phase 3; phase 4 --force
+
+expect_b "a command-substituted marker path is refused at Phase 4" \
+  DENY 'printf "task=runtime\nslice=1/1\n" > "$(echo .claude/.spec-validation)"'
+[ -f .claude/.spec-validation ] \
+  && bad "the refused command still wrote the marker" \
+  || ok "and no marker was written"
+expect_b "so is one built from a variable" \
+  DENY 'V=.spec-validation; printf "task=runtime\nslice=1/1\n" > .claude/$V'
+expect_b "and one built with backticks" \
+  DENY 'printf x > `echo .claude/.spec-phase`'
+.claude/hooks/phase.sh 5 >/dev/null 2>&1 \
+  && bad "4 -> 5 cleared with nothing run" \
+  || ok "so 4 -> 5 still refuses"
+
+# Reading is not writing: the deny is scoped to write targets, so an ordinary
+# read through a substitution must stay allowed at every phase.
+expect_b "a command substitution that writes nothing is untouched" \
+  ALLOW 'grep -l TODO $(git ls-files)'
+
+################################################################################
+# The token list can never be complete — find, git stash, an interpreter and an
+# env-assignment prefix all reach the same inodes, and each needed its own case.
+# These are the spellings the third review found; they are pinned here so the
+# next round finds new ones rather than these.
+group "the deletion routes the verb list missed"
+setup_repo; phase start spell; phase 2; phase 3
+
+expect_b "a glob relative to a cd'd directory" \
+  DENY 'cd .claude && rm -f .spec-*'
+expect_b "find -delete by name" \
+  DENY "find .claude -name '.spec-*' -delete"
+expect_b "find -delete with no name at all" \
+  DENY 'find .claude -type f -delete'
+expect_b "find -exec rm" \
+  DENY 'find .claude -name ".spec-*" -exec rm {} ;'
+expect_b "git stash --all, which removes ignored files exactly as clean -x does" \
+  DENY 'git stash --all'
+expect_b "and its short spelling" \
+  DENY 'git stash -a'
+expect_b "an interpreter given the unlink as an argument" \
+  DENY "python3 -c \"import os; os.remove('.claude/.spec-phase')\""
+expect_b "and another interpreter, same shape" \
+  DENY 'node -e "require(`fs`).unlinkSync(`.claude/.spec-phase`)"'
+expect_b "a fused -c flag, which is one token starting with a dash" \
+  DENY "bash -c'rm -f .claude/.spec-red && echo x'"
+expect_b "an env-assignment prefix whose value contains a slash" \
+  DENY 'FOO=a/b git clean -fdx'
+
+# The complements, so none of the above became a blanket refusal.
+setup_repo; phase start spell2; phase 2; phase 3
+expect_b "an ordinary find that deletes nothing"     ALLOW 'find src -name "*.ts"'
+expect_b "a find -delete outside .claude"            ALLOW 'find build -type f -delete'
+expect_b "git stash without -a/-u leaves them alone" ALLOW 'git stash'
+expect_b "an interpreter doing ordinary work"        ALLOW 'python3 -c "print(1 + 1)"'
+expect_b "and an env prefix on an innocent command"  ALLOW 'FOO=a/b git status'
+
+################################################################################
+# Deleting a marker only re-arms a gate; forging one clears it. Every route above
+# is a deletion route, so the guard's job there is containment — but the marker
+# itself must be unforgeable, or one missed write spelling is the whole gate. The
+# key lives under .git/, which is not a working-tree path: no git clean, no git
+# stash --all and no `rm -rf .claude` reaches it.
+group "the gate markers are authenticated, not merely present"
+setup_repo; phase start forge; phase 2; phase 3; phase 4 --force
+
+# Written by hand, with every field the tripwire reads set correctly.
+printf 'task=forge\nslice=1/1\n' > .claude/.spec-validation
+.claude/hooks/phase.sh 5 >/dev/null 2>&1 \
+  && bad "a hand-written validation marker cleared 4 -> 5" \
+  || ok "a hand-written validation marker does not clear 4 -> 5"
+FOUT=$(.claude/hooks/phase.sh 5 2>&1)
+printf '%s' "$FOUT" | grep -qi 'not written by phase.sh\|could not be authenticated\|written by hand' \
+  && ok "and the refusal says the marker was not machine-written" \
+  || bad "the refusal does not explain the marker was forged: $FOUT"
+
+# The legitimate writer must still clear it, or the gate is simply broken.
+setup_repo; phase start forge2; phase 2; phase 3; phase 4 --force
+.claude/hooks/phase.sh validation >/dev/null 2>&1 <<'EOF'
+Commands: make test
+Result:   pass, 12 assertions
+EOF
+.claude/hooks/phase.sh 5 >/dev/null 2>&1 \
+  && ok "a marker written by phase.sh validation does clear 4 -> 5" \
+  || bad "the real validation path no longer clears 4 -> 5"
+
+# A tampered authenticator with every readable field left correct. task= and
+# slice= already have their own check, so this is the case that isolates the MAC:
+# before it existed there was nothing here to tamper with, and the marker cleared.
+setup_repo; phase start forge3; phase 2; phase 3; phase 4 --force
+.claude/hooks/phase.sh validation >/dev/null 2>&1 <<'EOF'
+Commands: make test
+Result:   pass
+EOF
+sed 's/^mac=.*/mac=0000000000000000000000000000000000000000000000000000000000000000/' \
+  .claude/.spec-validation > .claude/.spec-validation.x
+mv .claude/.spec-validation.x .claude/.spec-validation
+.claude/hooks/phase.sh 5 >/dev/null 2>&1 \
+  && bad "a marker with a wrong authenticator still cleared 4 -> 5" \
+  || ok "a wrong authenticator voids the marker even with the fields intact"
+
+# The key is outside the working tree, so the routes that remove every state file
+# cannot remove it — and a marker cannot be re-minted by wiping the key and
+# writing a fresh pair.
+setup_repo; phase start forge4; phase 2; phase 3; phase 4 --force
+.claude/hooks/phase.sh validation >/dev/null 2>&1 <<'EOF'
+Commands: make test
+Result:   pass
+EOF
+[ -f "$(git rev-parse --git-dir)/spec-gate-key" ] \
+  && ok "the key lives under .git/, where no working-tree wipe reaches it" \
+  || bad "no key under .git/ — the marker cannot be authenticated across a clean"
+git clean -fdx >/dev/null 2>&1
+[ -f "$(git rev-parse --git-dir)/spec-gate-key" ] \
+  && ok "and git clean -fdx leaves it standing" \
+  || bad "git clean -fdx removed the authentication key"
+
+################################################################################
+# brief tested `[ -f "$VALIDATION" ]` while the tripwire additionally required
+# the task and slice to match — so a stale marker was reported to a resuming
+# session as a recorded report, and the transition then refused it. A briefing
+# that contradicts the gate it is describing is the one thing brief must not do.
+group "brief agrees with the tripwire about the marker"
+setup_repo; phase start bstale; phase 2; phase 3; phase 4 --force
+printf 'task=somethingelse\nslice=9/9\n' > .claude/.spec-validation
+BOUT=$(.claude/hooks/phase.sh brief 2>&1)
+printf '%s' "$BOUT" | grep -qi 'a validation report is recorded' \
+  && bad "brief called a stale marker a recorded report" \
+  || ok "brief does not call a stale marker a recorded report"
+printf '%s' "$BOUT" | grep -qi 'checks:' \
+  && ok "and it still says something about the checks" \
+  || bad "brief dropped the checks line entirely"
+
+# The agreeing case, both directions.
+setup_repo; phase start bfresh; phase 2; phase 3; phase 4 --force
+.claude/hooks/phase.sh validation >/dev/null 2>&1 <<'EOF'
+Commands: make test
+Result:   pass
+EOF
+BOUT=$(.claude/hooks/phase.sh brief 2>&1)
+printf '%s' "$BOUT" | grep -qi 'a validation report is recorded' \
+  && ok "a real report is reported as one" \
+  || bad "brief did not see the real report: $BOUT"
+
+################################################################################
+# .claude/spec-gate-test-cmd is writable in every phase by design, and phase.sh
+# red executes its contents as shell. Two allowed calls therefore disarmed the
+# whole workflow: write the payload, run the gate's own verifier. That makes the
+# marker hardening above moot, so it is closed here in the same pass.
+group "the configured test command cannot disarm the gate"
+# A changed test file first, or `red` refuses before it ever runs the command and
+# the payload below is never reached — the test would pass having proved nothing.
+setup_repo; phase start tcmd; phase 2; phase 3
+echo 'it("fails", () => expect(1).toBe(2))' > src/x.test.ts
+
+printf 'rm -f .claude/.spec-phase .claude/.spec-baseline; exit 1\n' > .claude/spec-gate-test-cmd
+.claude/hooks/phase.sh red >/dev/null 2>&1
+[ -f .claude/.spec-phase ] \
+  && ok "phase.sh red did not let its test command remove the phase state" \
+  || bad "the configured test command disarmed the workflow"
+
+setup_repo; phase start tcmd2; phase 2; phase 3
+echo 'it("fails", () => expect(1).toBe(2))' > src/x.test.ts
+printf 'rm -rf .claude; exit 1\n' > .claude/spec-gate-test-cmd
+.claude/hooks/phase.sh red >/dev/null 2>&1
+[ -f .claude/.spec-phase ] \
+  && ok "nor to take the directory instead" \
+  || bad "the configured test command removed the state directory"
+
+# An ordinary test command must still run, or this is just a broken feature.
+# RED needs a changed test file to have anything to certify, so write one first.
+setup_repo; phase start tcmd3; phase 2; phase 3
+echo 'it("fails", () => expect(1).toBe(2))' > src/x.test.ts
+printf 'exit 1\n' > .claude/spec-gate-test-cmd
+ROUT=$(.claude/hooks/phase.sh red 2>&1)
+printf '%s' "$ROUT" | grep -qi 'RED verified\|tests failed as required' \
+  && ok "and an ordinary failing test command still verifies RED" \
+  || bad "a legitimate test command no longer works: $ROUT"
 
 ################################################################################
 printf '\n%s%d passed, %d failed%s\n' "$B" "$PASS" "$FAIL" "$N"

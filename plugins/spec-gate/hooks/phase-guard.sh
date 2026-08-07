@@ -129,7 +129,43 @@ esac
 #
 # The single-quote character is built with sprintf rather than written, so the
 # whole program sits inside a single-quoted shell string with nothing escaped.
+#
+# --- The work budget ---------------------------------------------------------
+# How long this hook takes is a security property, not a performance one. A
+# PreToolUse hook that gets killed emits no JSON, and no JSON reads as no
+# decision — so the call proceeds. Anything the model can make arbitrarily slow
+# is therefore an allow it can reach on demand, and both scanners were linear or
+# worse in a word count it chooses: scan_state_tokens forked one awk per
+# argument, and the segment walks below accumulate words into a string, which is
+# quadratic. 6000 arguments took 20s against a 15s timeout.
+#
+# So the scan is bounded, and running out is a DENY rather than a slow allow.
+# Two counters, because they bound different things: tokens caps the total work,
+# lexes caps the number of forks a nested payload can demand. Both are global and
+# shared across every recursion, or the bound is per-call and means nothing.
+#
+# The limits are far above real commands — a legitimate one is tens of tokens,
+# not thousands — and heredoc bodies are consumed as data by the lexer, so a long
+# journal entry or plan document costs one token, not one per word.
+SCAN_TOKENS=0
+SCAN_LEXES=0
+SCAN_TOKEN_BUDGET=2000
+SCAN_LEX_BUDGET=64
+OVERSIZE_MSG="This command is too large for phase-guard to evaluate: it exceeds the scan budget, and a scan that cannot finish inside the hook timeout would emit no decision at all, which reads as permission. Refusing is the only safe answer. Split it into separate commands, or use Write/Edit for file changes so the target is a structured field instead of something to parse out of shell."
+
+budget_token() {
+  SCAN_TOKENS=$((SCAN_TOKENS + 1))
+  [ "$SCAN_TOKENS" -gt "$SCAN_TOKEN_BUDGET" ] && deny "$OVERSIZE_MSG"
+  return 0
+}
+budget_lex() {
+  SCAN_LEXES=$((SCAN_LEXES + 1))
+  [ "$SCAN_LEXES" -gt "$SCAN_LEX_BUDGET" ] && deny "$OVERSIZE_MSG"
+  return 0
+}
+
 lex_command() {
+  budget_lex
   printf '%s' "$1" | awk '
     BEGIN { SQ = sprintf("%c", 39); DQ = sprintf("%c", 34); BS = sprintf("%c", 92)
             hd_head = 1 }   # awk zero-inits, and hd_d[0] is a delimiter that never matches
@@ -309,6 +345,7 @@ scan_command() {
       OP)   WANT_TARGET=1 ;;
       SEP)  finish_segment; WANT_TARGET=0 ;;
       WORD)
+        budget_token
         if [ "$WANT_TARGET" = 1 ]; then
           CAND="$CAND$VAL"$'\n'
           WANT_TARGET=0
@@ -372,7 +409,6 @@ if [ -n "$SPLIT" ]; then
       # it passes on its own merits, and phase.sh refuses across a split by
       # itself anyway.
       collect_write_targets "$CMD"
-      PROOT=$(spec_realpath "${PROJECT_DIR%/}")
       while IFS= read -r P; do
         [ -z "$P" ] && continue
         in_project "$P" && deny "$SPLIT_MSG"
@@ -414,7 +450,10 @@ fi
 # Deliberately not gated behind a cheap `case "$CMD"` pre-filter. That is one
 # more list of spellings to be incomplete, which is the bug being fixed; one awk
 # pass on a command line is cheaper than the class of hole it closes.
-STATE_DIR_REL=.claude
+# STATE_DIR_REL comes from phase-policy.sh, which all three layers source. It is
+# defaulted here so this file still parses standalone if the policy is missing —
+# the same degradation the other shared names get.
+: "${STATE_DIR_REL:=.claude}"
 
 # True when a path, once normalised, is the directory holding the state files or
 # an ancestor of it. `rm -rf .claude` and `rm -rf .` remove every state file
@@ -455,28 +494,112 @@ glob_hits_state() {
 
 STATE_MSG="The phase state is not yours to edit, move or remove — .spec-red, .spec-approval and .spec-validation included, because a receipt you could write by hand would assert RED without running anything, record an approval the user never gave, or claim this repo's checks passed with none of them run. Change phases with phase.sh <n>, verify RED with phase.sh red, record the Phase 4 checks with phase.sh validation, ask the user with phase.sh ask <gate>, and read the current phase with phase.sh status."
 
+# Does this token name a state file, either as written or relative to a directory
+# the same command cd'd into? `cd .claude && rm -f .spec-*` names nothing this
+# hook recognises until the cd is applied, and a cd persists across && and ; —
+# which is why the caller carries it across segments rather than resetting it.
+state_token_hits() {
+  local t=$1 cwd=$2
+  is_phase_state "$t" && return 0
+  glob_hits_state "$t" && return 0
+  if [ -n "$cwd" ]; then
+    case "$t" in
+      /*) ;;
+      *)  is_phase_state "$cwd/$t" && return 0
+          glob_hits_state "$cwd/$t" && return 0 ;;
+    esac
+  fi
+  return 1
+}
+
+# An interpreter's code argument is not shell and cannot be lexed as shell, so
+# there is no token in it to recognise. Substring is the honest check here: it
+# is a heuristic over something this hook genuinely cannot parse, and it errs
+# toward refusing. It cannot see through obfuscation — see the threat model in
+# the README, which says so rather than implying otherwise.
+names_state_file() {
+  case "$1" in
+    *.spec-phase*|*.spec-baseline*|*.spec-red*|*.spec-approval*|\
+    *.spec-scaffold*|*.spec-validation*|*spec-journal.md*|*review-log.jsonl*) return 0 ;;
+  esac
+  return 1
+}
+
 scan_state_tokens() {
-  local KIND VAL T IS_VERB VERB='' EXPECT_VERB=1 GITCLEAN=0
+  local KIND VAL T IS_VERB VERB='' EXPECT_VERB=1 GITCLEAN=0 GITSTASH=0
+  local FINDDIR=0 WANT_TARGET=0
+  local depth=${2:-0} cwd=${3:-} CDNEXT=0
+  [ "$depth" -gt 4 ] && deny "$OVERSIZE_MSG"
   while IFS=$'\t' read -r KIND VAL; do
     case "$KIND" in
-      SEP) VERB=''; EXPECT_VERB=1; GITCLEAN=0; continue ;;
-      OP)  continue ;;                    # the redirect target arrives as the next WORD
+      # A cd survives a `;` or `&&`, so cwd deliberately does NOT reset here.
+      SEP) VERB=''; EXPECT_VERB=1; GITCLEAN=0; GITSTASH=0; FINDDIR=0
+           CDNEXT=0; WANT_TARGET=0; continue ;;
+      OP)  WANT_TARGET=1; continue ;;     # the redirect target arrives as the next WORD
     esac
     T=$VAL
     [ -z "$T" ] && continue
+    budget_token
+
+    # A write target the shell computes cannot be judged as a path. Phases 1-3
+    # refuse every one of them further down, but that check sits below the
+    # `PHASE -ge 4` exit — and Phase 4 is the only phase the validation marker
+    # exists in, so the marker gating 4 -> 5 was writable through one `$(...)`.
+    # Here it runs at every phase, narrowed to targets that name state, so
+    # ordinary Phase 4 work like `> $LOGFILE` is untouched.
+    if [ "$WANT_TARGET" = 1 ]; then
+      WANT_TARGET=0
+      case "$T" in
+        *'$'*|*'`'*)
+          # Two ways a computed target gives itself away. It spells a state name
+          # somewhere in the text — `$(echo .claude/.spec-validation)` — or the
+          # literal part before the first expansion already lands inside the
+          # state directory, which is `.claude/$V`. Everything else is ordinary
+          # work like `> $LOGFILE`, and is left alone at every phase.
+          names_state_file "$T" && deny "This writes to a target the shell computes at runtime ($T), and the computed text names a phase state file. phase-guard cannot evaluate what it would resolve to, and the file it appears to name is one no command may write. $STATE_MSG"
+          TPRE=${T%%[\$\`]*}
+          case "$TPRE" in
+            */*) covers_state_dir "${TPRE%/*}" \
+                   && deny "This writes to a target the shell computes at runtime ($T), inside $STATE_DIR_REL where the phase state lives. phase-guard cannot evaluate what it would resolve to, so it cannot rule out a state file. $STATE_MSG" ;;
+          esac ;;
+      esac
+    fi
 
     IS_VERB=0
     if [ "$EXPECT_VERB" = 1 ]; then
+      # `*=*` is tested on the whole token, not the basename. `FOO=a/b` reduced
+      # to `b`, which matches no assignment pattern, so the env prefix became
+      # the verb and the real command was never classified at all.
+      case "$T" in
+        *=*) continue ;;
+      esac
       case "${T##*/}" in
-        *=*|sudo|env|command|nohup|time|xargs|exec) continue ;;
+        sudo|env|command|nohup|time|xargs|exec) continue ;;
         -*) continue ;;
       esac
       VERB=${T##*/}
       EXPECT_VERB=0
       IS_VERB=1
+      [ "$VERB" = cd ] && CDNEXT=1
     else
+      if [ "$CDNEXT" = 1 ]; then
+        CDNEXT=0
+        case "$T" in
+          -*) ;;
+          /*) cwd=$T ;;
+          *)  cwd=${cwd:+$cwd/}$T; cwd=${cwd#./} ;;
+        esac
+      fi
       case "$VERB" in
-        git) [ "$T" = clean ] && GITCLEAN=1 ;;
+        git)
+          [ "$T" = clean ] && GITCLEAN=1
+          [ "$T" = stash ] && GITSTASH=1 ;;
+        find)
+          case "$T" in
+            -*) ;;
+            *) covers_state_dir "$T" && FINDDIR=1
+               state_token_hits "$T" "$cwd" && FINDDIR=1 ;;
+          esac ;;
       esac
       # `git clean -x` and `-X` are the only ordinary commands that remove these
       # files, and they do it precisely because the files are gitignored by
@@ -490,6 +613,38 @@ scan_state_tokens() {
                   esac ;;
         esac
       fi
+      # `git stash --all` stashes ignored files too, which is the same act as
+      # `clean -x` by another name: every state file goes, and `git stash` is
+      # not a command anyone reads as destructive. `-u` is not included — it
+      # takes untracked files and leaves ignored ones, so it never reaches these.
+      if [ "$GITSTASH" = 1 ]; then
+        case "$T" in
+          --all) deny "git stash --all stashes ignored files as well as untracked ones, and every spec-gate state file is ignored by design — this would disarm the workflow exactly as 'git clean -x' would. Use 'git stash -u' if the intent is to set untracked work aside, or 'phase.sh off' if the intent is to end the task." ;;
+          --) ;;
+          -[!-]*) case "$T" in
+                    *a*) deny "git stash -a stashes ignored files as well as untracked ones, and every spec-gate state file is ignored by design — this would disarm the workflow exactly as 'git clean -x' would. Use 'git stash -u' if the intent is to set untracked work aside, or 'phase.sh off' if the intent is to end the task." ;;
+                  esac ;;
+        esac
+      fi
+      # find reaches the same inodes with no path token that any check above
+      # would recognise as a state file: `-delete` names nothing, and `-exec rm`
+      # hides the verb behind an argument. POSIX find takes its paths before its
+      # predicates, so the directory is always known by the time either appears.
+      if [ "$FINDDIR" = 1 ]; then
+        case "$T" in
+          -delete|-exec|-execdir|-fprint|-fprintf)
+            deny "This find would delete or overwrite inside $STATE_DIR_REL, where the phase state lives. $STATE_MSG" ;;
+        esac
+      fi
+      # An interpreter is handed code, not shell. It cannot be lexed here, so
+      # the check is on whether the code names one of these files at all.
+      case "$VERB" in
+        python|python3|node|deno|bun|ruby|perl|php)
+          case "$T" in
+            -*) ;;
+            *) names_state_file "$T" && deny "$STATE_MSG" ;;
+          esac ;;
+      esac
     fi
 
     # A quoted string handed to a shell is not data, it is shell. Re-read it,
@@ -501,18 +656,31 @@ scan_state_tokens() {
     # whose verb is `bash`, forever, and the hook died on a stack overflow — a
     # crashed PreToolUse hook produces no JSON, which Claude Code reads as no
     # decision, so the fail-open was total.
+    #
+    # `-c'...'` with no space is one token beginning with a dash, which the flag
+    # filter dropped whole — the payload rode in on the flag. The remainder after
+    # the flag is the payload, so it is unwrapped rather than skipped.
     if [ "$IS_VERB" = 0 ]; then
       case "$VERB" in
         sh|bash|zsh|ksh|dash|eval)
           case "$T" in
-            -*) ;;
-            *) scan_state_tokens "$T" ;;
+            -c?*) scan_state_tokens "${T#-c}" "$((depth + 1))" "$cwd" ;;
+            -*)   ;;
+            *)    scan_state_tokens "$T" "$((depth + 1))" "$cwd" ;;
           esac ;;
       esac
     fi
 
-    is_phase_state "$T" && deny "$STATE_MSG"
-    glob_hits_state "$T" && deny "$STATE_MSG"
+    state_token_hits "$T" "$cwd" && deny "$STATE_MSG"
+
+    # A token carrying a substitution cannot be matched as a path — `` `echo
+    # .claude/.spec-phase` `` splits into words that each end or begin with a
+    # backtick, so no exact pattern reaches them. If such a token spells a state
+    # file at all, that is enough to refuse: nothing legitimate computes a path
+    # that happens to read as this gate's own bookkeeping.
+    case "$T" in
+      *'$'*|*'`'*) names_state_file "$T" && deny "$STATE_MSG" ;;
+    esac
 
     # Removing the directory is removing the files in it. Restricted to verbs
     # that destroy, because `.claude` also holds the hooks, the settings and the
@@ -559,7 +727,68 @@ fi
 # were terminal-only for the same limitation, and they stop being terminal-only
 # for the same reason: an answer through the host is evidence the user decided,
 # which a permission prompt on a shell command never was.
-if [ -n "$CMD" ] && printf '%s' "$CMD" | grep -qE '(^|[^[:alnum:]_.+-])phase\.sh([[:space:]]|$)'; then
+# One line per phase.sh call in the command, each holding that call's own
+# argument tail, prefixed with ':' so a call with no arguments is still a line.
+#
+# This used to be a regex over the raw command text — the mistake the token
+# rewrite existed to end, still sitting one dispatch down. `.*phase\.sh` is
+# greedy, so on a line with two calls it read the LAST; `head -1` read the first
+# LINE. Either way the guard judged one call while the other ran, so appending
+# `; phase.sh status` laundered any transition and any --force.
+#
+# Nested payloads are re-read for the same reason the state scan re-reads them:
+# `bash -c "phase.sh 4 --force"` is one opaque word otherwise, and the old text
+# regex caught it by accident.
+phase_invocations() {
+  local KIND VAL T IN=0 ACC='' VERB='' EXPECT_VERB=1 IS_VERB
+  local depth=${2:-0}
+  [ "$depth" -gt 4 ] && deny "$OVERSIZE_MSG"
+  while IFS=$'\t' read -r KIND VAL; do
+    case "$KIND" in
+      SEP) [ "$IN" = 1 ] && printf ':%s\n' "$ACC"
+           IN=0; ACC=''; VERB=''; EXPECT_VERB=1; continue ;;
+      OP)  continue ;;
+    esac
+    T=$VAL
+    [ -z "$T" ] && continue
+    budget_token
+
+    IS_VERB=0
+    if [ "$EXPECT_VERB" = 1 ]; then
+      case "$T" in *=*) continue ;; esac
+      case "${T##*/}" in
+        sudo|env|command|nohup|time|xargs|exec) continue ;;
+        -*) continue ;;
+      esac
+      VERB=${T##*/}; EXPECT_VERB=0; IS_VERB=1
+    else
+      case "$VERB" in
+        sh|bash|zsh|ksh|dash|eval)
+          case "$T" in
+            -c?*) phase_invocations "${T#-c}" "$((depth + 1))" ;;
+            -*)   ;;
+            *)    phase_invocations "$T" "$((depth + 1))" ;;
+          esac ;;
+      esac
+    fi
+
+    if [ "${T##*/}" = phase.sh ]; then
+      [ "$IN" = 1 ] && printf ':%s\n' "$ACC"
+      IN=1; ACC=''; continue
+    fi
+    [ "$IN" = 1 ] && ACC="$ACC $T"
+  done <<< "$(lex_command "$1")"
+  [ "$IN" = 1 ] && printf ':%s\n' "$ACC"
+  return 0
+}
+
+PHASE_CALLS=""
+[ -n "$CMD" ] && PHASE_CALLS=$(phase_invocations "$CMD")
+
+# Every call is judged, and the first that decides wins — decide/deny/ask exit,
+# and a herestring loop runs in this shell, so an exit here is the hook's answer.
+while IFS= read -r ARGV; do
+  case "$ARGV" in :*) ARGV=${ARGV#:} ;; *) continue ;; esac
   # ARG has to name the destination, and a flag never does. Taking the first
   # token blindly read `phase.sh --force 5` as ARG=--force, which is not 5, so
   # the force dispatch below fell through to the Phase 4 question — asking the
@@ -570,7 +799,6 @@ if [ -n "$CMD" ] && printf '%s' "$CMD" | grep -qE '(^|[^[:alnum:]_.+-])phase\.sh
   #
   # Globbing is off for the walk: these are command-line tokens, and a `*` in
   # one would otherwise expand against the hook's own working directory.
-  ARGV=$(printf '%s' "$CMD" | sed -nE 's|.*phase\.sh[[:space:]]+([^;&|]*).*|\1|p' | head -1)
   ARG=""
   set -f
   for _tok in $ARGV; do
@@ -856,7 +1084,7 @@ if [ -n "$CMD" ] && printf '%s' "$CMD" | grep -qE '(^|[^[:alnum:]_.+-])phase\.sh
         advance_deny "$ARG"
       fi ;;
   esac
-fi
+done <<< "$PHASE_CALLS"
 
 [ "$PHASE" -ge 4 ] && exit 0            # execute onward: normal permission flow
 

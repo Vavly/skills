@@ -10,6 +10,147 @@
 #
 # Not executable and not a hook. Sourced only.
 
+# The directory holding the state files, relative to the project root. Shared,
+# because all three layers name it in refusals and one of them getting it wrong
+# would point the reader at a path that does not exist.
+STATE_DIR_REL=.claude
+
+# --- Authenticating the markers that clear a gate ----------------------------
+# Deleting a marker only re-arms a gate; forging one clears it. The guard denies
+# every deletion route it knows, but that list is a list of spellings and cannot
+# be complete — three review rounds found a new one each time. So the two markers
+# that CLEAR a gate carry a keyed hash of their own fields, and a marker that
+# does not verify is treated as absent. One missed write spelling then costs a
+# re-run rather than the gate.
+#
+# The key lives under .git/, alongside review_marker_path's own marker and for
+# the same reason: it is not a working-tree path. `git clean -fdx`, `git stash
+# --all` and `rm -rf .claude` all remove every state file by design — they are
+# gitignored — and none of them reaches this.
+#
+# This is not protection against someone with a shell and patience: anything that
+# can read the key can mint a marker. It closes the gap between "the guard missed
+# a spelling" and "the gate is gone", which is the gap that kept reopening.
+spec_key_path() {
+  d=$(git rev-parse --git-dir 2>/dev/null) || return 1
+  [ -n "$d" ] || return 1
+  case "$d" in /*) ;; *) d="${PROJECT_DIR%/}/$d" ;; esac
+  printf '%s/spec-gate-key\n' "$d"
+}
+
+spec_key() {
+  k=$(spec_key_path) || return 1
+  if [ ! -s "$k" ]; then
+    ( umask 077
+      dd if=/dev/urandom bs=32 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n' > "$k"
+    ) || return 1
+  fi
+  [ -s "$k" ] || return 1
+  cat "$k"
+}
+
+# $1 = message. Prints a hex digest, or fails if the host has no hasher — in
+# which case every caller treats the marker as unverifiable and refuses, since a
+# gate that cannot check its own receipt must not accept it.
+spec_mac() {
+  _k=$(spec_key) || return 1
+  if command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$_k$1" | shasum -a 256 | cut -d' ' -f1
+  elif command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$_k$1" | sha256sum | cut -d' ' -f1
+  elif command -v openssl >/dev/null 2>&1; then
+    printf '%s' "$_k$1" | openssl dgst -sha256 | sed 's/.*= *//'
+  else
+    return 1
+  fi
+}
+
+# The authenticated body of a marker: every line except the comment header and
+# the mac line itself. Keeping this one function means the writer and the reader
+# cannot disagree about what was signed.
+spec_mac_body() {
+  sed -e '/^#/d' -e '/^mac=/d' "$1"
+}
+
+spec_mac_write() {   # $1 = path — appends the mac line for what is already there
+  m=$(spec_mac "$(spec_mac_body "$1")") || return 1
+  printf 'mac=%s\n' "$m" >> "$1"
+}
+
+spec_mac_ok() {      # $1 = path — 0 if the file authenticates against the key
+  [ -r "$1" ] || return 1
+  have=$(sed -n 's/^mac=//p' "$1" | head -1)
+  [ -n "$have" ] || return 1
+  want=$(spec_mac "$(spec_mac_body "$1")") || return 1
+  [ "$have" = "$want" ]
+}
+
+# none | forged | stale | valid. Shared by the 4 -> 5 tripwire and by `brief`,
+# which used to test `[ -f ]` alone — so a stale marker was announced to a
+# resuming session as a recorded report and then refused by the transition it
+# was describing. A briefing that contradicts its own gate is the one thing it
+# must not do, so both now read the same answer.
+validation_marker_status() {   # $1 = marker path, $2 = task, $3 = slice
+  [ -f "$1" ] || { printf 'none\n'; return 0; }
+  spec_mac_ok "$1" || { printf 'forged\n'; return 0; }
+  vt=$(sed -n 's/^task=//p' "$1" | head -1)
+  vs=$(sed -n 's/^slice=//p' "$1" | head -1)
+  if [ "$vt" = "$2" ] && [ "$vs" = "$3" ]; then printf 'valid\n'; else printf 'stale\n'; fi
+}
+
+# --- Running the configured test command without handing it the gate ---------
+# .claude/spec-gate-test-cmd has to be writable in every phase — a repo that
+# never configured one otherwise cannot verify RED at all — and `phase.sh red`
+# executes its contents as shell. Two allowed calls therefore disarmed the whole
+# workflow: write the payload, then run the gate's own verifier.
+#
+# A static scan of the payload would be the same losing game as the verb list,
+# so the state is snapshotted under .git/ instead and restored afterwards. That
+# holds whatever the command does — obfuscated, nested, or spawned — because it
+# is checked on the way out rather than predicted on the way in.
+spec_state_backup_dir() {
+  d=$(git rev-parse --git-dir 2>/dev/null) || return 1
+  [ -n "$d" ] || return 1
+  case "$d" in /*) ;; *) d="${PROJECT_DIR%/}/$d" ;; esac
+  printf '%s/spec-gate-statebak\n' "$d"
+}
+
+spec_state_save() {
+  b=$(spec_state_backup_dir) || return 1
+  rm -rf "$b" 2>/dev/null
+  mkdir -p "$b" || return 1
+  while IFS= read -r s; do
+    [ -z "$s" ] && continue
+    f="${PROJECT_DIR%/}/$s"
+    [ -f "$f" ] || continue
+    cp "$f" "$b/$(printf '%s' "$s" | tr '/' '_')" 2>/dev/null
+  done <<< "$(spec_state_list)"
+  return 0
+}
+
+# 0 if nothing moved, 1 if anything had to be put back.
+spec_state_restore() {
+  b=$(spec_state_backup_dir) || return 0
+  [ -d "$b" ] || return 0
+  touched=0
+  while IFS= read -r s; do
+    [ -z "$s" ] && continue
+    f="${PROJECT_DIR%/}/$s"
+    k="$b/$(printf '%s' "$s" | tr '/' '_')"
+    if [ -f "$k" ]; then
+      if [ ! -f "$f" ] || ! cmp -s "$k" "$f"; then
+        mkdir -p "$(dirname "$f")" 2>/dev/null
+        cp "$k" "$f" 2>/dev/null && touched=1
+      fi
+    elif [ -f "$f" ]; then
+      # Nothing was there before, so whatever wrote this invented it.
+      rm -f "$f" 2>/dev/null && touched=1
+    fi
+  done <<< "$(spec_state_list)"
+  rm -rf "$b" 2>/dev/null
+  [ "$touched" = 0 ]
+}
+
 # --- What counts as a test ---------------------------------------------------
 # Adjust to the repo's layout. A false negative here means production code
 # slips through Phase 3 — the one failure that makes the whole gate pointless.

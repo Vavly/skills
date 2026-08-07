@@ -165,11 +165,28 @@ verify_red() {
   # Captured rather than streamed, because the classification below reads it.
   # bash rather than sh, for pipefail: `pytest | tail` returned the tail's zero,
   # so a genuinely failing suite was reported as PASSED.
+  # The gate's own state is put aside before the command runs and checked back
+  # afterwards. This command is model-authored shell that the guard deliberately
+  # allows in every phase, so without this the shortest route out of the workflow
+  # was to write `rm -f .claude/.spec-phase` here and run the verifier.
+  spec_state_save
   out=$(
     cd "$PROJECT_DIR" 2>/dev/null || exit 0
     SPEC_GATE_TEST_FILES="$files" bash -c "set -o pipefail; $cmd" 2>&1
   )
   rc=$?
+  if ! spec_state_restore; then
+    printf '%s\n' "$out"
+    echo
+    rm -f "$RECEIPT"
+    echo "spec-driven: REFUSED — the configured test command changed this gate's own"
+    echo "  state while it ran. Whatever it did to $STATE_DIR_REL has been undone."
+    echo "  A test command runs the repo's tests; one that rewrites the phase, the"
+    echo "  receipts or the approval is doing something else, and nothing it printed"
+    echo "  is evidence about anything."
+    echo "  Fix the command in $TEST_CMD_FILE, then run phase.sh red again."
+    return 1
+  fi
   printf '%s\n' "$out"
   echo
   kind=$(red_failure_kind "$rc" "$out")
@@ -342,24 +359,36 @@ journal_append() {  # $1 = command name, for the messages; $2 = optional label
 validation_tripwire() {
   cur=$(sed -n 's/^phase=//p' "$STATE" | head -1)
   [ "$cur" = "4" ] || return 0          # only 4 -> 5 asserts a report
-  if [ -f "$VALIDATION" ]; then
-    # The marker carries the task and slice it was written for, and those fields
-    # are read rather than merely recorded — data nothing consults is data that
-    # drifts unnoticed until it is wrong. Deleting the marker on every phase
-    # change covers most of this already, but `phase.sh slices` moves the slice
-    # position with no phase change at all, so without this a report written for
-    # slice 1 of 2 would still clear 4 -> 5 after the task was re-sliced.
-    #
-    # Exact match on the whole `slice` field, matching approval_status rather
-    # than being cleverer than it. Re-sliced work has had its scope redrawn, and
-    # re-running the repo's checks against the new shape is cheap next to
-    # reasoning about which halves of a stale report still apply.
+  st=$(sed -n 's/^task=//p' "$STATE" | head -1)
+  # The marker carries the task and slice it was written for, and those fields
+  # are read rather than merely recorded — data nothing consults is data that
+  # drifts unnoticed until it is wrong. Deleting the marker on every phase
+  # change covers most of this already, but `phase.sh slices` moves the slice
+  # position with no phase change at all, so without this a report written for
+  # slice 1 of 2 would still clear 4 -> 5 after the task was re-sliced.
+  #
+  # Exact match on the whole `slice` field, matching approval_status rather
+  # than being cleverer than it. Re-sliced work has had its scope redrawn, and
+  # re-running the repo's checks against the new shape is cheap next to
+  # reasoning about which halves of a stale report still apply.
+  case "$(validation_marker_status "$VALIDATION" "$st" "$(slice_current)/$(slice_total)")" in
+    valid) return 0 ;;
+    forged)
+      echo "spec-driven: REFUSED — the validation marker could not be authenticated."
+      echo "  It was not written by phase.sh validation: the marker carries a keyed"
+      echo "  hash of its own fields, and this one does not verify. A marker that can"
+      echo "  be written by hand certifies nothing, which is the whole reason 4 -> 5"
+      echo "  asks for one. (A marker made before this version has no hash and lands"
+      echo "  here too — re-record and it will be accepted.)"
+      echo "  Run the repo's checks, then record them:"
+      echo "    phase.sh validation <<'EOF'"
+      echo "    ..."
+      echo "    EOF"
+      echo "  Override with: phase.sh 5 --force"
+      return 1 ;;
+    stale)
     vt=$(sed -n 's/^task=//p' "$VALIDATION" | head -1)
     vs=$(sed -n 's/^slice=//p' "$VALIDATION" | head -1)
-    st=$(sed -n 's/^task=//p' "$STATE" | head -1)
-    if [ "$vt" = "$st" ] && [ "$vs" = "$(slice_current)/$(slice_total)" ]; then
-      return 0
-    fi
     echo "spec-driven: REFUSED — the validation report on record was written for a"
     echo "  different point in this task (task '${vt:-?}', slice ${vs:-?}; you are on"
     echo "  task '${st:-?}', slice $(slice_current)/$(slice_total))."
@@ -369,8 +398,8 @@ validation_tripwire() {
     echo "    ..."
     echo "    EOF"
     echo "  Override with: phase.sh 5 --force"
-    return 1
-  fi
+      return 1 ;;
+  esac
   echo "spec-driven: REFUSED — no validation report on record for this Phase 4."
   echo "  Phase 5 hands the repo's own checks to the reviewer. A report that"
   echo "  exists only in this conversation cannot be handed over by the session"
@@ -688,6 +717,16 @@ case "${1:-status}" in
     { printf '# spec-gate validation marker — written by phase.sh validation, never by hand\n'
       printf 'task=%s\nslice=%s/%s\n' "$T" "$(slice_current)" "$(slice_total)"
     } > "$VALIDATION"
+    # The authenticator, over the fields just written. Without it the marker is
+    # a plain file the model can recreate, so every deletion route the guard
+    # misses becomes a way to clear 4 -> 5 rather than merely to re-arm it.
+    if ! spec_mac_write "$VALIDATION"; then
+      rm -f "$VALIDATION"
+      echo "spec-driven: could not authenticate the validation marker — no key could be" >&2
+      echo "  written under .git/, or this host has no sha256 tool. The report is in the" >&2
+      echo "  journal, but 4 -> 5 will refuse until this is fixed." >&2
+      exit 1
+    fi
     echo "spec-driven: validation report recorded — 4 -> 5 is clear."
     echo "  It is in .claude/spec-journal.md, which is where Phase 5 hands it to the"
     echo "  reviewer from, and where the next session finds it if this one ends first."
@@ -720,10 +759,16 @@ case "${1:-status}" in
     echo "  phase: $(phase_name "$BP")"
     [ "$(slice_total)" -gt 1 ] && echo "  slice: $(slice_current) of $(slice_total)"
     # Phase 1 has no spec yet — writing one is what Phase 2 is — so "NOT FOUND"
-    # there reports the workflow working correctly as though it were damage.
+    # there reports the workflow working correctly as though it were damage. The
+    # same holds at Phase 2 itself, where an absent spec means the phase is
+    # unfinished rather than that something went missing: the line stays, because
+    # a resuming session needs to know there is nothing written yet, but it says
+    # which of the two it is.
     if [ "$BP" != 1 ]; then
       if [ -n "$BT" ] && [ -f "$PROJECT_DIR/docs/specs/$BT.md" ]; then
         echo "  spec:  docs/specs/$BT.md"
+      elif [ "$BP" = 2 ]; then
+        echo "  spec:  docs/specs/${BT:-<task>}.md — NOT FOUND; writing it is what Phase 2 is for"
       else
         echo "  spec:  docs/specs/${BT:-<task>}.md — NOT FOUND; find it before trusting the rest"
       fi
@@ -744,11 +789,18 @@ case "${1:-status}" in
       esac
     fi
     if [ "$BP" = 4 ]; then
-      if [ -f "$VALIDATION" ]; then
-        echo "  checks: a validation report is recorded for this Phase 4"
-      else
-        echo "  checks: none recorded — 4 -> 5 will refuse until 'phase.sh validation' runs"
-      fi
+      # The same predicate 4 -> 5 reads, not `[ -f ]`. Testing existence alone
+      # announced a stale or unauthenticated marker as a recorded report, and the
+      # transition then refused the very thing the briefing had just promised.
+      BT=$(sed -n 's/^task=//p' "$STATE" | head -1)
+      case "$(validation_marker_status "$VALIDATION" "$BT" "$(slice_current)/$(slice_total)")" in
+        valid)  echo "  checks: a validation report is recorded for this Phase 4" ;;
+        stale)  echo "  checks: the report on record was written for a different task or slice —" ;
+                echo "          4 -> 5 will refuse until 'phase.sh validation' runs again" ;;
+        forged) echo "  checks: the marker on record does not authenticate and will not be" ;
+                echo "          accepted — re-run 'phase.sh validation'" ;;
+        *)      echo "  checks: none recorded — 4 -> 5 will refuse until 'phase.sh validation' runs" ;;
+      esac
     fi
     for g in $(gate_list); do
       A=$(approval_status "$g")
