@@ -432,8 +432,27 @@ fi
 # for the same reason: an answer through the host is evidence the user decided,
 # which a permission prompt on a shell command never was.
 if [ -n "$CMD" ] && printf '%s' "$CMD" | grep -qE '(^|[^[:alnum:]_.+-])phase\.sh([[:space:]]|$)'; then
-  ARG=$(printf '%s' "$CMD" | sed -nE 's|.*phase\.sh[[:space:]]+([^[:space:];&|]+).*|\1|p' | head -1)
-  ARG=${ARG#[\"\']}; ARG=${ARG%[\"\']}
+  # ARG has to name the destination, and a flag never does. Taking the first
+  # token blindly read `phase.sh --force 5` as ARG=--force, which is not 5, so
+  # the force dispatch below fell through to the Phase 4 question — asking the
+  # user about unlocking production code in order to decide a Phase 5 override.
+  # That is the exact confusion the dispatch was split in two to end, reachable
+  # by typing the same two words in the other order. Leading flags are skipped,
+  # so the destination is found on whichever side of one it was written.
+  #
+  # Globbing is off for the walk: these are command-line tokens, and a `*` in
+  # one would otherwise expand against the hook's own working directory.
+  ARGV=$(printf '%s' "$CMD" | sed -nE 's|.*phase\.sh[[:space:]]+([^;&|]*).*|\1|p' | head -1)
+  ARG=""
+  set -f
+  for _tok in $ARGV; do
+    _tok=${_tok#[\"\']}; _tok=${_tok%[\"\']}
+    case "$_tok" in
+      ''|-*) continue ;;
+      *) ARG=$_tok; break ;;
+    esac
+  done
+  set +f
 
   # These five used to be "go run it in your own terminal", because a PreToolUse
   # hook cannot tell a Bash call the model chose from one a slash command made.
@@ -483,8 +502,9 @@ if [ -n "$CMD" ] && printf '%s' "$CMD" | grep -qE '(^|[^[:alnum:]_.+-])phase\.sh
   # a point where the code is already written. Routing both to the `force` gate
   # asked the user about unlocking production code in order to decide something
   # else entirely — and worse, one answer was then redeemable for the other,
-  # since the receipt records the gate and not the transition. ARG is the token
-  # after phase.sh, so it names the destination phase exactly.
+  # since the receipt records the gate and not the transition. ARG is the first
+  # non-flag token after phase.sh, so it names the destination phase whichever
+  # side of the flag it was typed on.
   case "$CMD" in
     *--force*)
       case "$ARG" in

@@ -2807,6 +2807,24 @@ printf '%s' "$out" | grep -qF "$MAIN" \
   && ok "status names the tree that holds the state" \
   || bad "status does not say where the state actually is: '$out'"
 
+# The same question put to `brief`, which had the branch for it and could not
+# reach it: FOREIGN is only computed when no state file is present here, which is
+# exactly the case brief used to exit 0 on, and the refusal above it caught brief
+# before either. A regression here is silent in the worst way — brief is the
+# SessionStart hook, and stdout from a hook that exits non-zero never becomes
+# context, so the session simply starts knowing nothing.
+BOUT=$(.claude/hooks/phase.sh brief 2>&1); BRC=$?
+[ "$BRC" = 0 ] && ok "brief exits 0 from a tree the task does not live in" \
+  || bad "brief exited $BRC across a split; a SessionStart hook that fails says nothing"
+[ -n "$BOUT" ] && ok "and is not silent, which is how it reports 'no task armed'" \
+  || bad "brief was silent across a split — indistinguishable from nothing being armed"
+printf '%s' "$BOUT" | grep -q 'ANOTHER WORKTREE' \
+  && ok "and says the task is armed somewhere else" \
+  || bad "brief across a split did not report the split: '$BOUT'"
+printf '%s' "$BOUT" | grep -qF "$MAIN" \
+  && ok "and names the tree that holds it" \
+  || bad "brief does not say where the task actually is: '$BOUT'"
+
 out=$("$MAIN"/.claude/hooks/phase.sh 4 2>&1)
 [ "$(sed -n 's/^phase=//p' "$MAIN/.claude/.spec-phase" | head -1)" = 3 ] \
   && ok "phase.sh does not advance a task living in another tree" \
@@ -3054,6 +3072,35 @@ setup_repo; phase start vforce3; phase 2; phase 3; phase 4 --force
 answer force-validation 'Run the checks first'
 expect_b "declining force-validation denies rather than asks again" \
   DENY '.claude/hooks/phase.sh 5 --force'
+
+# The dispatch routes on ARG, and ARG used to be the first token after phase.sh —
+# so writing the flag first made ARG '--force', which is not 5, and the Phase 5
+# override fell through to the Phase 4 question. The user would be asked about
+# unlocking production code in order to decide something else: the confusion the
+# split exists to prevent, reachable by typing the same two words in the other
+# order.
+setup_repo; phase start vforceord; phase 2; phase 3; phase 4 --force
+FR=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh --force 5')")
+printf '%s' "$FR" | grep -qi 'phase 5' \
+  && ok "flag-first '--force 5' still reaches the Phase 5 question" \
+  || bad "'--force 5' asked about something else: '$FR'"
+printf '%s' "$FR" | grep -qi 'force-validation' \
+  && ok "and still names the force-validation gate" \
+  || bad "'--force 5' did not route to force-validation: '$FR'"
+expect_b "and flag-first is not itself a way around the gate" \
+  DENY '.claude/hooks/phase.sh --force 5'
+
+# The mirror, so the flag-skipping walk cannot be "return 5 whenever unsure".
+FR=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh --force 4')")
+printf '%s' "$FR" | grep -qi 'phase 4' \
+  && ok "flag-first '--force 4' still reaches the Phase 4 question" \
+  || bad "'--force 4' asked about something else: '$FR'"
+
+# A flag with no destination at all names no phase, and must not be read as one.
+FR=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh --force')")
+printf '%s' "$FR" | grep -qi 'phase 5' \
+  && bad "a bare '--force' was routed to the Phase 5 gate: '$FR'" \
+  || ok "a bare '--force' does not invent a destination"
 
 ################################################################################
 # An untracked state file counts as work owed review, so a name the install

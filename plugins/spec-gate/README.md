@@ -1476,7 +1476,7 @@ you read it.
 
 Builds a throwaway git repo in a temp dir, installs the hooks into it, and drives
 them with synthetic hook payloads. Nothing touches the repo you run it from.
-742 cases: the phase policy, every write vector, the advance-transition matrix,
+751 cases: the phase policy, every write vector, the advance-transition matrix,
 RED verification and the receipt's staleness rules, the approval questions and
 everything the receipt hook refuses to record, fail-closed behavior, the review
 gate with its index-invariance and its between-rounds delta, the slice position

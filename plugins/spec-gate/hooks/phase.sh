@@ -263,17 +263,6 @@ red_tripwire() {
 # so a journal kept in the spec — or anywhere else tracked — would dirty the tree
 # every time it was written, re-arm the gate, and demand a review round whose
 # only finding would be the entry describing the previous one.
-journal_append() {
-  mkdir -p "$STATE_DIR" 2>/dev/null || return 1
-  JP=$(sed -n 's/^phase=//p' "$STATE" 2>/dev/null | head -1)
-  { printf '\n## %s — phase %s, slice %s/%s%s\n\n' \
-      "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "${JP:-?}" \
-      "$(slice_current)" "$(slice_total)" "${1:+ — $1}"
-    printf '%s\n' "$BODY"
-    printf '\n'
-  } >> "$JOURNAL"
-}
-
 # Both journal-writing commands take their body on stdin, and both had the same
 # two ways of silently getting nothing. Run with no redirection — which is what
 # the documented /spec-phase path does, since it forwards arguments and never a
@@ -289,8 +278,17 @@ journal_append() {
 # certified that nothing had been run. A gate that produces evidence of a check
 # nobody performed is worse than no gate, because the next session reads it and
 # stops asking.
-BODY=""
-read_body() {
+#
+# The check lives in the function that writes rather than in its callers, and
+# that placement is the point. Guarding at each call site leaves the next caller
+# free to forget, and what it would silently produce is the empty entry this
+# refusal exists to prevent — the same bug back through a new door. Reading
+# stdin and refusing an empty body are one act here, so there is no way to
+# append without having passed it.
+journal_append() {  # $1 = command name, for the messages; $2 = optional label
+  # 1 = refused, and the reason is already on stderr. 2 = could not write, which
+  # the caller reports itself. Collapsing the two made a refusal print a
+  # "could not write" line on top of a precise explanation of why nothing was.
   if [ -t 0 ]; then
     echo "spec-driven: '$1' reads its entry from stdin, and stdin is a terminal." >&2
     echo "  Nothing was recorded. Pass the text as a heredoc:" >&2
@@ -309,6 +307,15 @@ read_body() {
     echo "      EOF" >&2
     return 1
   fi
+
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 2
+  JP=$(sed -n 's/^phase=//p' "$STATE" 2>/dev/null | head -1)
+  { printf '\n## %s — phase %s, slice %s/%s%s\n\n' \
+      "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "${JP:-?}" \
+      "$(slice_current)" "$(slice_total)" "${2:+ — $2}"
+    printf '%s\n' "$BODY"
+    printf '\n'
+  } >> "$JOURNAL" || return 2
   return 0
 }
 
@@ -634,8 +641,12 @@ case "${1:-status}" in
 
   journal)
     [ -f "$STATE" ] || { echo "spec-driven: not started. Run: phase.sh start <task>" >&2; exit 1; }
-    read_body journal || exit 1
-    journal_append "${2:-}" || { echo "spec-driven: could not write $JOURNAL" >&2; exit 1; }
+    journal_append journal "${2:-}"
+    case $? in
+      0) ;;
+      1) exit 1 ;;                      # refused; journal_append said why
+      *) echo "spec-driven: could not write $JOURNAL" >&2; exit 1 ;;
+    esac
     echo "spec-driven: recorded in .claude/spec-journal.md"
     ;;
 
@@ -648,8 +659,15 @@ case "${1:-status}" in
       echo "  is what Phase 4 cannot exit without."
       exit 1
     fi
-    read_body validation || exit 1
-    journal_append "VALIDATION REPORT" || { echo "spec-driven: could not write $JOURNAL" >&2; exit 1; }
+    # The marker below is written only after this succeeds. That order is what
+    # makes the refusal mean anything: a marker written first would clear 4 -> 5
+    # on a report the journal never received.
+    journal_append validation "VALIDATION REPORT"
+    case $? in
+      0) ;;
+      1) exit 1 ;;                      # refused; journal_append said why
+      *) echo "spec-driven: could not write $JOURNAL" >&2; exit 1 ;;
+    esac
     T=$(sed -n 's/^task=//p' "$STATE" | head -1)
     { printf '# spec-gate validation marker — written by phase.sh validation, never by hand\n'
       printf 'task=%s\nslice=%s/%s\n' "$T" "$(slice_current)" "$(slice_total)"
@@ -859,8 +877,13 @@ for line in sys.stdin:
   *)
     echo "usage: phase.sh [status | brief | start <task> | ask <gate> | red | scaffold |"
     echo "                slices <n> | journal | validation | 1..5 | off]"
+    # Derived, not retyped. This line said "spec | red | close-out" while
+    # gate_list had grown to nine, and the `ask` command a few hundred lines up
+    # already builds its own error from gate_list — so the usage was the only
+    # copy that could drift, and had.
     echo "       phase.sh ask <gate>  print the question for a gate as an"
-    echo "                            AskUserQuestion payload: spec | red | close-out"
+    echo "                            AskUserQuestion payload:"
+    echo "                            $(gate_list | tr ' ' '|')"
     echo "       phase.sh red         run the Phase 3 tests and record RED if they fail"
     echo "       phase.sh slices <n>  set how many slices this task lands in"
     echo "       phase.sh brief       reconstruct the task from disk, for a session"
