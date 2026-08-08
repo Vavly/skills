@@ -1430,19 +1430,24 @@ covered by a case in `test.sh`:
   either restrict it or increase scrutiny.
 - **Writes to a phase state file are denied in the common spellings.** The check
   reads the *tokens the shell would produce*, not the command text, so a
-  quote-split path (`.spec-vali''dation`), a glob (`rm -f .claude/.spec-*`), a
-  glob relative to a `cd`, `rm -rf .claude`, `find .claude -delete`, an
+  quote-split path (`.spec-vali''dation`), a glob (`rm -f .git/spec-gate/.spec-*`),
+  a glob relative to a `cd`, `rm -rf .git/spec-gate`, `find . -delete`, an
   interpreter (`python3 -c "os.remove(...)"`), a nested or fused shell payload
-  (`bash -c'...'`), an env-assignment prefix, and `git clean -x/-X` and
-  `git stash --all` — which remove every state file precisely because they are
-  all gitignored — are each denied. A write target the shell computes at runtime
-  is denied at every phase when the computed text names state. This is a list of
-  spellings and is **not** claimed to be complete; see the threat model below.
-- **The Phase 4 validation marker is authenticated, not merely present.** It
-  carries a keyed hash of its own fields, with the key under `.git/` where no
-  working-tree wipe reaches it. A marker written by hand does not verify and is
-  treated as absent, so a missed write spelling costs a re-run rather than the
-  gate. `phase.sh red` also snapshots and restores the gate's state around the
+  (`bash -c'...'`), and an env-assignment prefix are each denied. A write target
+  the shell computes at runtime is denied at every phase when the computed text
+  names state. This is a list of spellings and is **not** claimed to be complete;
+  see the threat model below.
+- **The phase state is not in the working tree.** It lives under
+  `.git/spec-gate/`, so `git clean -fdx`, `git stash --all` and `rm -rf .claude`
+  run and the gate survives all three — the tests assert that by running them,
+  not by asserting a refusal. It is also not gitignored, because there is nothing
+  there to ignore, which retires the install step that could be got wrong.
+- **Every state file is authenticated, not merely present.** Each carries a keyed
+  hash of its own fields, with the key under `.git/` beside them. A file written
+  by hand does not verify, so a missed write spelling costs a re-arm rather than
+  the gate. Four of them read an unverifiable file as absent, which is their safe
+  direction; `.spec-phase` fails **closed** instead, because for the file that
+  arms the gate "absent" is what a forger wants. `phase.sh red` also snapshots and restores the gate's state around the
   configured test command, which is model-authored shell it must be free to write.
 - **An approval is an answer the user gave, not a claim the model makes.** The
   three gates allow on a receipt written by a `PostToolUse` hook from an
@@ -1528,14 +1533,17 @@ another, because the list is a list and the space is not.
 
 Where that leaves the design:
 
-- **Deletion is contained by the guard; forgery is contained by the marker.**
-  Removing a state file only re-arms a gate — the costly failure is *clearing*
-  one, so the marker that clears 4 → 5 carries a keyed hash and a file written by
-  hand is treated as absent. That is the property worth relying on, and it does
-  not depend on the guard's spelling list being complete.
-- **The key is under `.git/`, not in the working tree**, so the commands that
-  wipe every state file (`git clean -fdx`, `git stash --all`, `rm -rf .claude`)
-  do not reach it, and the guard refuses any command naming it at any phase.
+- **Two independent containments, and neither is the spelling list.** The state
+  is out of *reach*: it lives under `.git/spec-gate/`, so the commands that wipe
+  a working tree do not touch it. And a forgery has no *payoff*: every state file
+  carries a keyed hash, so a file written by hand does not verify. A spelling the
+  guard misses therefore costs a re-arm, which is the property worth relying on.
+  `find` is the exception worth naming — it walks the filesystem rather than the
+  tree, so `find .` descends into `.git` and the guard's root and `-name` checks
+  are still what covers it.
+- **The key is under `.git/`, beside the state it signs**, so the commands that
+  wipe a working tree do not reach either, and the guard refuses any command
+  naming the key at any phase.
   That last part is load-bearing and was missing at first: a model does not need
   to *read* the key to forge a marker, it only needs to **replace** it, and a
   marker signed with a key of your own choosing verifies perfectly. Reading it is

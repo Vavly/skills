@@ -157,7 +157,9 @@ TMP="$GATE_DIR/.spec-approval.tmp.$$"
   printf 'slice=%s\n' "$(sed -n 's/^slice=//p' "$STATE" | head -1)"
   printf 'subject:\n'
   (cd "$PROJECT_DIR" 2>/dev/null && gate_subject "$GATE")
-} > "$TMP" 2>/dev/null && mv -f "$TMP" "$(approval_path)" 2>/dev/null
+} > "$TMP" 2>/dev/null \
+  && spec_mac_write "$TMP" \
+  && mv -f "$TMP" "$(approval_path)" 2>/dev/null
 rm -f "$TMP" 2>/dev/null
 
 exit 0

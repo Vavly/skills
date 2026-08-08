@@ -108,6 +108,17 @@ fi
 # A corrupt state file used to fall through to exit 0, silently disabling the
 # gate — the same fail-open bug as a missing parser. It now fails closed, with a
 # reason that says how to recover.
+# Authenticated before it is read. Every other state file treats "does not
+# verify" as "is not there", because absent is the safe direction for all of
+# them — a gate re-arms, a receipt has to be re-earned. This one is the
+# exception, and it is the exception for the reason the rule exists: absent means
+# NO WORKFLOW here, so treating a forged phase file as missing would hand the
+# forger exactly what they wrote it for. It fails closed instead, the same way a
+# corrupt phase value already does.
+if [ -f "$STATE" ] && ! spec_mac_ok "$STATE"; then
+  deny "phase-guard: $STATE does not authenticate. Every spec-gate state file carries a keyed hash of its own fields, and this one does not verify — so it was not written by phase.sh. A phase written by hand is production code unlocked with nothing asked, which is the whole of what this gate exists to prevent, so it is refused rather than believed. Recover with 'phase.sh off' and start the task again; if you did not edit it, the key under .git/ may have been replaced or removed."
+fi
+
 PHASE=$(sed -n 's/^phase=//p' "$STATE" 2>/dev/null | head -1)
 case "$PHASE" in
   1|2|3|4|5) ;;

@@ -35,6 +35,29 @@ gate_dir_of() {   # $1 = a worktree path -> its absolute gate dir
   printf '%s/.claude\n' "$1"
 }
 
+# A SIGNED state file, for tests that need to stand at a particular phase or
+# slice without walking there. Every state file now carries a keyed hash of its
+# own fields, and .spec-phase is the one that fails CLOSED on a bad one — so a
+# hand-written setup file is indistinguishable from a forgery and is refused by
+# every layer, which is the point. Setup writes a real one; the forgery tests
+# below write a bad one deliberately.
+sign_state() {   # $1 = path to a state file under the gate dir
+  ( . "$SRC/hooks/phase-policy.sh"
+    PROJECT_DIR="$PWD"
+    spec_mac_write "$1" ) >/dev/null 2>&1
+}
+set_state() {    # <phase> [task] [slice]
+  mkdir -p "$SPD"
+  if [ "$#" -ge 3 ]; then
+    printf 'phase=%s\ntask=%s\nslice=%s\n' "$1" "$2" "$3" > "$SPD/.spec-phase"
+  elif [ "$#" = 2 ]; then
+    printf 'phase=%s\ntask=%s\n' "$1" "$2" > "$SPD/.spec-phase"
+  else
+    printf 'phase=%s\n' "$1" > "$SPD/.spec-phase"
+  fi
+  sign_state "$SPD/.spec-phase"
+}
+
 PASS=0; FAIL=0
 if [ -t 1 ]; then G=$'\033[32m'; R=$'\033[31m'; B=$'\033[1m'; N=$'\033[0m'; else G=""; R=""; B=""; N=""; fi
 
@@ -544,7 +567,7 @@ else
 fi
 
 group "Corrupt state fails closed [#7]"
-printf 'phase=notanumber\ntask=x\n' > $SPD/.spec-phase
+set_state notanumber x
 expect_w "corrupt phase denies writes"    DENY src/x.ts
 out=$(.claude/hooks/phase.sh status 2>&1); rc=$?
 if [ $rc -eq 0 ] && ! printf '%s' "$out" | grep -qi 'unbound variable'; then
@@ -552,7 +575,7 @@ if [ $rc -eq 0 ] && ! printf '%s' "$out" | grep -qi 'unbound variable'; then
 else
   bad "phase.sh status on corrupt state — rc=$rc out=$out"
 fi
-printf 'task=only\n' > $SPD/.spec-phase
+printf 'task=only\n' > $SPD/.spec-phase; sign_state $SPD/.spec-phase
 expect_w "missing phase= denies writes"   DENY src/x.ts
 
 # phase.sh degrades rather than erroring when the policy file is gone, and the
@@ -1658,7 +1681,7 @@ done
 
 # Absent reads as 1/1; malformed fails closed. A bad value cannot come from the
 # user — the guard denies every write to this file — so it means corruption.
-printf 'phase=3\ntask=t\n' > $SPD/.spec-phase
+set_state 3 t
 printf '%s' "$(st)" | grep -qi 'corrupt' \
   && bad "absent slice field reported as corrupt" || ok "absent slice field reads as 1/1"
 # Matched with `case` rather than a pipe into grep -q. This file runs under
@@ -1667,14 +1690,14 @@ printf '%s' "$(st)" | grep -qi 'corrupt' \
 # text it wanted is sitting in the output. That race made this loop flaky —
 # observed failing on '1/2/3' alone, on a run where every other case passed.
 for junk in 'abc' '2/' '/5' '0/3' '4/2' '1/2/3'; do
-  printf 'phase=3\ntask=t\nslice=%s\n' "$junk" > $SPD/.spec-phase
+  set_state 3 t "$junk"
   if grep -qi 'corrupt' <<< "$(st)"; then
     ok "slice='$junk' fails closed"
   else
     bad "slice='$junk' was accepted"
   fi
 done
-printf 'phase=4\ntask=t\nslice=2/2\n' > $SPD/.spec-phase
+set_state 4 t 2/2
 .claude/hooks/phase.sh slices 1 >/dev/null 2>&1 \
   && bad "slices dropped the total below the current slice" \
   || ok "slices refuses a total below the current slice"
@@ -1683,7 +1706,7 @@ group "The slice boundary is a commit [5 -> 3]"
 setup_repo
 phase start sliced
 .claude/hooks/phase.sh slices 3 >/dev/null 2>&1
-printf 'phase=5\ntask=sliced\nslice=1/3\n' > $SPD/.spec-phase
+set_state 5 sliced 1/3
 
 # Dirty tree: the next slice would fold this diff into its baseline and the
 # review gate would never see it again. That is the escape Phase 5 exists to
@@ -1719,14 +1742,14 @@ grep -q '^slice=2/3$' $SPD/.spec-phase \
   && ok "5 -> 3 advances the slice position" || bad "slice position did not advance"
 
 # The last slice has no next one. Closing out is `off`, which is the user's.
-printf 'phase=5\ntask=sliced\nslice=3/3\n' > $SPD/.spec-phase
+set_state 5 sliced 3/3
 reason=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh 3')")
 [ -n "$reason" ] && ok "5 -> 3 denied on the final slice" \
                  || bad "5 -> 3 allowed past the final slice"
 # Every other move off 5 stays denied, sliced or not.
 reason=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh 4')")
 [ -n "$reason" ] && ok "5 -> 4 still denied" || bad "5 -> 4 escaped the review gate"
-printf 'phase=5\ntask=sliced\nslice=1/3\n' > $SPD/.spec-phase
+set_state 5 sliced 1/3
 reason=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh 2')")
 [ -n "$reason" ] && ok "5 -> 2 still denied mid-slice" || bad "5 -> 2 escaped the review gate"
 
@@ -1742,7 +1765,7 @@ for p in 1 2; do
 done
 # Phase 3+: the total is part of what was approved at 2 -> 3.
 for p in 3 4 5; do
-  printf 'phase=%s\ntask=sliced\nslice=1/5\n' "$p" > $SPD/.spec-phase
+  set_state "$p" sliced 1/5
   d=$(pl_bash '.claude/hooks/phase.sh slices 8' | .claude/hooks/phase-guard.sh \
       | python3 -c 'import json,sys
 try: print(json.load(sys.stdin).get("hookSpecificOutput",{}).get("permissionDecision",""))
@@ -1759,7 +1782,7 @@ done
 group "Closing out names the unfinished slices"
 setup_repo
 phase start sliced
-printf 'phase=5\ntask=sliced\nslice=2/5\n' > $SPD/.spec-phase
+set_state 5 sliced 2/5
 reason=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh off')")
 if printf '%s' "$reason" | grep -q 'slice 2 of 5'; then
   ok "the close-out prompt names the slice position"
@@ -1768,7 +1791,7 @@ else
 fi
 printf '%s' "$reason" | grep -q '3 more are unimplemented' \
   && ok "close-out counts what is left" || bad "close-out does not count the remainder"
-printf 'phase=5\ntask=sliced\nslice=5/5\n' > $SPD/.spec-phase
+set_state 5 sliced 5/5
 reason=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh off')")
 printf '%s' "$reason" | grep -qi 'unimplemented' \
   && bad "close-out warns about slices on a finished task" \
@@ -2171,7 +2194,7 @@ group "Close-out at a slice boundary offers the next slice"
 # used it only in the no-receipt fallback, so it fired when the model skipped the
 # question and stayed silent when the model asked properly.
 setup_repo; phase start sliced
-printf 'phase=5\ntask=sliced\nslice=1/8\n' > $SPD/.spec-phase
+set_state 5 sliced 1/8
 
 Q=$(gate_q close-out)
 printf '%s' "$Q" | grep -qi 'slice 1 of 8' \
@@ -2216,7 +2239,7 @@ done
 
 # The last slice is the case close-out was written for, and it must not grow a
 # next-slice option that goes nowhere.
-printf 'phase=5\ntask=sliced\nslice=8/8\n' > $SPD/.spec-phase
+set_state 5 sliced 8/8
 Q=$(gate_q close-out)
 printf '%s' "$Q" | grep -qi 'slice' \
   && bad "the final slice is asked about as though more were coming: '$Q'" \
@@ -2227,7 +2250,7 @@ printf '%s' "$Q" | grep -qi 'slice' \
   || ok "no next slice is offered once the last one is reviewed"
 
 # An unsliced task must be indistinguishable from before any of this existed.
-printf 'phase=5\ntask=sliced\nslice=1/1\n' > $SPD/.spec-phase
+set_state 5 sliced 1/1
 .claude/hooks/phase.sh ask close-out 2>/dev/null | grep -qiE 'slice' \
   && bad "a 1/1 task is asked about slices it never had" \
   || ok "a 1/1 task closes out with no slice wording"
@@ -2761,9 +2784,9 @@ answer spec 'Approve, and create the files first'
 printf 'and one more requirement nobody approved\n' >> docs/specs/newfeature.md
 expect_b "a stale answer is not re-prompted"   DENY '.claude/hooks/phase.sh scaffold'
 answer spec 'Approve, and create the files first'
-printf 'phase=2\ntask=newfeature\nslice=1/2\n' > $SPD/.spec-phase
+set_state 2 newfeature 1/2
 expect_b "an expired answer is not re-prompted" DENY '.claude/hooks/phase.sh scaffold'
-printf 'phase=2\ntask=newfeature\nslice=1/1\n' > $SPD/.spec-phase
+set_state 2 newfeature 1/1
 .claude/hooks/phase.sh scaffold >/dev/null 2>&1
 [ -f $SPD/.spec-scaffold ] && ok "scaffold mode is recorded on disk" \
                              || bad "phase.sh scaffold left no marker"
@@ -2822,12 +2845,12 @@ expect_w "and production is blocked again at Phase 3" DENY src/another.ts
 # Scaffold belongs to Phase 2 and nowhere else. This is what makes it unable to
 # serve as the free retreat a numbered phase would have been.
 for p in 1 3 4 5; do
-  printf 'phase=%s\ntask=newfeature\nslice=1/1\n' "$p" > $SPD/.spec-phase
+  set_state "$p" newfeature 1/1
   .claude/hooks/phase.sh scaffold >/dev/null 2>&1
   [ -f $SPD/.spec-scaffold ] && bad "scaffold armed from phase $p" \
                                || ok "scaffold is refused at phase $p"
 done
-printf 'phase=2\ntask=newfeature\nslice=1/1\n' > $SPD/.spec-phase
+set_state 2 newfeature 1/1
 .claude/hooks/phase.sh off >/dev/null 2>&1
 [ -f $SPD/.spec-scaffold ] && bad "off left the scaffold marker behind" \
                              || ok "off clears scaffold mode too"
@@ -2930,7 +2953,7 @@ printf '%s' "$out" | grep -qF "$MAIN" \
 # task does not have it.
 cd "$MAIN" || exit 1
 export CLAUDE_PROJECT_DIR="$MAIN"
-printf 'phase=5\ntask=feature\nslice=1/1\n' > "$MAIN/$SPD/.spec-phase"
+( cd \"$MAIN\" && set_state 5 feature 1/1 )
 printf 'someone elses branch\n' > "$WT/src/unrelated.ts"
 rc=$(gate)
 [ "$rc" = 0 ] && ok "an unrelated dirty worktree is not this task's business" \
@@ -2946,7 +2969,7 @@ rm -rf "$WT/docs/specs" "$WT/src/newthing.ts" "$WT/src/unrelated.ts"
 rc=$(gate)
 [ "$rc" = 0 ] && ok "and goes quiet once no related tree is dirty" \
               || bad "the Stop gate stayed blocked with no related tree left (exit $rc)"
-printf 'phase=3\ntask=feature\nslice=1/1\n' > "$MAIN/$SPD/.spec-phase"
+( cd \"$MAIN\" && set_state 3 feature 1/1 )
 cd "$WT" || exit 1
 export CLAUDE_PROJECT_DIR="$WT"
 
@@ -4516,7 +4539,8 @@ printf 'a\nb\n\n\n' > $SPD/.spec-red
 setup_repo; phase start snapbytes2; phase 2; phase 3
 echo 'it("f", () => expect(1).toBe(2))' > src/x.test.ts
 printf 'exit 1\n' > .claude/spec-gate-test-cmd
-printf 'phase=3\ntask=snapbytes2\nslice=1/1\n\n\n' > $SPD/.spec-phase
+set_state 3 snapbytes2 1/1
+printf '\n\n' >> $SPD/.spec-phase
 BEFORE=$(cksum < $SPD/.spec-phase)
 .claude/hooks/phase.sh red >/dev/null 2>&1
 [ "$(cksum < $SPD/.spec-phase)" = "$BEFORE" ] \
@@ -4635,6 +4659,102 @@ if [ -d "$WT2" ]; then
   git worktree remove --force "$WT2" >/dev/null 2>&1
 else
   ok "git worktree add unavailable; per-tree gate dir not exercised"
+fi
+
+################################################################################
+# The guard's deletion routes are a list of spellings and cannot be complete.
+# Moving the state out of the tree removes the reach; signing it removes the
+# payoff. With both, a spelling the guard misses costs a re-arm — which is what
+# the README has always claimed and what only .spec-validation could previously
+# back up, because spec_mac_write had exactly one call site.
+group "every state file is signed, and a forgery buys nothing"
+setup_repo; phase start macs; phase 2; phase 3
+
+for f in .spec-phase .spec-baseline; do
+  [ -n "$(sed -n 's/^mac=//p' "$SPD/$f" 2>/dev/null | head -1)" ] \
+    && ok "$f carries an authenticator" \
+    || bad "$f was written unsigned"
+done
+
+pol() { ( . "$SRC/hooks/phase-policy.sh"; PROJECT_DIR="$PWD"; "$@" ) 2>/dev/null; }
+
+# .spec-phase is the one that fails CLOSED. Absent means "no workflow", so
+# treating a forged phase file as missing would hand the forger the disarm they
+# wrote it for.
+printf 'phase=4\ntask=macs\nslice=1/1\n' > "$SPD/.spec-phase"
+expect_w "a forged phase does not unlock production code" DENY src/x.ts
+expect_b "and the guard refuses rather than reading it"   DENY 'echo hi > src/y.ts'
+GR=$(guard_reason "$(pl_write src/x.ts)")
+printf '%s' "$GR" | grep -q 'does not authenticate' \
+  && ok "and says the state does not authenticate, not that the phase forbids it" \
+  || bad "the refusal does not name the real reason: $GR"
+SOUT=$(.claude/hooks/phase.sh status 2>&1)
+printf '%s' "$SOUT" | grep -q 'does not authenticate' \
+  && ok "phase.sh refuses to report a phase it cannot trust" \
+  || bad "phase.sh status reported a forged phase: $SOUT"
+# The recovery the refusal names has to work, or it is not a recovery.
+.claude/hooks/phase.sh off >/dev/null 2>&1
+[ -f "$SPD/.spec-phase" ] \
+  && bad "phase.sh off could not clear an unauthenticated state file" \
+  || ok "phase.sh off still works, which is the recovery the refusal names"
+
+# The other four fail OPEN-as-absent, which for them is the safe direction: a
+# gate re-arms, a receipt has to be re-earned, scaffold is not armed.
+setup_repo; phase start macs2; phase 2; phase 3
+printf '# fake\ntask=macs2\nrc=1\nkind=assertion\ncmd=x\ntests:\n' > "$SPD/.spec-red"
+[ "$(pol red_receipt_status)" = forged ] \
+  && ok "a hand-written RED receipt does not verify" \
+  || bad "a forged RED receipt read as $(pol red_receipt_status)"
+expect_b "and 3 -> 4 still refuses on it" DENY '.claude/hooks/phase.sh 4'
+
+printf 'task=macs2\n' > "$SPD/.spec-scaffold"
+pol scaffold_armed \
+  && bad "a hand-written scaffold marker armed scaffold mode" \
+  || ok "a hand-written scaffold marker does not arm scaffold mode"
+
+printf 'gate=red\nverdict=approve\nphase=3\ntask=macs2\nslice=1/1\nsubject:\nx\n' \
+  > "$SPD/.spec-approval"
+[ "$(pol approval_status red)" = forged ] \
+  && ok "a hand-written approval does not verify" \
+  || bad "a forged approval read as $(pol approval_status red)"
+
+# The real ones still verify — a signature nobody can produce is a gate nobody
+# can pass, and every one of these is written by a hook rather than by hand.
+setup_repo; phase start macs3; phase 2
+printf 'the spec\n' > docs/specs/macs3.md
+answer spec 'Approve the spec'
+[ "$(pol approval_status spec)" = approve ] \
+  && ok "a receipt written by approval-receipt.sh verifies" \
+  || bad "a genuine approval read as $(pol approval_status spec)"
+phase 3
+echo 'it("f", () => expect(1).toBe(2))' > src/x.test.ts
+printf 'exit 1\n' > .claude/spec-gate-test-cmd
+.claude/hooks/phase.sh red >/dev/null 2>&1
+[ "$(pol red_receipt_status)" = valid ] \
+  && ok "a receipt written by phase.sh red verifies" \
+  || bad "a genuine RED receipt read as $(pol red_receipt_status)"
+[ -n "$(sed -n 's/^mac=//p' "$SPD/.spec-red" | head -1)" ] \
+  && ok "and it carries its authenticator" || bad ".spec-red was written unsigned"
+# The mac line must not leak into the block the receipt is compared on, or every
+# receipt would go stale the moment it was signed.
+pol changed_test_snapshot | grep -q 'mac=' \
+  && bad "the authenticator leaked into the tests: block" \
+  || ok "the authenticator is not part of what the receipt pins"
+
+# The key is per-worktree and the state now sits beside it, so a marker minted
+# for one tree must not clear a gate in another. Replacing the key must void
+# everything rather than only the validation marker.
+setup_repo; phase start macs4; phase 2; phase 3
+K=$( . "$SRC/hooks/phase-policy.sh"; PROJECT_DIR="$PWD" spec_key_path )
+if [ -n "$K" ] && [ -f "$K" ]; then
+  printf '%s\n' deadbeef > "$K"
+  expect_w "replacing the key voids the phase file too" DENY src/x.ts
+  GR=$(guard_reason "$(pl_write src/x.ts)")
+  printf '%s' "$GR" | grep -q 'does not authenticate' \
+    && ok "and the refusal points at authentication, not at the phase" \
+    || bad "replacing the key did not produce an authentication refusal"
+else
+  bad "no key path resolved, so the key-replacement check could not run"
 fi
 
 ################################################################################

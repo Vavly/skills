@@ -202,6 +202,50 @@ spec_mac_ok() {      # $1 = path — 0 if the file authenticates against the key
   [ "$have" = "$want" ]
 }
 
+# --- Every state file, not just the one -------------------------------------
+# spec_mac_write had exactly one call site. That made the argument three
+# paragraphs up true of .spec-validation and false of everything else: deleting a
+# marker only re-arms a gate, forging one clears it, and .spec-red, .spec-approval
+# and .spec-scaffold each clear a gate as surely as .spec-validation does. A model
+# that could write .spec-red asserts RED without running anything; one that could
+# write .spec-approval records an answer the user never gave; one that could write
+# .spec-scaffold widens Phase 2 to create production files.
+#
+# So all of them are signed, and every reader treats an unverifiable file the way
+# it treats a missing one. What that means differs by file, and the difference is
+# the whole design:
+#
+#   .spec-red, .spec-approval, .spec-scaffold, .spec-baseline
+#       Absent is the SAFE direction — a gate re-arms, a receipt has to be
+#       re-earned, scaffold is not armed, the baseline is empty so everything
+#       counts as changed. Unverifiable therefore reads as absent, and a forgery
+#       buys exactly nothing.
+#
+#   .spec-phase
+#       Absent means NO WORKFLOW, which is the unsafe direction: treating a
+#       forged phase file as missing would disarm the gate, i.e. hand the forger
+#       the thing they wanted. This one fails CLOSED instead, exactly as a corrupt
+#       phase value already does. That is a correction to the shape of the rest,
+#       not an exception to it — "treat it as absent" is shorthand for "do not let
+#       it clear anything", and for the file that arms the gate those are opposite
+#       instructions.
+#
+# There is no upgrade path to worry about: the state directory moved in the same
+# change, so no repository has a .git/spec-gate/.spec-phase written by an earlier
+# version. The first `phase.sh start` after this writes a signed one.
+spec_authentic() {   # $1 = path — 0 if it exists AND verifies
+  [ -f "$1" ] || return 1
+  spec_mac_ok "$1"
+}
+
+# The authenticated content of a state file, for readers that consume the whole
+# thing rather than picking fields out of it. The `mac=` line is part of the file
+# and not part of what was signed, so a reader that does not strip it sees a
+# record nobody wrote — a spurious baseline entry, an extra line in a RED
+# receipt's `tests:` block. One definition of "the body", shared with the writer,
+# is what stops those disagreeing.
+spec_state_body() { spec_mac_body "$1"; }
+
 # none | forged | stale | valid. Shared by the 4 -> 5 tripwire and by `brief`,
 # which used to test `[ -f ]` alone — so a stale marker was announced to a
 # resuming session as a recorded report and then refused by the transition it
@@ -457,7 +501,7 @@ is_phase_state() {
 # the module boundary before the design exists, and committing that guess as the
 # frontier every later test imports from.
 scaffold_path() { printf '%s/.spec-scaffold' "$(spec_gate_dir)"; }
-scaffold_armed() { [ -f "$(scaffold_path)" ]; }
+scaffold_armed() { spec_authentic "$(scaffold_path)"; }
 
 # "New" means NOT IN HEAD. The two layers have to agree about the same file at
 # any point in the turn, and by the time the Stop scan runs, the file the guard
@@ -867,7 +911,8 @@ red_receipt_path() { printf '%s/.spec-red' "$(spec_gate_dir)"; }
 # "<content-hash> <path>" lines for the test files changed since the phase began,
 # from the same snapshot the Stop scan uses. Must run from the project root.
 changed_test_snapshot() {
-  base=$(cat "$(spec_gate_dir)/.spec-baseline" 2>/dev/null)
+  base=$(spec_authentic "$(spec_gate_dir)/.spec-baseline" \
+           && spec_state_body "$(spec_gate_dir)/.spec-baseline" 2>/dev/null)
   tree_snapshot | while IFS= read -r line; do
     [ -z "$line" ] && continue
     case $'\n'"$base"$'\n' in
@@ -885,9 +930,14 @@ red_receipt_status() {
   (
     r=$(red_receipt_path)
     [ -r "$r" ] || { printf 'none\n'; exit 0; }
+    # A receipt that does not authenticate is one phase.sh red did not write, and
+    # a hand-written one asserts RED with nothing having been run. Reported as
+    # `forged` rather than `none` so the refusal can say which happened; every
+    # caller already treats anything but `valid` as "not verified".
+    spec_mac_ok "$r" || { printf 'forged\n'; exit 0; }
     cd "$PROJECT_DIR" 2>/dev/null || { printf 'unverifiable\n'; exit 0; }
     git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { printf 'unverifiable\n'; exit 0; }
-    want=$(sed -n '/^tests:$/,$p' "$r" | sed '1d')
+    want=$(spec_state_body "$r" | sed -n '/^tests:$/,$p' | sed '1d')
     [ -n "$want" ] || { printf 'stale\n'; exit 0; }
     if [ "$want" = "$(changed_test_snapshot)" ]; then printf 'valid\n'; else printf 'stale\n'; fi
   )
@@ -1194,6 +1244,12 @@ approval_status() {
     g="$1"
     a=$(approval_path)
     [ -r "$a" ] || { printf 'none\n'; exit 0; }
+    # Written only by approval-receipt.sh, from an answer that came back through
+    # the host. The signature is what makes that claim checkable rather than
+    # merely stated: a receipt the model wrote by hand records an approval the
+    # user never gave, which is the sharpest version of the forgery this whole
+    # mechanism exists to prevent.
+    spec_mac_ok "$a" || { printf 'forged\n'; exit 0; }
     [ "$(sed -n 's/^gate=//p' "$a" | head -1)" = "$g" ] || { printf 'none\n'; exit 0; }
     v=$(sed -n 's/^verdict=//p' "$a" | head -1)
     [ -n "$v" ] || { printf 'stale\n'; exit 0; }
@@ -1207,7 +1263,7 @@ approval_status() {
 
     cd "$PROJECT_DIR" 2>/dev/null || { printf 'unverifiable\n'; exit 0; }
     git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { printf 'unverifiable\n'; exit 0; }
-    want=$(sed -n '/^subject:$/,$p' "$a" | sed '1d')
+    want=$(spec_state_body "$a" | sed -n '/^subject:$/,$p' | sed '1d')
     case "$g" in
       # An empty fingerprint on a gate that approves a document means there was
       # no document. Refusing rather than passing is the same call as an empty

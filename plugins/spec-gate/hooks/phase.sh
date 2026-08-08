@@ -103,6 +103,22 @@ write_state() {
   [ -f "$STATE" ] && S=$(sed -n 's/^started=//p' "$STATE" 2>/dev/null | head -1)
   [ -n "$S" ] || S=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
   printf 'phase=%s\ntask=%s\nslice=%s\nstarted=%s\n' "$1" "$2" "$3" "$S" > "$STATE"
+  # Signed like every other state file. This one is the sharpest case: a phase
+  # written by hand is production code unlocked with nothing asked, and it was
+  # the file the guard's whole list of deletion spellings was protecting.
+  #
+  # Unsigned is fatal rather than degraded, and every reader refuses on it, so a
+  # failure here must not leave a file behind that nothing will accept — it would
+  # look exactly like a gate that had armed.
+  if ! spec_mac_write "$STATE"; then
+    rm -f "$STATE"
+    echo "spec-driven: REFUSED — the phase state could not be authenticated." >&2
+    echo "  No key could be written under .git/, or this host has no sha256 tool." >&2
+    echo "  spec-gate signs every state file so that a missed deletion route costs" >&2
+    echo "  a re-arm rather than the gate; it will not write one it cannot sign." >&2
+    return 1
+  fi
+  return 0
 }
 
 # Indexing an array with an unvalidated value out of the state file used to
@@ -130,6 +146,13 @@ snapshot_baseline() {
     git rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 0
     tree_snapshot > "$BASELINE" 2>/dev/null
   )
+  # A forged baseline is a forged answer to "what did this phase change" — an
+  # empty one hides nothing, but one holding the current tree makes the review
+  # scan and the RED check both conclude that nothing moved. Unsigned reads as
+  # empty at every reader, which is the conservative direction, so a failure here
+  # is not fatal the way write_state's is.
+  spec_mac_write "$BASELINE" 2>/dev/null || rm -f "$BASELINE"
+  return 0
 }
 
 # --- RED verification ---------------------------------------------------------
@@ -299,6 +322,16 @@ verify_red() {
     printf 'tests:\n'
     (cd "$PROJECT_DIR" 2>/dev/null && changed_test_snapshot)
   } > "$RECEIPT"
+  # The receipt says the machine checked something. Unsigned it says only that
+  # a file exists, and a file the model can write asserts RED with nothing run —
+  # the same hole .spec-validation was signed to close, one phase earlier.
+  if ! spec_mac_write "$RECEIPT"; then
+    rm -f "$RECEIPT"
+    echo "spec-driven: the tests failed as required, but the receipt could not be"
+    echo "  authenticated — no key could be written under .git/, or this host has no"
+    echo "  sha256 tool. Nothing was recorded, so 3 -> 4 will still refuse."
+    return 1
+  fi
 
   echo "spec-driven: tests failed as required — RED verified (exit $rc, $kind)."
   echo "  Note: this proves not-green, and that the failure was neither a broken"
@@ -545,6 +578,22 @@ FOREIGN=""
 if [ ! -f "$STATE" ] && command -v spec_foreign_state >/dev/null 2>&1; then
   FOREIGN=$(spec_foreign_state "$PROJECT_DIR")
 fi
+
+# The same refusal the guard raises, in the script the user reaches for when the
+# guard has refused. Reporting a phase read out of a file that does not
+# authenticate would tell them where they are on the strength of the forgery.
+# `off` is exempt, because it is the recovery this refusal names — a recovery
+# route that is itself blocked is not one.
+if [ -f "$STATE" ] && command -v spec_mac_ok >/dev/null 2>&1 \
+   && ! spec_mac_ok "$STATE" && [ "${1:-status}" != off ]; then
+  echo "spec-driven: REFUSED — the phase state does not authenticate."
+  echo "  Every spec-gate state file carries a keyed hash of its own fields, and"
+  echo "  $STATE does not verify, so phase.sh did not write it. Nothing here will"
+  echo "  report or advance a phase read out of a file it cannot trust."
+  echo "  Recover with 'phase.sh off', then 'phase.sh start <task>'."
+  echo "  If you did not edit it, the key under .git/ may have been replaced."
+  exit 1
+fi
 # `brief` joins `status` in being answerable from the wrong tree, and for a
 # stronger reason than symmetry. It is the SessionStart hook, so it runs before
 # the model has done anything — which is the one moment where "a task is armed,
@@ -729,6 +778,11 @@ case "${1:-status}" in
     T=$(sed -n 's/^task=//p' "$STATE" | head -1)
     mkdir -p "$GATE_DIR" 2>/dev/null
     printf '# spec-gate scaffold mode - written by phase.sh scaffold, never by hand\ntask=%s\n' "$T" > "$SCAFFOLD"
+    if ! spec_mac_write "$SCAFFOLD"; then
+      rm -f "$SCAFFOLD"
+      echo "spec-driven: could not authenticate the scaffold marker; scaffold is NOT armed." >&2
+      exit 1
+    fi
     echo "spec-driven: scaffold mode ON (still Phase 2)"
     echo "  -> you may CREATE files that do not exist yet, and tests"
     echo "  -> you may NOT edit anything already tracked; that is Phase 4"
