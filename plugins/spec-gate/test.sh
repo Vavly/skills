@@ -4758,5 +4758,250 @@ else
 fi
 
 ################################################################################
+# Everything above this line tests a SPELLING: someone found a way past the
+# guard, it was closed, and the exact string that did it is pinned so it cannot
+# come back. That is worth having and it is not coverage. 986 of those were green
+# while `find . -exec rm -rf .claude` was allowed, while `rm -rf /abs/repo/.git`
+# was allowed, and while a decoy assignment hid a real one — because nobody had
+# written those particular strings down.
+#
+# So the axes are enumerated instead, and the cross product is generated. A hole
+# now has to survive being constructed rather than survive not being thought of.
+# T5 and T6 both fall out of this mechanically; so does T7.
+#
+# Three axes: WHICH FILE (every path the gate's own state lives in), WHICH VERB
+# (everything that destroys or overwrites), WHICH SPELLING (every way of naming a
+# path that the shell resolves and a substring match does not).
+group "generated: every state path, every destroying verb, every spelling"
+setup_repo; phase start prop; phase 2; phase 3
+
+# Read off the policy rather than retyped, so a file added there is covered here
+# without anyone remembering to add it.
+STATE_PATHS=$( . "$SRC/hooks/phase-policy.sh"
+               PROJECT_DIR="$PWD"
+               spec_phase_state_list | sed "s#^$PWD/##" )
+NPATHS=$(printf '%s\n' "$STATE_PATHS" | grep -c .)
+[ "${NPATHS:-0}" -ge 6 ] \
+  && ok "the generated matrix covers $NPATHS state paths" \
+  || bad "only $NPATHS state paths resolved — the matrix would be near-empty"
+
+# <spelling> <relative path> -> "<prefix>|<path expression>"
+#
+# Each is a way the shell arrives at the same inode without the literal appearing
+# where a substring check would see it.
+spell() {
+  local p=$2 dir base
+  dir=${p%/*}; base=${p##*/}
+  case "$1" in
+    literal)    printf '|%s' "$p" ;;
+    absolute)   printf '|%s/%s' "$PWD" "$p" ;;
+    glob)       printf '|%s*' "${p%?}" ;;
+    dirglob)    printf '|%s/.spec-*' "$dir" ;;
+    cdglob)     printf 'cd %s && |.spec-*' "$dir" ;;
+    variable)   printf 'V=%s; |$V' "$p" ;;
+    vardir)     printf 'D=%s; |$D/%s' "$dir" "$base" ;;
+    # A decoy binding whose name is a PREFIX of the real one. Substitution is
+    # textual, so applied in the wrong order `$V` eats the front of `$VD` and the
+    # token resolves to something that matches nothing.
+    shadowed)   printf 'V=safe; VD=%s; |$VD' "$p" ;;
+    quotesplit) printf "|%s''%s" "${p%??}" "${p#"${p%??}"}" ;;
+    backslash)  printf '|%s\\%s' "${p%?}" "${p#"${p%?}"}" ;;
+  esac
+}
+
+# <verb> <path expression> -> a command that destroys or overwrites it
+verb() {
+  case "$1" in
+    rm)       printf 'rm -f %s' "$2" ;;
+    unlink)   printf 'unlink %s' "$2" ;;
+    shred)    printf 'shred -u %s' "$2" ;;
+    mv)       printf 'mv %s /tmp/spec-parked' "$2" ;;
+    truncate) printf 'truncate -s 0 %s' "$2" ;;
+    redirect) printf 'echo x > %s' "$2" ;;
+    append)   printf 'echo x >> %s' "$2" ;;
+    tee)      printf 'echo x | tee %s' "$2" ;;
+    cp)       printf 'cp /dev/null %s' "$2" ;;
+    dd)       printf 'dd if=/dev/null of=%s' "$2" ;;
+  esac
+}
+
+# <wrapper> <command> -> the same command, reached the long way round
+wrap() {
+  case "$1" in
+    bare)     printf '%s' "$2" ;;
+    dashc)    printf 'bash -c "%s"' "$2" ;;
+    fused)    printf "bash -c'%s'" "$2" ;;
+    twodeep)  printf 'sh -c "bash -c \\"%s\\""' "$2" ;;
+    heredoc)  printf 'bash <<EOF\n%s\nEOF' "$2" ;;
+    afterok)  printf 'echo fine; %s' "$2" ;;
+    envpfx)   printf 'FOO=bar %s' "$2" ;;
+  esac
+}
+
+build() {   # <spelling> <verb> <wrapper> <path> -> a full command
+  local sp pre pexp cmd
+  sp=$(spell "$1" "$4"); pre=${sp%%|*}; pexp=${sp#*|}
+  cmd=$(verb "$2" "$pexp")
+  wrap "$3" "$pre$cmd"
+}
+
+# Counted rather than reported one line each: 400 PASS lines would bury the
+# suite's other output, and what matters is that the count of holes is zero and
+# that the matrix was not empty.
+matrix() {   # <label> <spellings> <verbs> <wrappers> <paths>
+  local sp vb wr pt cmd got n=0 bad_n=0 first=''
+  for pt in $5; do for vb in $3; do for sp in $2; do for wr in $4; do
+    cmd=$(build "$sp" "$vb" "$wr" "$pt")
+    n=$((n + 1))
+    got=$(guard "$(pl_bash "$cmd")")
+    if [ "$got" != DENY ]; then
+      bad_n=$((bad_n + 1))
+      [ -z "$first" ] && first="[$sp/$vb/$wr] $cmd -> $got"
+    fi
+  done; done; done; done
+  if [ "$n" = 0 ]; then
+    bad "$1 — the matrix was empty, so it proved nothing"
+  elif [ "$bad_n" = 0 ]; then
+    ok "$1 — $n commands, all denied"
+  else
+    bad "$1 — $bad_n of $n allowed; first: $first"
+  fi
+}
+
+ALL_SPELLINGS="literal absolute glob dirglob cdglob variable vardir shadowed quotesplit backslash"
+ALL_VERBS="rm unlink shred mv truncate redirect append tee cp dd"
+ALL_WRAPPERS="bare dashc fused twodeep heredoc afterok envpfx"
+
+# Axis 1: every path against every spelling.
+matrix "every state path, every spelling" \
+  "$ALL_SPELLINGS" rm bare "$STATE_PATHS"
+# Axis 2: every path against every destroying verb.
+matrix "every state path, every verb" \
+  literal "$ALL_VERBS" bare "$STATE_PATHS"
+# Axis 3: every spelling against every verb, on the file that arms the gate.
+matrix "every spelling, every verb" \
+  "$ALL_SPELLINGS" "$ALL_VERBS" bare "$SPD/.spec-phase"
+# Axis 4: every spelling reached through every nesting.
+matrix "every spelling, every nesting" \
+  "$ALL_SPELLINGS" rm "$ALL_WRAPPERS" "$SPD/.spec-phase"
+# Axis 5: the key, which is not a state file but is what makes them mean anything.
+matrix "the signing key, every spelling and verb" \
+  "literal absolute glob variable" "$ALL_VERBS" bare ".git/spec-gate-key"
+
+# find reaches the same inodes with no path token any of the above would
+# recognise, so it gets its own axis: the root it walks, and whether a -name
+# filter can match a state file.
+group "generated: find, by root and by filter"
+setup_repo; phase start propfind; phase 2; phase 3
+FIND_N=0; FIND_BAD=0; FIND_FIRST=''
+for root in . .git .git/spec-gate "$PWD" "$PWD/.git"; do
+  for filt in "" "-name '.spec-*'" "-name '.spec-phase'" "-path '*spec-gate*'"; do
+    for act in "-delete" "-exec rm -f {} ;" "-execdir rm -f {} ;" "-exec rm -rf .git/spec-gate {} ;"; do
+      cmd="find $root $filt $act"
+      FIND_N=$((FIND_N + 1))
+      got=$(guard "$(pl_bash "$cmd")")
+      if [ "$got" != DENY ]; then
+        FIND_BAD=$((FIND_BAD + 1))
+        [ -z "$FIND_FIRST" ] && FIND_FIRST="$cmd -> $got"
+      fi
+    done
+  done
+done
+[ "$FIND_BAD" = 0 ] \
+  && ok "find: $FIND_N roots x filters x actions, all denied" \
+  || bad "find: $FIND_BAD of $FIND_N allowed; first: $FIND_FIRST"
+
+# Directory sweeps: every ancestor of the state, and the directory holding the
+# record that git has no copy of.
+group "generated: directory sweeps"
+setup_repo; phase start propdir; phase 2; phase 3
+DIR_N=0; DIR_BAD=0; DIR_FIRST=''
+for d in . ./ .. .git .git/ .git/spec-gate .git/spec-gate/ .claude .claude/ \
+         "$PWD" "$PWD/.git" "$PWD/.git/spec-gate" "$PWD/.claude"; do
+  for v in "rm -rf" "rm -r -f" "mv" "rmdir"; do
+    case "$v" in mv) cmd="mv $d /tmp/spec-parked" ;; *) cmd="$v $d" ;; esac
+    DIR_N=$((DIR_N + 1))
+    got=$(guard "$(pl_bash "$cmd")")
+    if [ "$got" != DENY ]; then
+      DIR_BAD=$((DIR_BAD + 1))
+      [ -z "$DIR_FIRST" ] && DIR_FIRST="$cmd -> $got"
+    fi
+  done
+done
+[ "$DIR_BAD" = 0 ] \
+  && ok "directory sweeps: $DIR_N commands, all denied" \
+  || bad "directory sweeps: $DIR_BAD of $DIR_N allowed; first: $DIR_FIRST"
+
+# An interpreter is handed code this hook cannot lex, so the check is a
+# substring and is honest about it. It still has to fire on every state path.
+group "generated: interpreters naming a state path"
+setup_repo; phase start propint; phase 2; phase 3
+INT_N=0; INT_BAD=0; INT_FIRST=''
+for pt in $STATE_PATHS; do
+  for form in "python3 -c \"import os; os.remove('$pt')\"" \
+              "node -e \"require('fs').unlinkSync('$pt')\"" \
+              "ruby -e \"File.delete('$pt')\"" \
+              "python3 <<EOF
+import os
+os.remove('$pt')
+EOF"; do
+    INT_N=$((INT_N + 1))
+    got=$(guard "$(pl_bash "$form")")
+    if [ "$got" != DENY ]; then
+      INT_BAD=$((INT_BAD + 1))
+      [ -z "$INT_FIRST" ] && INT_FIRST="$form -> $got"
+    fi
+  done
+done
+[ "$INT_BAD" = 0 ] \
+  && ok "interpreters: $INT_N programs naming a state path, all denied" \
+  || bad "interpreters: $INT_BAD of $INT_N allowed; first: $INT_FIRST"
+
+################################################################################
+# A generated deny-suite passes perfectly on a guard that denies everything, so
+# the same matrix is run against paths that are NOT the gate's business. Without
+# this, the section above is evidence of nothing.
+group "generated: the same matrix on ordinary paths must be ALLOWED"
+setup_repo; phase start propctl; phase 2; phase 3
+CTL_N=0; CTL_BAD=0; CTL_FIRST=''
+# Paths Phase 3 permits: its own tests, and the gate config that must stay
+# writable in every phase or a repo that never configured one cannot verify RED.
+for pt in tests/helper.ts src/x.test.ts .claude/spec-gate-test-cmd; do
+  for sp in literal absolute variable vardir; do
+    for vb in $ALL_VERBS; do
+      cmd=$(build "$sp" "$vb" bare "$pt")
+      CTL_N=$((CTL_N + 1))
+      got=$(guard "$(pl_bash "$cmd")")
+      if [ "$got" != ALLOW ]; then
+        CTL_BAD=$((CTL_BAD + 1))
+        [ -z "$CTL_FIRST" ] && CTL_FIRST="[$sp/$vb] $cmd -> $got"
+      fi
+    done
+  done
+done
+[ "$CTL_BAD" = 0 ] \
+  && ok "ordinary paths: $CTL_N commands, all allowed" \
+  || bad "ordinary paths: $CTL_BAD of $CTL_N refused; first: $CTL_FIRST"
+
+# And the narrow operations under .claude/ that used to be holes and now reach
+# nothing. If these start denying again, the carve-outs have crept back.
+for c in 'rm -f .claude/*.log' 'cd .claude && rm -f *.log' \
+         'rm -f .claude/spec-gate-test-cmd' 'echo x > .claude/spec-gate-test-cmd'; do
+  got=$(guard "$(pl_bash "$c")")
+  [ "$got" = ALLOW ] && ok "still allowed: $c" || bad "$c -> $got, a carve-out has crept back"
+done
+
+# The write scan resolves this command's own bindings, the way the state scan
+# already did. The two used to disagree about the same text: `rm -f $V` was
+# judged on what V holds while `echo x > $V` was refused as unevaluable. What
+# stays refused is what the hook genuinely cannot see.
+expect_b "a bound target is judged on what it resolves to" ALLOW \
+  'V=tests/a.test.ts; echo x > $V'
+expect_b "and judged as production when that is what it holds" DENY \
+  'V=src/x.ts; echo x > $V'
+expect_b "a substitution is still unevaluable" DENY 'V=$(mktemp); echo x > $V'
+expect_b "and so is a variable from outside the command" DENY 'echo x > $LOGFILE'
+
+################################################################################
 printf '\n%s%d passed, %d failed%s\n' "$B" "$PASS" "$FAIL" "$N"
 [ "$FAIL" -eq 0 ] || exit 1

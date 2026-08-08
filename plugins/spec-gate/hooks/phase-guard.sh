@@ -1794,7 +1794,21 @@ while IFS= read -r P; do
   if [ "$PATHS_ARE_SHELL" = 1 ]; then
     case "$P" in
       *'$'*|*'`'*)
-        deny "Phase $PHASE of spec-driven: this command writes to a target the shell computes at runtime ($P), which phase-guard cannot evaluate. Use Write or Edit for file changes during phases 1-3." ;;
+        # A binding this same command made is not something the hook "cannot
+        # evaluate" — it is written down one token away, and the state scan has
+        # resolved exactly these since it learned to. Refusing them here made the
+        # two scans disagree about the same text: `V=.claude/x; rm -f $V` was
+        # judged on what V holds, while `V=tests/a.ts; echo x > $V` was refused
+        # for being unjudgeable. VARS is populated by the state walk, which runs
+        # before this.
+        resolve_tok "$P"
+        case "$RT" in
+          *'$'*|*'`'*)
+            deny "Phase $PHASE of spec-driven: this command writes to a target the shell computes at runtime ($P), which phase-guard cannot evaluate. Use Write or Edit for file changes during phases 1-3." ;;
+          '')
+            deny "Phase $PHASE of spec-driven: this command writes to a target the shell computes at runtime ($P), which phase-guard cannot evaluate. Use Write or Edit for file changes during phases 1-3." ;;
+          *) P=$RT ;;
+        esac ;;
     esac
   fi
 
