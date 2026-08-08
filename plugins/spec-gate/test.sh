@@ -51,9 +51,27 @@ setup_repo() {
 # every Phase 5 test standing in Phase 4 — which is exactly how four of them
 # failed rather than telling us the tripwire worked. The tripwire has its own
 # tests below; this one only needs to arrive.
+#
+# Matched on the WHOLE argument list, not on the first word. `case "${1:-}"`
+# discarded everything past the first argument, so `phase 5 --something` — any
+# future call meaning to test a variant — silently became `phase.sh 5 --force`
+# and asserted against a forced advance nobody wrote. A test helper that rewrites
+# its own input is the one thing in a suite that cannot be caught by the suite.
+#
+# It also has to WALK there. --force is now bound to the transition whose check
+# it skips — `5 --force` overrides 4 -> 5 and nothing else — so firing it from
+# Phase 2 is refused, and a helper that ignored the refusal left every Phase 5
+# test standing wherever it started. That is the same silent-setup failure this
+# comment was written about, one layer down.
 phase() {
-  case "${1:-}" in
-    5) .claude/hooks/phase.sh 5 --force >/dev/null 2>&1 ;;
+  local p
+  case "$*" in
+    5) p=$(sed -n 's/^phase=//p' .claude/.spec-phase 2>/dev/null | head -1)
+       case "$p" in
+         1|2) .claude/hooks/phase.sh 3 >/dev/null 2>&1; p=3 ;;
+       esac
+       if [ "$p" = 3 ]; then .claude/hooks/phase.sh 4 --force >/dev/null 2>&1; p=4; fi
+       if [ "$p" = 4 ]; then .claude/hooks/phase.sh 5 --force >/dev/null 2>&1; fi ;;
     *) .claude/hooks/phase.sh "$@" >/dev/null 2>&1 ;;
   esac
 }
@@ -3004,7 +3022,9 @@ grep -q 'make test' .claude/spec-journal.md 2>/dev/null \
 [ -f .claude/.spec-validation ] \
   && bad "the validation marker survived the phase change" \
   || ok "the marker is cleared by the phase change"
-phase 4 --force
+# A plain retreat: 5 -> 4 asserts nothing, so there is no check for --force to
+# skip and the flag is now refused there rather than ignored.
+phase 4
 .claude/hooks/phase.sh 5 >/dev/null 2>&1 \
   && bad "a second 4 -> 5 rode the earlier report" \
   || ok "a retreat into 4 cannot ride the earlier report"
@@ -4261,6 +4281,227 @@ BEFORE=$(cat .claude/spec-journal.md)
 [ "$(cat .claude/spec-journal.md)" = "$BEFORE" ] \
   && ok "an ordinary journal survives the snapshot unchanged" \
   || bad "the snapshot altered the journal it saved"
+
+################################################################################
+# How long the guard takes is a security property, and every bound it had was a
+# proxy for time rather than time itself. Each of these commands sat UNDER the
+# token budget and ran past the 15s hook timeout anyway — a killed hook emits no
+# JSON, which Claude Code reads as no decision, so all three were a silent ALLOW
+# reachable on demand. Measured before the fix: 1000 assignments 120s, 800
+# assignments 52s, 1900 glob tokens 22s.
+#
+# Asserted as "answers, and answers quickly" rather than as "denies": the fix for
+# two of these was to make the work cheap, so the honest post-condition is that
+# the guard reaches a decision inside its timeout. A DENY on the wall clock is
+# what catches whatever is still slow, and it is pinned separately below.
+group "the scan cannot be made to outrun its own timeout"
+setup_repo; phase start budget2; phase 2; phase 3
+
+timed_guard() {   # <label> <command> -> asserts a decision arrives under 15s
+  local s e d out
+  s=$(date +%s)
+  out=$(guard "$(pl_bash "$2")")
+  e=$(date +%s); d=$((e - s))
+  if [ "$out" = ALLOW ] && [ "$d" -ge 15 ]; then
+    bad "$1 — no decision after ${d}s, which reads as permission"
+  elif [ "$d" -ge 15 ]; then
+    bad "$1 — decided $out but took ${d}s, past the hook timeout"
+  else
+    ok "$1 (${d}s, $out)"
+  fi
+}
+
+timed_guard "1000 assignments decide in time" \
+  "$(python3 -c 'print("; ".join("V%d=x%d"%(i,i) for i in range(1000)))')"
+timed_guard "1900 glob tokens decide in time" \
+  "$(python3 -c 'print("echo " + " ".join("a%d*"%i for i in range(1900)))')"
+timed_guard "1000 assignments then 900 uses" \
+  "$(python3 -c 'print("; ".join("V%d=x%d"%(i,i) for i in range(1000)) + "; echo " + " ".join("$V%d"%i for i in range(900)))')"
+
+# The wall clock is the bound that corresponds to the timeout, so it has to be
+# able to fire. Nothing under the byte budget is slow enough to trip it now, so
+# this drives budget_token directly rather than inventing a pathological command
+# that a later optimisation would make fast again and quietly stop testing.
+if ( set -uo pipefail
+     SECONDS=0; SCAN_SECONDS_BUDGET=0; OVERSIZE_MSG=over
+     decide() { printf 'DECIDED:%s\n' "$1"; exit 0; }
+     deny() { decide deny; }
+     SCAN_TOKENS=0; SCAN_BYTES=0; SCAN_LEXES=0
+     SCAN_TOKEN_BUDGET=2000; SCAN_BYTE_BUDGET=262144; MAX_TOKEN_BYTES=65536
+     budget_token() {
+       [ "$SECONDS" -ge "$SCAN_SECONDS_BUDGET" ] && deny "$OVERSIZE_MSG"
+       return 0
+     }
+     budget_token x ) 2>/dev/null | grep -q 'DECIDED:deny'; then
+  ok "an overrun of the wall clock is a deny, not an empty exit"
+else
+  bad "budget_token does not refuse once the seconds budget is spent"
+fi
+
+# The counters must still be the cheap early exit they were: the wall clock is
+# an addition, not a replacement.
+expect_b "the token budget still refuses an oversized command" DENY \
+  "$(python3 -c 'print("echo " + " ".join("w%d"%i for i in range(2500)))')"
+
+################################################################################
+# --force is an override of ONE check, and which check depends entirely on where
+# you are standing. Reading it without reading $PHASE made a receipt bought for
+# the adjacent step spendable as a jump from anywhere.
+group "--force is bound to the transition whose check it skips"
+setup_repo; phase start forceadj
+
+# The receipt is real: the user was asked about entering review unvalidated, and
+# answered. What they did not answer is "skip Phase 2, Phase 3 and the RED gate",
+# which is what redeeming it at Phase 1 would have bought.
+answer force-validation "Review it unvalidated"
+expect_b "a force-validation answer does not buy 1 -> 5" DENY \
+  '.claude/hooks/phase.sh 5 --force'
+expect_b "nor does it buy 1 -> 4"                       DENY \
+  '.claude/hooks/phase.sh 4 --force'
+P=$(sed -n 's/^phase=//p' .claude/.spec-phase | head -1)
+[ "$P" = 1 ] && ok "and the phase did not move" || bad "the phase became $P"
+
+# phase.sh has to refuse it too. The guard is a hook, and a hook is exactly the
+# layer that can be absent — run from a terminal, or in a session where the
+# plugin is not installed, this script was the only thing left and it had no
+# adjacency check at all.
+.claude/hooks/phase.sh 5 --force >/dev/null 2>&1
+P=$(sed -n 's/^phase=//p' .claude/.spec-phase | head -1)
+[ "$P" = 1 ] \
+  && ok "phase.sh refuses a non-adjacent --force on its own" \
+  || bad "phase.sh 5 --force moved phase 1 to $P with no hook involved"
+
+# And it still works where it means something.
+phase 2; phase 3
+.claude/hooks/phase.sh 4 --force >/dev/null 2>&1
+P=$(sed -n 's/^phase=//p' .claude/.spec-phase | head -1)
+[ "$P" = 4 ] && ok "3 -> 4 --force still works" || bad "3 -> 4 --force refused, phase=$P"
+.claude/hooks/phase.sh 5 --force >/dev/null 2>&1
+P=$(sed -n 's/^phase=//p' .claude/.spec-phase | head -1)
+[ "$P" = 5 ] && ok "4 -> 5 --force still works" || bad "4 -> 5 --force refused, phase=$P"
+
+# A flag that names no check has nothing to override.
+setup_repo; phase start forceadj2; phase 2
+expect_b "--force on a move that asserts nothing is refused" DENY \
+  '.claude/hooks/phase.sh 1 --force'
+
+################################################################################
+group "phases 4 and 5 are normal permission flow for structured paths"
+setup_repo; phase start structured; phase 2; phase 3
+phase 4 --force
+# `$` is an ordinary character in a filename. PATHS is set for Edit/Write in
+# every phase, so removing the old `PHASE -ge 4` early exit sent structured
+# file_path fields through a scanner written for targets guessed out of shell —
+# and it refused this as "a target the shell computes at runtime" with no shell
+# anywhere near it.
+expect_w "a Write to a path containing \$ is allowed at Phase 4" ALLOW 'src/cost$total.ts'
+expect_w "and one containing a backtick"                        ALLOW 'src/a`b.ts'
+expect_w "an ordinary production write is still allowed"        ALLOW 'src/x.ts'
+# The exemption is for structured fields only. A shell-derived target that the
+# shell would compute is still unjudgeable — at phases 1-3, where the write scan
+# is what decides.
+setup_repo; phase start structured2; phase 2; phase 3
+expect_b "a computed shell target is still refused at Phase 3" DENY 'echo x > $(mktemp)'
+# And phase state is off limits at 4 and 5 regardless: that check never depended
+# on the write scan.
+setup_repo; phase start structured3; phase 2; phase 3; phase 4 --force
+expect_w "phase state is still refused at Phase 4" DENY '.claude/.spec-phase'
+
+################################################################################
+# A redirect says where stdin comes from. It does not say where the PROGRAM comes
+# from, and treating the two as one refused a stream of commands whose payload
+# was sitting in the same segment, one token away.
+group "a shell with a visible program may still redirect its stdin"
+setup_repo; phase start stdin2; phase 2; phase 3
+
+expect_b "a pipe into bash -c"            ALLOW 'echo hi | bash -c "echo hello"'
+expect_b "a redirect into bash -c"        ALLOW 'bash -c "echo hello" < input.txt'
+expect_b "a script operand with a redirect" ALLOW 'bash script.sh < input.txt'
+expect_b "a pipe into a script operand"   ALLOW 'echo hi | bash script.sh'
+expect_b "sh -c with a separate payload"  ALLOW 'echo hi | sh -c "echo hello"'
+
+# The blind spots are unchanged: these have no program to read anywhere.
+expect_b "bash -s from a redirect is still refused" DENY 'bash -s < script.sh'
+expect_b "a bare shell on the end of a pipe"        DENY 'cat script.sh | bash'
+expect_b "-s with arguments is still stdin"         DENY 'bash -s 4 --force < .claude/hooks/phase.sh'
+expect_b "and the same through a pipe"              DENY 'cat .claude/hooks/phase.sh | bash -s 4 --force'
+# The payload of a visible program is still scanned — allowing the redirect must
+# not stop the program itself being read.
+expect_b "the visible payload is still read"        DENY 'echo hi | bash -c "rm -f .claude/.spec-red"'
+
+################################################################################
+# The snapshot exists to keep the configured test command away from THE GATE, and
+# the gate is what is_phase_state defines. It was walking spec_state_list, which
+# answers a different question and includes the two files is_phase_state
+# deliberately excludes.
+group "the state snapshot covers phase state, and only phase state"
+setup_repo; phase start snapscope; phase 2; phase 3
+echo 'it("f", () => expect(1).toBe(2))' > src/x.test.ts
+printf '{"t":"2020-01-01","agent":"adversary","msg":"an earlier verdict"}\n' \
+  > .claude/review-log.jsonl
+printf 'echo {\\"t\\":\\"2020-01-02\\",\\"agent\\":\\"a\\",\\"msg\\":\\"new\\"} >> .claude/review-log.jsonl; exit 1\n' \
+  > .claude/spec-gate-test-cmd
+ROUT=$(.claude/hooks/phase.sh red 2>&1)
+printf '%s' "$ROUT" | grep -q 'changed this gate' \
+  && bad "appending to the review log was reported as tampering with gate state" \
+  || ok "a write to the review log is not a write to the gate"
+grep -q 'an earlier verdict' .claude/review-log.jsonl \
+  && ok "and the earlier verdict is still there" \
+  || bad "the snapshot destroyed a reviewer verdict it had no business holding"
+grep -q '2020-01-02' .claude/review-log.jsonl \
+  && ok "the appended verdict survived too" \
+  || bad "the snapshot reverted an append to the audit trail"
+printf '%s' "$ROUT" | grep -q 'RED verified' \
+  && ok "and RED was verified rather than refused" \
+  || bad "RED was refused over a file that is not phase state"
+
+# Phase state itself is still put back, which is the whole point of the mechanism.
+setup_repo; phase start snapscope2; phase 2; phase 3
+echo 'it("f", () => expect(1).toBe(2))' > src/x.test.ts
+printf 'rm -f .claude/.spec-phase; exit 1\n' > .claude/spec-gate-test-cmd
+.claude/hooks/phase.sh red >/dev/null 2>&1
+P=$(sed -n 's/^phase=//p' .claude/.spec-phase 2>/dev/null | head -1)
+[ "$P" = 3 ] \
+  && ok "a test command that deletes the phase file has it restored" \
+  || bad "the phase file was not restored (phase=${P:-gone})"
+
+# Byte-exact, because the validation marker is authenticated over its own bytes:
+# a restore that re-terminates a file puts back one that no longer verifies.
+setup_repo; phase start snapbytes; phase 2; phase 3
+echo 'it("f", () => expect(1).toBe(2))' > src/x.test.ts
+printf 'printf trailing >> .claude/.spec-red; exit 1\n' > .claude/spec-gate-test-cmd
+printf 'a\nb\n\n\n' > .claude/.spec-red
+.claude/hooks/phase.sh red >/dev/null 2>&1
+setup_repo; phase start snapbytes2; phase 2; phase 3
+echo 'it("f", () => expect(1).toBe(2))' > src/x.test.ts
+printf 'exit 1\n' > .claude/spec-gate-test-cmd
+printf 'phase=3\ntask=snapbytes2\nslice=1/1\n\n\n' > .claude/.spec-phase
+BEFORE=$(cksum < .claude/.spec-phase)
+.claude/hooks/phase.sh red >/dev/null 2>&1
+[ "$(cksum < .claude/.spec-phase)" = "$BEFORE" ] \
+  && ok "trailing newlines survive a snapshot round trip" \
+  || bad "the snapshot normalised the file it saved"
+
+################################################################################
+group "a briefing does not claim to be truncating what it shows whole"
+setup_repo; phase start brieftrunc; phase 2; phase 3
+.claude/hooks/phase.sh journal >/dev/null 2>&1 <<'EOF'
+one short line
+EOF
+BOUT=$(.claude/hooks/phase.sh brief 2>&1)
+printf '%s' "$BOUT" | grep -q 'which is longer' \
+  && bad "a five-line journal was announced as the tail of something longer" \
+  || ok "a short journal is not described as truncated"
+printf '%s' "$BOUT" | grep -q 'one short line' \
+  && ok "and it is still shown" || bad "the journal body went missing"
+
+for i in $(seq 1 60); do
+  printf 'line %s\n' "$i" | .claude/hooks/phase.sh journal >/dev/null 2>&1
+done
+BOUT=$(.claude/hooks/phase.sh brief 2>&1)
+printf '%s' "$BOUT" | grep -q 'which is longer' \
+  && ok "a long journal still says it is a tail" \
+  || bad "a genuinely truncated journal did not say so"
 
 ################################################################################
 printf '\n%s%d passed, %d failed%s\n' "$B" "$PASS" "$FAIL" "$N"

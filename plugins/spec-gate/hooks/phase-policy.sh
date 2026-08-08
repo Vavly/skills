@@ -148,18 +148,70 @@ validation_marker_status() {   # $1 = marker path, $2 = task, $3 = slice
 #
 # Indexing removes the parse entirely. There is no record to forge, the path is
 # never taken from content, and `printf -v` never evaluates what it stores.
+# What is snapshotted is what is_phase_state defines, and nothing else. The list
+# this used to walk is spec_state_list, which is a different question with a
+# different job — it answers "what must the REVIEW gate ignore", and it therefore
+# includes the two files is_phase_state deliberately excludes: spec-journal.md,
+# which is the model's own prose, and review-log.jsonl, which is the append-only
+# record of every reviewer verdict.
+#
+# Snapshotting those two put this mechanism in charge of files it was explicitly
+# designed not to control, and it went wrong in both directions at once. A test
+# command that appended a line to review-log.jsonl had the verdict silently
+# reverted — an audit trail rolled back by the thing protecting the gate — and
+# `phase.sh red` then REFUSED, reporting that "the configured test command changed
+# this gate's own state", which was false: it changed a record that is not gate
+# state and that the model is allowed to write. Reproduced, both halves.
+#
+# Nothing is given up by narrowing it. The journal is writable by design, so
+# protecting it from a test command protects the model's notes from their own
+# author; and the guard's own refusals still cover both paths against deletion.
+# What the snapshot is for is the thing a receipt rests on, which is exactly
+# is_phase_state.
+#
+# Contents are captured byte for byte, and stay in shell variables to do it. The
+# obvious way to get exactness is a temp directory of copies, and that is the one
+# thing this must not be: a backup on disk is findable, the executed test command
+# can walk $TMPDIR, and deleting the backup disarms the gate however loudly the
+# restore complains afterwards. Memory is the property; exactness is the fix.
+#
+# `$(cat "$f")` strips every trailing newline, and that ran in both directions.
+# The comparison stripped both sides, so a file differing only in trailing bytes
+# read as unchanged; and the restore wrote `printf '%s\n'`, so a file that HAD
+# moved came back re-terminated. Both matter here more than they look: the
+# validation marker is authenticated over its own bytes, so a normalising restore
+# puts back a marker that no longer verifies — the gate would refuse a report it
+# had itself rewritten.
+#
+# `$(cat "$f"; printf X)` with the X removed afterwards is the standard way to
+# hold trailing newlines through a command substitution. A NUL still cannot live
+# in a shell variable, so it is detected rather than silently truncated: the byte
+# count is checked against the captured length, and a mismatch fails the save,
+# which makes phase.sh refuse to run the test command at all. None of these files
+# has ever contained a NUL; the point is that if one did, this would say so
+# instead of restoring a shorter file and reporting success.
 SPEC_SNAP_N=0
 
 spec_state_save() {
-  local n=0 s f
+  local n=0 s f c z
+  # `${#c}` counts characters, `wc -c` counts bytes, and every one of these files
+  # opens with a header containing an em dash — so under a UTF-8 locale the two
+  # disagreed on every file and the NUL check below rejected all of them, which
+  # made `phase.sh red` refuse to run at all. Under LC_ALL=C both count bytes.
+  local LC_ALL=C
   while IFS= read -r s; do
     [ -z "$s" ] && continue
+    is_phase_state "$s" || continue
     n=$((n + 1))
     printf -v "SPEC_SNAP_P_$n" '%s' "$s"
     f="${PROJECT_DIR%/}/$s"
     if [ -f "$f" ]; then
+      c=$(cat "$f" 2>/dev/null; printf X) || return 1
+      c=${c%X}
+      z=$(wc -c < "$f" 2>/dev/null | tr -d ' ')
+      [ "${#c}" = "$z" ] || return 1
       printf -v "SPEC_SNAP_E_$n" '%s' 1
-      printf -v "SPEC_SNAP_C_$n" '%s' "$(cat "$f")"
+      printf -v "SPEC_SNAP_C_$n" '%s' "$c"
     else
       printf -v "SPEC_SNAP_E_$n" '%s' 0
       printf -v "SPEC_SNAP_C_$n" '%s' ''
@@ -175,7 +227,7 @@ spec_state_discard() { SPEC_SNAP_N=0; return 0; }
 # was needed and could not be written, so the caller must not claim the state
 # was recovered.
 spec_state_restore() {
-  local n=1 touched=0 sp se sc f
+  local n=1 touched=0 sp se sc f now
   [ "$SPEC_SNAP_N" -gt 0 ] || return 2
   while [ "$n" -le "$SPEC_SNAP_N" ]; do
     eval "sp=\${SPEC_SNAP_P_$n}"
@@ -184,12 +236,14 @@ spec_state_restore() {
     n=$((n + 1))
     f="${PROJECT_DIR%/}/$sp"
     if [ "$se" = 1 ]; then
-      if [ ! -f "$f" ] || [ "$(cat "$f" 2>/dev/null)" != "$sc" ]; then
+      now=''
+      if [ -f "$f" ]; then now=$(cat "$f" 2>/dev/null; printf X); now=${now%X}; fi
+      if [ ! -f "$f" ] || [ "$now" != "$sc" ]; then
         touched=1
         # The directory itself may be gone: `rm -rf .claude` is one of the
         # payloads this exists to undo.
         mkdir -p "$(dirname "$f")" 2>/dev/null
-        printf '%s\n' "$sc" > "$f" 2>/dev/null || { spec_state_discard; return 2; }
+        printf '%s' "$sc" > "$f" 2>/dev/null || { spec_state_discard; return 2; }
       fi
     elif [ -f "$f" ]; then
       # Not there before the command ran, so the command invented it.
@@ -250,9 +304,10 @@ is_spec_path() {
 # two answers must be the same one: a file the gate refuses to review is a file
 # the gate must let you write, or writing it owes a review that never comes.
 gate_config_list() {
+  local d="${STATE_DIR_REL:-.claude}"
   printf '%s\n' \
-    '.claude/spec-gate-test-cmd' \
-    '.claude/spec-gate-review-exclude'
+    "$d/spec-gate-test-cmd" \
+    "$d/spec-gate-review-exclude"
 }
 
 is_gate_config() {
@@ -524,16 +579,23 @@ in_project() {
 # gitignored-by-intent, so there is no commit a human can make to satisfy the
 # 5 -> 3 boundary or the close-out. Correctness here cannot rest on an install
 # step having been done properly.
+#
+# Built from STATE_DIR_REL rather than from eight hardcoded prefixes. The
+# directory is already a shared name that three layers quote in their refusals;
+# having the list that enumerates its contents spell it out again meant the
+# variable and the paths could disagree, and relocating the state directory was
+# not a change anyone could make in one place.
 spec_state_list() {
+  local d="${STATE_DIR_REL:-.claude}"
   printf '%s\n' \
-    '.claude/.spec-phase' \
-    '.claude/.spec-baseline' \
-    '.claude/.spec-red' \
-    '.claude/.spec-approval' \
-    '.claude/.spec-scaffold' \
-    '.claude/.spec-validation' \
-    '.claude/spec-journal.md' \
-    '.claude/review-log.jsonl'
+    "$d/.spec-phase" \
+    "$d/.spec-baseline" \
+    "$d/.spec-red" \
+    "$d/.spec-approval" \
+    "$d/.spec-scaffold" \
+    "$d/.spec-validation" \
+    "$d/spec-journal.md" \
+    "$d/review-log.jsonl"
 }
 
 review_exclude_list() {

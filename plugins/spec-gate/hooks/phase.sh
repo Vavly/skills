@@ -175,16 +175,28 @@ verify_red() {
     echo "  the command touches it. Refusing rather than running unprotected."
     return 1
   fi
-  # A killed run must not leave the snapshot behind: it is the thing a later
-  # payload would go looking for.
-  trap 'spec_state_discard' EXIT INT TERM
+  # The snapshot lives in shell variables, which die with this process, so there
+  # was nothing for a cleanup trap to clean up — and the trap it had did active
+  # harm. `spec_state_discard` zeroes SPEC_SNAP_N, and an INT handler that does
+  # not re-raise leaves the script RUNNING: Ctrl-C during the test command
+  # therefore ran the trap, threw the snapshot away, and then carried on to
+  # spec_state_restore, which found no snapshot and reported "the state has NOT
+  # been restored — nothing here can be trusted to put it back". Nothing had
+  # touched the state. The user was told their gate was unrecoverable by the
+  # handler that was supposed to protect it.
+  #
+  # Re-raised rather than dropped, so Ctrl-C ends this script the way the user
+  # asked and the shell that spawned it sees a real interrupt. The restore is
+  # skipped on that path because the state was never put at risk: the payload was
+  # interrupted, and whatever it did or did not do is what a re-run will find.
+  trap 'trap - INT; kill -INT $$' INT
   out=$(
     cd "$PROJECT_DIR" 2>/dev/null || exit 0
     SPEC_GATE_TEST_FILES="$files" bash -c "set -o pipefail; $cmd" 2>&1
   )
   rc=$?
   spec_state_restore; sr=$?
-  trap - EXIT INT TERM
+  trap - INT
   if [ "$sr" != 0 ]; then
     printf '%s\n' "$out"
     echo
@@ -857,7 +869,18 @@ case "${1:-status}" in
       # denying the model write access would only protect its own notes from
       # their author — and a briefing that flattens the two into one register
       # teaches the reader to trust the weaker half as much as the stronger.
-      echo "Journal tail — the last 40 lines of .claude/spec-journal.md, which is longer."
+      # "which is longer" is a claim about the file, so it is read off the file
+      # rather than asserted. A five-line journal was being introduced as the
+      # tail of something longer, which sends the reader to look for the rest of
+      # a document they have just been shown in full — and in a briefing whose
+      # whole argument is that everything above the journal is fact read off
+      # disk, a throwaway falsehood is expensive.
+      JLINES=$(wc -l < "$JOURNAL" 2>/dev/null | tr -d ' ')
+      if [ "${JLINES:-0}" -gt 40 ]; then
+        echo "Journal tail — the last 40 lines of .claude/spec-journal.md, which is longer."
+      else
+        echo "Journal — all $JLINES lines of .claude/spec-journal.md."
+      fi
       echo "These are a previous session's own notes, not verified state: what they claim"
       echo "was run or decided is testimony. Read the file in full, and re-check anything"
       echo "you are about to build on."
@@ -932,6 +955,34 @@ for line in sys.stdin:
 
   1|2|3|4|5)
     [ -f "$STATE" ] || { echo "spec-driven: not started. Run: phase.sh start <task>"; exit 1; }
+    FROM=$(sed -n 's/^phase=//p' "$STATE" | head -1)
+    # --force is bound to the transition whose check it skips, here as well as in
+    # the guard. This script had no adjacency check of any kind — `write_state
+    # "$1"` took whatever number it was handed — so the guard was the only thing
+    # standing, and a hook is exactly the layer that can be absent: a bare
+    # `phase.sh 5 --force` typed in a terminal, or run in a session where the
+    # plugin is not installed, moved four phases on a flag. Refusing here means
+    # the two layers agree rather than one covering for the other.
+    case "${2:-}" in
+      --force)
+        case "$1" in
+          4) EXPECT_FROM=3 ;;
+          5) EXPECT_FROM=4 ;;
+          *) echo "spec-driven: REFUSED — --force is not a general override."
+             echo "  It exists for two transitions: '4 --force' skips the RED check, and"
+             echo "  '5 --force' skips the validation report. On a move to $1 it names no"
+             echo "  check, so there is nothing for it to skip."
+             exit 1 ;;
+        esac
+        if [ "$FROM" != "$EXPECT_FROM" ]; then
+          echo "spec-driven: REFUSED — 'phase.sh $1 --force' overrides the $EXPECT_FROM -> $1 check,"
+          echo "  and you are at $(phase_name "$FROM"), not phase $EXPECT_FROM."
+          echo "  The flag skips one check; it does not carry the phases in between."
+          echo "  Go to phase $EXPECT_FROM first, then force that one step if it still"
+          echo "  cannot be satisfied."
+          exit 1
+        fi ;;
+    esac
     if [ "$1" = 4 ]; then
       case "${2:-}" in
         --force)
@@ -949,7 +1000,6 @@ for line in sys.stdin:
       esac
     fi
     T=$(sed -n 's/^task=//p' "$STATE" | head -1)
-    FROM=$(sed -n 's/^phase=//p' "$STATE" | head -1)
     CUR=$(slice_current); TOT=$(slice_total)
     # 5 -> 3 is the only transition that moves the slice on. The guard has
     # already established that nothing is owed review and that a next slice

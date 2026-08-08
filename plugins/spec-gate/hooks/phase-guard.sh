@@ -152,12 +152,28 @@ esac
 # others: many tokens, many nested payloads (one fork each), and total bytes —
 # `${t##*/}` is quadratic in bash 3.2, so ONE 130 KB token outran the timeout
 # while the token count stood at 1.
+#
+# And a fourth axis, which is the only one that measures the thing actually being
+# protected. The three counters above are proxies: they bound work in units that
+# were *once* proportional to time, and every one of them has been outrun by an
+# input that stayed under it and ran long anyway. 1000 assignments is half the
+# token budget and took 120s; 1900 glob tokens is under it and took 22s. Against a
+# 15s timeout both were a silent allow. Seconds are what the timeout is denominated
+# in, so seconds are what has to be counted.
+#
+# SECONDS is elapsed time for this process, which is exactly the clock the host
+# runs the 15s timeout on — so this is global rather than per-scan. A per-scan
+# window would give each of the three top-level walkers its own 8s and total 24s,
+# i.e. a bound that cannot fire before the thing it is bounding. The token, byte
+# and lex counters stay per-scan and stay as they are: they are cheap early exits
+# that catch the common shapes before any clock has to be read.
 SCAN_TOKENS=0
 SCAN_LEXES=0
 SCAN_BYTES=0
 SCAN_TOKEN_BUDGET=2000
 SCAN_LEX_BUDGET=64
 SCAN_BYTE_BUDGET=262144
+SCAN_SECONDS_BUDGET=8
 MAX_TOKEN_BYTES=65536
 BASENAME_MAX=256
 # One physical line of shell. The lexer builds words a character at a time, so
@@ -176,6 +192,7 @@ OVERSIZE_MSG="This command is too large for phase-guard to evaluate: it exceeds 
 # scanner may be invoked inside a command substitution, and budget_lex is called
 # at the call sites rather than inside lex_command, which is always `$(...)`.
 budget_token() {
+  [ "$SECONDS" -ge "$SCAN_SECONDS_BUDGET" ] && deny "$OVERSIZE_MSG"
   SCAN_TOKENS=$((SCAN_TOKENS + 1))
   [ "$SCAN_TOKENS" -gt "$SCAN_TOKEN_BUDGET" ] && deny "$OVERSIZE_MSG"
   SCAN_BYTES=$((SCAN_BYTES + ${#1}))
@@ -184,6 +201,7 @@ budget_token() {
   return 0
 }
 budget_lex() {
+  [ "$SECONDS" -ge "$SCAN_SECONDS_BUDGET" ] && deny "$OVERSIZE_MSG"
   SCAN_LEXES=$((SCAN_LEXES + 1))
   [ "$SCAN_LEXES" -gt "$SCAN_LEX_BUDGET" ] && deny "$OVERSIZE_MSG"
   return 0
@@ -621,23 +639,45 @@ covers_state_dir() {
   return 1
 }
 
+# --- The fixed lists, resolved once ------------------------------------------
+# Everything below used to recompute these per TOKEN: glob_hits_state forked
+# `$(spec_state_list)` twice per glob, glob_hits_state_base once more, and
+# names_gate_key forked `git rev-parse` for every glob it saw. None of the three
+# answers can change while this process runs, so paying for them per token bought
+# nothing except the 22s that a 1900-token command spent against a 15s timeout.
+#
+# Held in arrays rather than newline strings so the readers iterate with no
+# herestring either — `<<<` is a temp file per call, which is the same class of
+# per-token syscall the fork was.
+SPEC_STATE_PATHS=()
+SPEC_STATE_BASES=()
+SPEC_STATE_ABS=()
+while IFS= read -r _s; do
+  [ -z "$_s" ] && continue
+  is_phase_state "$_s" || continue
+  SPEC_STATE_PATHS+=("$_s")
+  SPEC_STATE_BASES+=("${_s##*/}")
+  SPEC_STATE_ABS+=("${PROJECT_DIR%/}/$_s")
+done <<< "$(spec_state_list)"
+SPEC_KEY_PATH_CACHE=$(spec_key_path 2>/dev/null) || SPEC_KEY_PATH_CACHE=""
+
 # A glob is matched the other way round from an ordinary path: the token is the
 # pattern and the state file is the subject, because that is what the shell will
 # do with it.
 glob_hits_state() {
-  local tok=$1 s
+  local tok=$1 i
   case "$tok" in
     *'*'*|*'?'*|*'['*) ;;
     *) return 1 ;;
   esac
-  while IFS= read -r s; do
-    [ -z "$s" ] && continue
-    is_phase_state "$s" || continue
+  i=0
+  while [ "$i" -lt "${#SPEC_STATE_PATHS[@]}" ]; do
     # shellcheck disable=SC2254
-    case "$s" in $tok) return 0 ;; esac
+    case "${SPEC_STATE_PATHS[$i]}" in $tok) return 0 ;; esac
     # shellcheck disable=SC2254
-    case "${PROJECT_DIR%/}/$s" in $tok) return 0 ;; esac
-  done <<< "$(spec_state_list)"
+    case "${SPEC_STATE_ABS[$i]}" in $tok) return 0 ;; esac
+    i=$((i + 1))
+  done
   return 1
 }
 
@@ -646,17 +686,17 @@ glob_hits_state() {
 # full paths, which is how a filtered find that reaches all of them read as one
 # that reaches none.
 glob_hits_state_base() {
-  local tok=$1 s
+  local tok=$1 i
   case "$tok" in
     *'*'*|*'?'*|*'['*) ;;
     *) return 1 ;;
   esac
-  while IFS= read -r s; do
-    [ -z "$s" ] && continue
-    is_phase_state "$s" || continue
+  i=0
+  while [ "$i" -lt "${#SPEC_STATE_BASES[@]}" ]; do
     # shellcheck disable=SC2254
-    case "${s##*/}" in $tok) return 0 ;; esac
-  done <<< "$(spec_state_list)"
+    case "${SPEC_STATE_BASES[$i]}" in $tok) return 0 ;; esac
+    i=$((i + 1))
+  done
   return 1
 }
 
@@ -724,9 +764,11 @@ names_gate_key() {
   # design, so the pattern is tried against the key path rather than the reverse.
   case "$1" in
     *'*'*|*'?'*|*'['*)
-      k=$(spec_key_path 2>/dev/null) || k=""
+      # Resolved once at startup, not once per glob token: this forked
+      # `git rev-parse` for every `*` in the command, and a command is allowed
+      # to have two thousand of them.
       # shellcheck disable=SC2254
-      [ -n "$k" ] && case "$k" in $1) return 0 ;; esac
+      [ -n "$SPEC_KEY_PATH_CACHE" ] && case "$SPEC_KEY_PATH_CACHE" in $1) return 0 ;; esac
       # shellcheck disable=SC2254
       case ".git/spec-gate-key" in $1) return 0 ;; esac ;;
   esac
@@ -734,12 +776,20 @@ names_gate_key() {
 }
 
 # `rm -rf .git` takes the key with everything else.
+#
+# The absolute arm mirrors covers_state_dir's, and its absence was the whole of
+# the asymmetry: `rm -rf /abs/path/repo/.claude` was refused and
+# `rm -rf /abs/path/repo/.git` was not, though the second is strictly worse — it
+# takes the key, the review marker and the repository along with the state.
 covers_git_dir() {
   local p=$1
   p=${p%/}; p=${p#./}
   [ -z "$p" ] && return 0
   case "$p" in
     .|..|.git) return 0 ;;
+    /*) case "${PROJECT_DIR%/}/.git" in
+          "$p"|"$p"/*) return 0 ;;
+        esac ;;
   esac
   return 1
 }
@@ -755,42 +805,90 @@ covers_git_dir() {
 # consulted: a variable this hook cannot see the value of stays unresolved, which
 # is what keeps `> $LOGFILE` working.
 VARS=""
+VARS_ORDER=""
+VARS_STALE=0
 
+# Append-only, and deliberately so. This used to rewrite the whole binding list
+# on every assignment to make the last write win — an O(n) string rebuild with a
+# `<<<` temp file inside it, i.e. O(n^2) with a syscall per step. Measured: 400
+# assignments 9.6s, 800 assignments 52s, 1000 assignments 120s, against a hook
+# timeout of 15s. Every one of those was a silent ALLOW, because a killed hook
+# emits no decision.
+#
+# Last-write-wins now happens once, in vars_order, where it costs one pass
+# instead of one pass per assignment. (An associative array would be the obvious
+# answer and is not available: /usr/bin/env bash is 3.2 on macOS, which is the
+# platform this whole file's performance notes are written against.)
 vars_record() {   # $1 = NAME=VALUE token
-  local n=${1%%=*} line out=""
+  local n=${1%%=*}
   case "$n" in
     ''|*[!A-Za-z0-9_]*) return 0 ;;
   esac
-  # The LAST assignment wins, so an earlier binding cannot shadow a later one.
-  # Taking the first match let `V=safe.txt; V=.claude/.spec-phase; rm -f $V`
-  # resolve to safe.txt and pass.
-  while IFS= read -r line; do
-    [ -z "$line" ] && continue
-    case "$line" in "$n="*) continue ;; esac
-    out="$out$line"$'\n'
-  done <<< "$VARS"
-  VARS="$out$1"$'\n'
+  VARS="$VARS$1"$'\n'
+  VARS_STALE=1
+  return 0
+}
+
+# The bindings in the order a resolver has to apply them: each name once, holding
+# its LAST value, longest name first.
+#
+# Longest first is not a tidiness preference. Substitution is textual, so with `V`
+# applied before `VX` the pattern `$V` consumes the prefix of `$VX` and the token
+# resolves to <value-of-V> followed by a stray `X` — which is not what the shell
+# would produce and, worse, is not what any later check would match. `V=s;
+# VD=.claude; rm -rf $VD` was ALLOW for exactly that reason, while the same
+# command without the decoy `V=s` was DENY. A binding that shadows nothing must
+# not be able to hide one that does.
+#
+# Built lazily and cached, so an ordinary command with no assignments never runs
+# it and a command with a thousand pays for one awk rather than one per token.
+# The sort is inside awk for the same reason.
+vars_order() {
+  [ "$VARS_STALE" = 0 ] && return 0
+  VARS_ORDER=$(printf '%s' "$VARS" | awk -F= '
+    NF > 1 && $1 ~ /^[A-Za-z0-9_]+$/ { last[$1] = substr($0, length($1) + 2) }
+    END {
+      k = 0
+      for (n in last) names[++k] = n
+      for (i = 1; i < k; i++)
+        for (j = i + 1; j <= k; j++)
+          if (length(names[j]) > length(names[i])) {
+            t = names[i]; names[i] = names[j]; names[j] = t
+          }
+      for (i = 1; i <= k; i++) printf "%s=%s\n", names[i], last[names[i]]
+    }')
+  VARS_STALE=0
   return 0
 }
 
 # Substitution anywhere in the token, not just a whole-token match. `.claude/$A`
 # and `${V}-phase` name a state file just as surely as `$V` does, and a
 # whole-token rule saw neither.
+#
+# The braced form is applied ahead of the bare one for every binding, because
+# `${V}` is unambiguous where `$V` is a prefix of `$VX`. The ordering above is
+# what settles the bare form.
 resolve_tok() {   # sets RT to the token with this command's own bindings applied
   RT=$1
   case "$RT" in
     *'$'*) ;;
     *) return 0 ;;
   esac
+  [ -z "$VARS" ] && return 0
+  vars_order
   local line n v pat
   while IFS= read -r line; do
     [ -z "$line" ] && continue
     n=${line%%=*}; v=${line#*=}
     pat="\${$n}"
     case "$RT" in *"$pat"*) RT=${RT//"$pat"/$v} ;; esac
+  done <<< "$VARS_ORDER"
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    n=${line%%=*}; v=${line#*=}
     pat="\$$n"
     case "$RT" in *"$pat"*) RT=${RT//"$pat"/$v} ;; esac
-  done <<< "$VARS"
+  done <<< "$VARS_ORDER"
   return 0
 }
 
@@ -799,7 +897,8 @@ GATE_KEY_MSG="That path is the gate's own authentication material — the key th
 scan_state_tokens() {
   local KIND VAL T TB IS_VERB VERB='' EXPECT_VERB=1 GITCLEAN=0 GITSTASH=0
   local FINDDIR=0 WANT_TARGET=0 HDOC='' STDIN_TAKEN=0 PIPED=0
-  local FINDNAMED=0 FINDHIT=0 FINDPAT=0 WAS_TARGET=0 RT AV
+  local FINDNAMED=0 FINDHIT=0 FINDPAT=0 WAS_TARGET=0 RT AV SHELL_SCRIPT=0
+  local WANT_IN=0 WAS_REDIR=0 SHELL_DASH_S=0
   local depth=${2:-0} cwd=${3:-} CDNEXT=0
   [ "$depth" -gt 4 ] && deny "$OVERSIZE_MSG"
   [ "$depth" = 0 ] && budget_reset
@@ -827,7 +926,17 @@ scan_state_tokens() {
         # written after the verb. The heredoc form is handled just above, where
         # there is a body to read; these two have nothing to read, so they are
         # refused rather than guessed at.
-        if [ -z "$HDOC" ]; then
+        #
+        # "Nothing to read" is the whole condition, and it was not being tested:
+        # a redirect or a pipe was taken as proof that stdin is where the program
+        # comes from, when it is only where stdin comes from. A shell given a -c
+        # payload or a script operand already has its program, and the redirect
+        # is feeding that program its INPUT — `echo hi | bash -c "echo hello"`
+        # and `bash script.sh < input.txt` were both refused with the payload
+        # sitting in plain sight, one token away. SHELL_SCRIPT records that the
+        # segment supplied a program by some other route, and it is set at the
+        # same place the payload is queued for scanning, so the two cannot drift.
+        if [ -z "$HDOC" ] && [ "$SHELL_SCRIPT" = 0 ]; then
           case "$VERB" in
             sh|bash|zsh|ksh|dash)
               if [ "$STDIN_TAKEN" = 1 ] || [ "$PIPED" = 1 ]; then
@@ -836,14 +945,18 @@ scan_state_tokens() {
           esac
         fi
         VERB=''; EXPECT_VERB=1; GITCLEAN=0; GITSTASH=0; FINDDIR=0
-        FINDNAMED=0; FINDHIT=0; FINDPAT=0
+        FINDNAMED=0; FINDHIT=0; FINDPAT=0; SHELL_SCRIPT=0; SHELL_DASH_S=0
         CDNEXT=0; WANT_TARGET=0; HDOC=''; STDIN_TAKEN=0
         # This SEP ends a segment and opens the next one; if it was a pipe, the
         # segment now beginning is the one whose stdin comes from it.
         case "$VAL" in pipe) PIPED=1 ;; *) PIPED=0 ;; esac
         continue ;;
       OP)   WANT_TARGET=1; continue ;;    # the redirect target arrives as the next WORD
-      OPIN) STDIN_TAKEN=1; continue ;;    # `< file`: decides what a shell RUNS
+      # `< file`: decides what a shell RUNS. WANT_IN marks the word after it,
+      # because that word is the redirect's SOURCE and not an argument to the
+      # verb — `bash -s < script.sh` has no script operand, and reading
+      # `script.sh` as one would say it does.
+      OPIN) STDIN_TAKEN=1; WANT_IN=1; continue ;;
       # Kept only when the verb makes it a program. Prose into `phase.sh
       # journal` is data and costs nothing — a plan document is legitimately
       # thousands of lines, and budgeting it would refuse the workflow's own
@@ -866,9 +979,15 @@ scan_state_tokens() {
     # Here it runs at every phase, narrowed to targets that name state, so
     # ordinary Phase 4 work like `> $LOGFILE` is untouched.
     WAS_TARGET=0
+    WAS_REDIR=0
+    if [ "$WANT_IN" = 1 ]; then
+      WANT_IN=0
+      WAS_REDIR=1
+    fi
     if [ "$WANT_TARGET" = 1 ]; then
       WANT_TARGET=0
       WAS_TARGET=1
+      WAS_REDIR=1
       # A variable this command set for itself is resolved first: `> $V` names
       # nothing on its own, and past the phase-4 exit nothing else looked.
       resolve_tok "$T"
@@ -1027,13 +1146,27 @@ scan_state_tokens() {
     # `-c'...'` with no space is one token beginning with a dash, which the flag
     # filter dropped whole — the payload rode in on the flag. The remainder after
     # the flag is the payload, so it is unwrapped rather than skipped.
-    if [ "$IS_VERB" = 0 ]; then
+    # A redirect's own word is never the program: it is the file the program
+    # reads from or writes to. Recursing on it read `script.sh` in
+    # `bash -s < script.sh` as an inline payload and, worse, as proof that the
+    # segment had supplied a program at all — which is the one thing that turns
+    # the stdin refusal above off.
+    if [ "$IS_VERB" = 0 ] && [ "$WAS_REDIR" = 0 ]; then
       case "$VERB" in
         sh|bash|zsh|ksh|dash|eval)
           case "$T" in
-            -c?*) scan_state_tokens "${T#-c}" "$((depth + 1))" "$cwd" ;;
+            -c?*) SHELL_SCRIPT=1; scan_state_tokens "${T#-c}" "$((depth + 1))" "$cwd" ;;
+            -c)   SHELL_SCRIPT=1 ;;   # payload is the next token, scanned below
+            # `-s` says the script comes from stdin and every operand after it is
+            # an ARGUMENT to that script, not the script. Without this,
+            # `bash -s 4 --force < .claude/hooks/phase.sh` looked like a shell
+            # that had been handed a program — the operand `4` — and the stdin
+            # refusal switched itself off in front of the one command it exists
+            # for. Bundled spellings count: `-es`, `-se`.
+            -[!-]*) case "$T" in *s*) SHELL_DASH_S=1 ;; esac ;;
             -*)   ;;
-            *)    scan_state_tokens "$T" "$((depth + 1))" "$cwd" ;;
+            *)    [ "$SHELL_DASH_S" = 1 ] || SHELL_SCRIPT=1
+                  scan_state_tokens "$T" "$((depth + 1))" "$cwd" ;;
           esac ;;
       esac
     fi
@@ -1055,6 +1188,24 @@ scan_state_tokens() {
     # that happens to read as this gate's own bookkeeping.
     case "$T" in
       *'$'*|*'`'*) names_state_file "$T" && deny "$STATE_MSG" ;;
+    esac
+
+    # `-exec`, `-execdir` and `-ok` introduce a command, so the token AFTER one
+    # is a verb and everything past it belongs to that verb rather than to find.
+    # finish_segment has had this arm since it was written; this walker never got
+    # it, and the two disagreeing is what made
+    # `find . -name '*.log' -exec rm -rf .claude {} \;` an ALLOW: `rm` was read
+    # as one more find operand, so VERB stayed `find` and the destructive-verb
+    # case below — the only thing that consults covers_state_dir — never ran.
+    #
+    # Set at the END of the body rather than the top, and without `continue`.
+    # `-exec` is also the token the FINDHIT refusal above matches on, so a
+    # version of this that short-circuited disarmed the filtered-find check it
+    # was meant to complement: `find .claude -name '.spec-*' -exec rm {} ;`
+    # stopped being refused for naming the state files, which it does, in order
+    # to be refused for running rm, which it also does. Both have to fire.
+    case "$T" in
+      -exec|-execdir|-ok|-okdir) EXPECT_VERB=1 ;;
     esac
 
     # Removing the directory is removing the files in it. Restricted to verbs
@@ -1289,11 +1440,31 @@ eval_phase_call() {
   # save a note. `git push --force && phase.sh status` did the same from a
   # command that has nothing to do with phases. ARGV is bounded to phase.sh's
   # own segment and stops at the first line, so both are outside it.
+  #
+  # Each flag is bound to the ONE transition whose check it skips, and that
+  # binding is read off $PHASE rather than assumed. Without it this whole block
+  # ran ahead of the phase matrix below and never consulted the current phase at
+  # all, so a receipt bought for the adjacent step was spendable as a jump from
+  # anywhere: with a force-validation answer on file, `phase.sh 5 --force` from
+  # Phase 1 went to Phase 5 — past the spec approval, past RED, past 3 -> 4 —
+  # and the guard allowed it, because "is --force approved" was the only question
+  # being asked. The user answered "enter review with the checks unrun". They did
+  # not answer "skip the entire workflow", and no wording of the force question
+  # could have covered that, because the question is about a check and the act
+  # was about four phases.
+  #
+  # A non-adjacent --force is refused outright rather than routed to the skip
+  # gate. Two overrides stacked into one move is not a decision anyone can weigh
+  # from a single prompt, and the honest route — retreat, then force the one step
+  # — is one command longer and asks each question where it means something.
   case "$ARGV" in
     *--force*)
       case "$ARG" in
-        5) gated_advance force-validation "advancing to Phase 5 with --force, which enters adversarial review with no record that this repo's own build, lint or test commands were ever run against the finished work" ;;
-        *) gated_advance force "advancing to Phase 4 with --force, which skips the RED check entirely and unlocks production code without anything having been shown to fail" ;;
+        5) [ "$PHASE" = 4 ] || deny "--force on a move to Phase 5 skips the validation report, and that report is what Phase 4 produces — so the flag only means anything on 4 -> 5. You are at phase $PHASE. Advance to Phase 4 first; the question about entering review unvalidated is asked there, where the work it describes exists. Current phase: $PHASE."
+           gated_advance force-validation "advancing to Phase 5 with --force, which enters adversarial review with no record that this repo's own build, lint or test commands were ever run against the finished work" ;;
+        4) [ "$PHASE" = 3 ] || deny "--force on a move to Phase 4 skips the RED check, and RED is what Phase 3 produces — so the flag only means anything on 3 -> 4. You are at phase $PHASE. Go to Phase 3 and write the failing tests; if they genuinely cannot be run here, the force question is asked there. Current phase: $PHASE."
+           gated_advance force "advancing to Phase 4 with --force, which skips the RED check entirely and unlocks production code without anything having been shown to fail" ;;
+        *) deny "--force is not a general override. It exists for exactly two transitions — 3 -> 4, which skips the RED check, and 4 -> 5, which skips the validation report — and each is a separate question the user answers about the check being given up. On a move to '$ARG' it names no check, so there is nothing for it to skip and nothing for anyone to have approved. Drop the flag. Current phase: $PHASE." ;;
       esac ;;
   esac
 
@@ -1514,9 +1685,15 @@ eval_phase_call() {
 # allow bypasses the permission system rather than merely skipping a phase.
 # Ordering the refusals ahead of the decisions is what makes an allow mean "and
 # nothing else in this command objects".
+# PATHS_ARE_SHELL says where the paths below came from, and the two sources are
+# not the same kind of evidence. A target dug out of a command string is a guess
+# about what the shell will do; a `file_path` on an Edit or a Write is the exact
+# path the tool was handed. Only the first can be "computed at runtime".
+PATHS_ARE_SHELL=0
 if [ "$PHASE" -lt 4 ] && [ -n "$CMD" ]; then
   collect_write_targets "$CMD"
   PATHS=$CAND
+  PATHS_ARE_SHELL=1
 fi
 
 run_write_scan() {
@@ -1527,10 +1704,23 @@ while IFS= read -r P; do
   # A target the shell would compute at runtime cannot be judged here. Only
   # write targets reach this point, so denying is narrow: a read-only command
   # like `grep foo $(git ls-files)` produces no target and never gets here.
-  case "$P" in
-    *'$'*|*'`'*)
-      deny "Phase $PHASE of spec-driven: this command writes to a target the shell computes at runtime ($P), which phase-guard cannot evaluate. Use Write or Edit for file changes during phases 1-3." ;;
-  esac
+  #
+  # Structured fields are exempt, and that exemption is the fix rather than a
+  # loophole: `$` is an ordinary character in a filename, and a Write to
+  # `src/cost$total.ts` was being refused at Phase 4 as an unevaluable shell
+  # expression when no shell was involved and the phase permits the write
+  # anyway. The removal of the old `PHASE -ge 4` early exit is what exposed it —
+  # PATHS is set for Edit/Write in every phase, so phases 4 and 5 started
+  # running structured paths through a scanner written for guessed-at ones.
+  # Everything else below still applies at every phase, deliberately: the
+  # one-tree-per-task check is not phase policy, and a write into a sibling
+  # worktree is exactly as unjudgeable at Phase 4 as at Phase 1.
+  if [ "$PATHS_ARE_SHELL" = 1 ]; then
+    case "$P" in
+      *'$'*|*'`'*)
+        deny "Phase $PHASE of spec-driven: this command writes to a target the shell computes at runtime ($P), which phase-guard cannot evaluate. Use Write or Edit for file changes during phases 1-3." ;;
+    esac
+  fi
 
   # /dev/null, /tmp scratch, ~/.config: not repo work, and never were.
   #
