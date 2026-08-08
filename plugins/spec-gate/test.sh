@@ -5003,5 +5003,51 @@ expect_b "a substitution is still unevaluable" DENY 'V=$(mktemp); echo x > $V'
 expect_b "and so is a variable from outside the command" DENY 'echo x > $LOGFILE'
 
 ################################################################################
+# Three walkers read one token stream, and each used to carry its own copy of
+# "what is this segment running". The copies had drifted: finish_segment knew
+# `-exec` introduces a command, scan_state_tokens did not, and that single
+# divergence is the whole of T5 — `find . -exec rm -rf .claude` was allowed while
+# plain `rm -rf .claude` was not.
+#
+# The rule is asked in one place now. These exercise the same construction
+# through all three consumers, so a rule that comes back in triplicate fails
+# here rather than in whichever walker was not updated.
+group "the walkers agree about what a segment is running"
+setup_repo; phase start drift; phase 2; phase 3
+
+# Reaches the state scan (rm on a state path), the write scan (a redirect to
+# production) and the phase walk (a transition) through the SAME dispatcher
+# prefix. All three have to see past it to the real verb.
+for pfx in "" "sudo " "env FOO=bar " "command " "nohup " "time " "exec "; do
+  expect_b "state scan sees past '${pfx:-no prefix}'" DENY \
+    "${pfx}rm -f .git/spec-gate/.spec-phase"
+done
+for pfx in "" "sudo " "env FOO=bar " "command " "nohup " "time "; do
+  expect_b "phase walk sees past '${pfx:-no prefix}'" DENY \
+    "${pfx}.claude/hooks/phase.sh 4 --force"
+done
+
+# find's action predicates introduce a command, and every walker has to know it.
+expect_b "state scan: find -exec rm on the state dir"  DENY \
+  'find . -name "*.log" -exec rm -rf .git/spec-gate {} ;'
+expect_b "and -execdir"                                DENY \
+  'find . -name "*.log" -execdir rm -rf .git/spec-gate {} ;'
+expect_b "in-place editor behind find -exec"           DENY \
+  'find . -name "*.ts" -exec sed -i "" s/a/b/ {} ;'
+expect_b "and behind xargs"                            DENY \
+  'git ls-files | xargs sed -i "" s/a/b/'
+
+# The stream is produced once and replayed. If the cache ever returned another
+# command's tokens, a command that is fine after one that is not would start
+# inheriting the wrong answer — so the same guard invocation is made to lex
+# several distinct payloads and the decision must still be about the last one.
+expect_b "distinct nested payloads do not share a stream" DENY \
+  'bash -c "echo one" ; bash -c "echo two" ; bash -c "rm -f .git/spec-gate/.spec-red"'
+expect_b "and the harmless ones stay harmless"           ALLOW \
+  'bash -c "echo one" ; bash -c "echo two" ; bash -c "echo three"'
+expect_b "a repeated payload is decided the same way each time" DENY \
+  'bash -c "rm -f .git/spec-gate/.spec-red" ; bash -c "rm -f .git/spec-gate/.spec-red"'
+
+################################################################################
 printf '\n%s%d passed, %d failed%s\n' "$B" "$PASS" "$FAIL" "$N"
 [ "$FAIL" -eq 0 ] || exit 1

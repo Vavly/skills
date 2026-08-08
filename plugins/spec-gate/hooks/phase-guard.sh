@@ -423,6 +423,83 @@ lex_command() {
   '
 }
 
+# --- One lex, three walks ----------------------------------------------------
+# Three walkers read the same token stream and each used to produce it for
+# itself: `<<< "$(lex_command "$1")"` in scan_command, in scan_state_tokens and
+# in phase_walk, which is three awk processes and three command substitutions for
+# one command string — and the same again for every nested payload, since two of
+# the three recurse into `-c` bodies independently.
+#
+# The stream cannot differ between them: it is a pure function of the text. So it
+# is produced once and replayed. Bounded, because the cache holds whole token
+# streams and a payload may be large; past the limit it simply re-lexes, which is
+# today's behaviour rather than a failure.
+#
+# Safe under recursion without any care being taken: `<<< "$LEXOUT"` snapshots
+# the value into a temp file before the loop begins, so a recursive call that
+# refills the cache cannot move the stream an outer loop is walking. The callers
+# take a local copy anyway, because relying on that is relying on a detail.
+LEX_KEYS=()
+LEX_VALS=()
+LEX_CACHE_MAX=32
+LEX_KEY_MAX=8192
+
+lex_cached() {   # sets LEXOUT
+  local i=0
+  if [ "${#1}" -le "$LEX_KEY_MAX" ]; then
+    while [ "$i" -lt "${#LEX_KEYS[@]}" ]; do
+      if [ "${LEX_KEYS[$i]}" = "$1" ]; then LEXOUT=${LEX_VALS[$i]}; return 0; fi
+      i=$((i + 1))
+    done
+  fi
+  LEXOUT=$(lex_command "$1")
+  if [ "${#1}" -le "$LEX_KEY_MAX" ] && [ "${#LEX_KEYS[@]}" -lt "$LEX_CACHE_MAX" ]; then
+    LEX_KEYS+=("$1")
+    LEX_VALS+=("$LEXOUT")
+  fi
+  return 0
+}
+
+# --- One definition of "what is this segment running" ------------------------
+# The three walkers each carried their own copy of this, and the copies had
+# drifted. finish_segment knew that `-exec` introduces a command; scan_state_tokens
+# did not, so `find . -name '*.log' -exec rm -rf .claude {} \;` had VERB=find and
+# the destructive-verb case never ran. phase_walk's dispatcher list omitted
+# `xargs` because it handles it separately, and finish_segment's skip list had
+# `{}`, `;` and `+` while the others did not.
+#
+# None of those differences was a decision. They are three transcriptions of one
+# rule, and a rule transcribed three times is a rule that will be wrong in one of
+# them — which is the whole finding, not the individual miss it produced. Asked
+# in one place now, so the next divergence has nowhere to happen.
+
+# A prefix standing in front of the real command: `sudo rm`, `env FOO=1 rm`,
+# `xargs rm`. The verb is further along.
+tok_is_dispatch() {
+  case "$1" in
+    sudo|env|command|nohup|time|xargs|exec) return 0 ;;
+  esac
+  return 1
+}
+
+# Introduces a NEW command whose own verb follows: find's three action
+# predicates. Everything after one belongs to that command, not to find.
+tok_opens_command() {
+  case "$1" in
+    -exec|-execdir|-ok|-okdir) return 0 ;;
+  esac
+  return 1
+}
+
+# Skippable while still looking for a verb: flags, and find's argument-list
+# punctuation.
+tok_skip_before_verb() {
+  case "$1" in
+    -*|'{}'|';'|'+') return 0 ;;
+  esac
+  return 1
+}
+
 # In-place editors: the target is genuinely ambiguous to parse (BSD `sed -i ''`
 # versus GNU `sed -i`, script arguments that look like paths). Denying is the
 # honest answer, and Edit is the better tool anyway.
@@ -440,10 +517,9 @@ finish_segment() {
     [ -z "$t" ] && continue
     tok_base "$t"
     if [ "$expect_verb" = 1 ]; then
-      case "$TB" in
-        *=*|sudo|env|command|nohup|time|xargs|exec) continue ;;
-        -*|'{}'|';'|'+') continue ;;
-      esac
+      case "$TB" in *=*) continue ;; esac
+      tok_is_dispatch "$TB" && continue
+      tok_skip_before_verb "$TB" && continue
       verb=$TB
       case "$TB" in
         sed|perl|awk) ed=$TB ;;
@@ -455,9 +531,7 @@ finish_segment() {
       expect_verb=0
       continue
     fi
-    case "$t" in
-      -exec|-execdir|-ok) expect_verb=1; continue ;;
-    esac
+    tok_opens_command "$t" && { expect_verb=1; continue; }
     case "$TB" in
       sed|perl|awk) ed=$TB; continue ;;
     esac
@@ -504,10 +578,11 @@ finish_segment() {
 }
 
 scan_command() {
-  local KIND VAL
+  local KIND VAL _toks
   budget_input "$1"
   [ "${SCAN_DEPTH:-0}" = 0 ] && budget_reset
   budget_lex
+  lex_cached "$1"; _toks=$LEXOUT
   WANT_TARGET=0
   SEGW=''
   SEGH=''
@@ -537,7 +612,7 @@ scan_command() {
           SEGW="$SEGW$VAL"$'\n'
         fi ;;
     esac
-  done <<< "$(lex_command "$1")"
+  done <<< "$_toks"
   finish_segment
 }
 
@@ -976,6 +1051,7 @@ scan_state_tokens() {
   [ "$depth" = 0 ] && budget_reset
   budget_input "$1"
   budget_lex
+  local _toks; lex_cached "$1"; _toks=$LEXOUT
   while IFS=$'\t' read -r KIND VAL; do
     case "$KIND" in
       OVER) deny "$OVERSIZE_MSG" ;;
@@ -1111,10 +1187,8 @@ scan_state_tokens() {
           continue ;;
       esac
       tok_base "$T"
-      case "$TB" in
-        sudo|env|command|nohup|time|xargs|exec) continue ;;
-        -*) continue ;;
-      esac
+      tok_is_dispatch "$TB" && continue
+      tok_skip_before_verb "$TB" && continue
       VERB=$TB
       EXPECT_VERB=0
       IS_VERB=1
@@ -1278,9 +1352,7 @@ scan_state_tokens() {
     # was meant to complement: `find .claude -name '.spec-*' -exec rm {} ;`
     # stopped being refused for naming the state files, which it does, in order
     # to be refused for running rm, which it also does. Both have to fire.
-    case "$T" in
-      -exec|-execdir|-ok|-okdir) EXPECT_VERB=1 ;;
-    esac
+    tok_opens_command "$T" && EXPECT_VERB=1
 
     # Removing the directory is removing the files in it. Restricted to verbs
     # that destroy, because `.claude` also holds the hooks, the settings and the
@@ -1299,7 +1371,7 @@ scan_state_tokens() {
              covers_record_dir "$RT" && deny "$RECORD_DIR_MSG" ;;
         esac ;;
     esac
-  done <<< "$(lex_command "$1")"
+  done <<< "$_toks"
   return 0
 }
 
@@ -1354,12 +1426,13 @@ fi
 # reads as no decision, so the refusal became permission. Nothing that can refuse
 # may run inside a command substitution.
 phase_walk() {
-  local KIND VAL T TB IN=0 ACC='' VERB='' EXPECT_VERB=1 HDOC='' XARGS=0 RT
+  local KIND VAL T TB IN=0 ACC='' VERB='' EXPECT_VERB=1 HDOC='' XARGS=0 RT _toks
   local depth=${2:-0}
   [ "$depth" -gt 4 ] && deny "$OVERSIZE_MSG"
   [ "$depth" = 0 ] && budget_reset
   budget_input "$1"
   budget_lex
+  lex_cached "$1"; _toks=$LEXOUT
   while IFS=$'\t' read -r KIND VAL; do
     case "$KIND" in
       OVER) deny "$OVERSIZE_MSG" ;;
@@ -1386,13 +1459,12 @@ phase_walk() {
     if [ "$EXPECT_VERB" = 1 ]; then
       case "$T" in *=*) vars_record "$T"; continue ;; esac
       tok_base "$T"
-      case "$TB" in
-        # xargs builds the argument list from stdin, so a phase.sh reached
-        # through it is a call whose arguments this hook cannot see at all.
-        xargs) XARGS=1; continue ;;
-        sudo|env|command|nohup|time|exec) continue ;;
-        -*) continue ;;
-      esac
+      # xargs builds the argument list from stdin, so a phase.sh reached through
+      # it is a call whose arguments this hook cannot see at all. Noted before
+      # the shared dispatcher test, which would otherwise skip past it silently.
+      case "$TB" in xargs) XARGS=1; continue ;; esac
+      tok_is_dispatch "$TB" && continue
+      tok_skip_before_verb "$TB" && continue
       VERB=$TB; EXPECT_VERB=0
     else
       case "$VERB" in
@@ -1418,7 +1490,7 @@ phase_walk() {
       resolve_tok "$T"
       ACC="$ACC $RT"
     fi
-  done <<< "$(lex_command "$1")"
+  done <<< "$_toks"
   [ "$IN" = 1 ] && eval_phase_call "$ACC"
   return 0
 }
