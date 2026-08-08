@@ -8,9 +8,9 @@
 # model's own say-so, which is what the receipt is for.
 #
 # Install: .claude/hooks/phase.sh  (chmod +x), or via the spec-gate-install skill
-# Add .claude/.spec-phase, .claude/.spec-baseline, .claude/.spec-red,
-# .claude/.spec-approval*, .claude/.spec-scaffold, .claude/.spec-validation
-# and .claude/spec-journal.md to .gitignore
+# Add .claude/spec-journal.md and .claude/review-log.jsonl to .gitignore. The
+# phase state itself lives under .git/spec-gate/ and is not in the working tree,
+# so there is nothing to ignore and nothing an install can forget.
 
 set -uo pipefail
 
@@ -22,12 +22,6 @@ set -uo pipefail
 # where the gate is inert anyway.
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || printf '%s' "$PWD")}"
 STATE_DIR="$PROJECT_DIR/.claude"
-STATE="$STATE_DIR/.spec-phase"
-BASELINE="$STATE_DIR/.spec-baseline"
-RECEIPT="$STATE_DIR/.spec-red"
-APPROVAL="$STATE_DIR/.spec-approval"
-SCAFFOLD="$STATE_DIR/.spec-scaffold"
-VALIDATION="$STATE_DIR/.spec-validation"
 JOURNAL="$STATE_DIR/spec-journal.md"
 TEST_CMD_FILE="$STATE_DIR/spec-gate-test-cmd"
 
@@ -61,7 +55,37 @@ else
   approval_status() { printf 'unverifiable\n'; }
   scaffold_armed() { false; }
   is_tracked_path() { return 0; }
+  STATE_DIR_REL=.claude
+  # Where the state lives is policy, so without the policy file this script has
+  # to reconstruct it — and it must reconstruct the SAME answer, or a degraded
+  # phase.sh would write a second state file that nothing else reads.
+  spec_gate_dir() {
+    local g="${PROJECT_DIR%/}/.git" l
+    if [ -d "$g" ]; then printf '%s/spec-gate\n' "$g"; return 0; fi
+    if [ -f "$g" ]; then
+      IFS= read -r l < "$g" 2>/dev/null
+      case "$l" in
+        "gitdir: "*) l=${l#gitdir: }
+          case "$l" in /*) ;; *) l="${PROJECT_DIR%/}/$l" ;; esac
+          printf '%s/spec-gate\n' "$l"; return 0 ;;
+      esac
+    fi
+    l=$( cd "$PROJECT_DIR" 2>/dev/null && git rev-parse --absolute-git-dir 2>/dev/null )
+    if [ -n "$l" ]; then printf '%s/spec-gate\n' "$l"
+    else printf '%s/%s\n' "${PROJECT_DIR%/}" "$STATE_DIR_REL"; fi
+  }
 fi
+
+# Resolved once. Every one of these used to be a literal under .claude/; they are
+# under the git directory now, which is what takes them out of reach of every
+# operation that sweeps the working tree.
+GATE_DIR="$(spec_gate_dir)"
+STATE="$GATE_DIR/.spec-phase"
+BASELINE="$GATE_DIR/.spec-baseline"
+RECEIPT="$GATE_DIR/.spec-red"
+APPROVAL="$GATE_DIR/.spec-approval"
+SCAFFOLD="$GATE_DIR/.spec-scaffold"
+VALIDATION="$GATE_DIR/.spec-validation"
 
 # The state file is written from exactly one place, so a field cannot be dropped
 # by a caller that forgot it existed. Adding `slice` to a `printf` in three
@@ -75,6 +99,7 @@ fi
 # falls back to today's behaviour.
 write_state() {
   local S=''
+  mkdir -p "$GATE_DIR" 2>/dev/null
   [ -f "$STATE" ] && S=$(sed -n 's/^started=//p' "$STATE" 2>/dev/null | head -1)
   [ -n "$S" ] || S=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
   printf 'phase=%s\ntask=%s\nslice=%s\nstarted=%s\n' "$1" "$2" "$3" "$S" > "$STATE"
@@ -98,6 +123,7 @@ phase_name() {
 # files that were already dirty when it began. Without a baseline the scan
 # blames the model for the user's own uncommitted work.
 snapshot_baseline() {
+  mkdir -p "$GATE_DIR" 2>/dev/null
   : > "$BASELINE" 2>/dev/null || return 0
   (
     cd "$PROJECT_DIR" 2>/dev/null || exit 0
@@ -168,7 +194,8 @@ verify_red() {
   # The gate's own state is put aside before the command runs and checked back
   # afterwards. This command is model-authored shell that the guard deliberately
   # allows in every phase, so without this the shortest route out of the workflow
-  # was to write `rm -f .claude/.spec-phase` here and run the verifier.
+  # was to write `rm -f "$(git rev-parse --git-dir)/spec-gate/.spec-phase"` here
+  # and run the verifier.
   if ! spec_state_save; then
     echo "spec-driven: REFUSED — could not put this gate's state aside before running"
     echo "  the configured test command, so there is nothing to restore it from if"
@@ -208,10 +235,10 @@ verify_red() {
       # so restoring from it would have installed whatever it now contains.
       echo "  It also reached the snapshot taken to undo that, so the state has NOT"
       echo "  been restored — nothing here can be trusted to put it back. Check"
-      echo "  $STATE_DIR_REL by hand, and run 'phase.sh status'; if the phase is wrong,"
+      echo "  $GATE_DIR by hand, and run 'phase.sh status'; if the phase is wrong,"
       echo "  'phase.sh off' and start the task again."
     else
-      echo "  Whatever it did to $STATE_DIR_REL has been undone."
+      echo "  Whatever it did to $GATE_DIR has been undone."
     fi
     echo "  A test command runs the repo's tests; one that rewrites the phase, the"
     echo "  receipts or the approval is doing something else, and nothing it printed"
@@ -605,7 +632,7 @@ case "${1:-status}" in
     ;;
 
   start)
-    mkdir -p "$STATE_DIR"
+    mkdir -p "$STATE_DIR" "$GATE_DIR"
     # A newline in the task name would inject extra lines into the state file.
     T=$(printf '%s' "${2:-unnamed}" | tr -d '\n\r')
     # Removed rather than overwritten, so write_state stamps a new `started`
@@ -700,6 +727,7 @@ case "${1:-status}" in
       exit 1
     fi
     T=$(sed -n 's/^task=//p' "$STATE" | head -1)
+    mkdir -p "$GATE_DIR" 2>/dev/null
     printf '# spec-gate scaffold mode - written by phase.sh scaffold, never by hand\ntask=%s\n' "$T" > "$SCAFFOLD"
     echo "spec-driven: scaffold mode ON (still Phase 2)"
     echo "  -> you may CREATE files that do not exist yet, and tests"
@@ -753,6 +781,7 @@ case "${1:-status}" in
       *) echo "spec-driven: could not write $JOURNAL" >&2; exit 1 ;;
     esac
     T=$(sed -n 's/^task=//p' "$STATE" | head -1)
+    mkdir -p "$GATE_DIR" 2>/dev/null
     { printf '# spec-gate validation marker — written by phase.sh validation, never by hand\n'
       printf 'task=%s\nslice=%s/%s\n' "$T" "$(slice_current)" "$(slice_total)"
     } > "$VALIDATION"

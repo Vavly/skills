@@ -10,10 +10,104 @@
 #
 # Not executable and not a hook. Sourced only.
 
-# The directory holding the state files, relative to the project root. Shared,
-# because all three layers name it in refusals and one of them getting it wrong
-# would point the reader at a path that does not exist.
+# The directory holding the gate's WORKING-TREE files, relative to the project
+# root. Shared, because all three layers name it in refusals and one of them
+# getting it wrong would point the reader at a path that does not exist.
+#
+# What lives here is what a person reads or a model writes: the journal, the
+# review log, and the two config files. The phase state itself does NOT — see
+# spec_gate_dir below.
 STATE_DIR_REL=.claude
+
+# --- Where the phase state lives ---------------------------------------------
+# Under the git directory, not under .claude/, and the argument is the one this
+# file already makes about the key three paragraphs down: a path that is not in
+# the working tree is not reachable by the operations that sweep the working
+# tree.
+#
+# .claude/ was the wrong home for a reason that has nothing to do with any
+# individual spelling. It is a directory the model legitimately reads and writes
+# — the hooks, settings.json, the skills, and the two gate-config files that must
+# stay writable in every phase — so every rule protecting it had to be a rule
+# about *part* of a directory, and the guard's refusals became a list of ways to
+# name that part. Three review rounds found a new one each time: `rm -rf .claude`,
+# `cd .claude && rm -f .spec-*`, `git clean -fdx`, `git stash --all`,
+# `find . -name '.spec-*' -delete`, `find . -exec rm -rf .claude`. Every one of
+# those is a legitimate command somewhere. None of them reaches .git/spec-gate.
+#
+# The state was also gitignored by necessity, which is what made `clean -x` and
+# `stash --all` reach it at all, and what made an install that forgot a name arm
+# the review gate on the gate's own bookkeeping. Out of the tree, there is
+# nothing to ignore and nothing to forget.
+#
+# `--git-dir`, not `--git-common-dir`, matching spec_key_path exactly: in a
+# linked worktree this resolves to .git/worktrees/<name>, so each worktree keeps
+# its own state. That is the existing per-tree semantics — spec_foreign_state
+# exists precisely because a task does not span two trees — and it must not be
+# "fixed" to the common dir.
+#
+# Resolved without a process wherever possible. This is read by a PreToolUse hook
+# on every Edit, Write and Bash call in every repo, and "inactive costs nothing"
+# stops being true the moment answering "is anything armed here" needs a fork.
+# The main checkout has .git as a directory and the linked worktree has it as a
+# one-line file, so both are a stat and a string; git is asked only when this is
+# not a worktree root.
+spec_gate_dir_for() {   # $1 = a worktree path; prints the absolute gate dir
+  local g="${1%/}/.git" l
+  if [ -d "$g" ]; then printf '%s/spec-gate\n' "$g"; return 0; fi
+  if [ -f "$g" ]; then
+    IFS= read -r l < "$g" 2>/dev/null
+    case "$l" in
+      "gitdir: "*)
+        l=${l#gitdir: }
+        case "$l" in /*) ;; *) l="${1%/}/$l" ;; esac
+        printf '%s/spec-gate\n' "$l"
+        return 0 ;;
+    esac
+  fi
+  l=$( cd "$1" 2>/dev/null && git rev-parse --absolute-git-dir 2>/dev/null )
+  [ -n "$l" ] || return 1
+  printf '%s/spec-gate\n' "$l"
+}
+
+# Outside a repository there is no git dir to put anything in, and the gate is
+# already inert there — every receipt it rests on needs git to verify. Falling
+# back to .claude/ keeps that degraded case behaving exactly as it did rather
+# than introducing a second failure mode nobody would see until they hit it.
+SPEC_GATE_DIR=""
+spec_gate_dir() {
+  [ -n "$SPEC_GATE_DIR" ] && { printf '%s\n' "$SPEC_GATE_DIR"; return 0; }
+  SPEC_GATE_DIR=$(spec_gate_dir_for "$PROJECT_DIR") \
+    || SPEC_GATE_DIR="${PROJECT_DIR%/}/$STATE_DIR_REL"
+  printf '%s\n' "$SPEC_GATE_DIR"
+}
+
+# The gate dir as the project would name it, for refusal text and for the
+# path-matching the guard does on relative tokens. Empty when the gate dir is
+# not inside the project at all, which is the linked-worktree case.
+spec_gate_dir_rel() {
+  local d p
+  d=$(spec_gate_dir); p="${PROJECT_DIR%/}/"
+  case "$d" in
+    "$p"*) printf '%s\n' "${d#"$p"}" ;;
+    *)     printf '\n' ;;
+  esac
+}
+
+# Every phase-state file, absolute. This is what the snapshot walks and what the
+# guard matches globs against — the question "what is the gate's own state",
+# which is is_phase_state's question, not the review gate's.
+spec_phase_state_list() {
+  local d
+  d=$(spec_gate_dir)
+  printf '%s\n' \
+    "$d/.spec-phase" \
+    "$d/.spec-baseline" \
+    "$d/.spec-red" \
+    "$d/.spec-approval" \
+    "$d/.spec-scaffold" \
+    "$d/.spec-validation"
+}
 
 # --- Authenticating the markers that clear a gate ----------------------------
 # Deleting a marker only re-arms a gate; forging one clears it. The guard denies
@@ -199,12 +293,11 @@ spec_state_save() {
   # disagreed on every file and the NUL check below rejected all of them, which
   # made `phase.sh red` refuse to run at all. Under LC_ALL=C both count bytes.
   local LC_ALL=C
-  while IFS= read -r s; do
-    [ -z "$s" ] && continue
-    is_phase_state "$s" || continue
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    is_phase_state "$f" || continue
     n=$((n + 1))
-    printf -v "SPEC_SNAP_P_$n" '%s' "$s"
-    f="${PROJECT_DIR%/}/$s"
+    printf -v "SPEC_SNAP_P_$n" '%s' "$f"
     if [ -f "$f" ]; then
       c=$(cat "$f" 2>/dev/null; printf X) || return 1
       c=${c%X}
@@ -216,7 +309,7 @@ spec_state_save() {
       printf -v "SPEC_SNAP_E_$n" '%s' 0
       printf -v "SPEC_SNAP_C_$n" '%s' ''
     fi
-  done <<< "$(spec_state_list)"
+  done <<< "$(spec_phase_state_list)"
   SPEC_SNAP_N=$n
   return 0
 }
@@ -227,14 +320,13 @@ spec_state_discard() { SPEC_SNAP_N=0; return 0; }
 # was needed and could not be written, so the caller must not claim the state
 # was recovered.
 spec_state_restore() {
-  local n=1 touched=0 sp se sc f now
+  local n=1 touched=0 se sc f now
   [ "$SPEC_SNAP_N" -gt 0 ] || return 2
   while [ "$n" -le "$SPEC_SNAP_N" ]; do
-    eval "sp=\${SPEC_SNAP_P_$n}"
+    eval "f=\${SPEC_SNAP_P_$n}"
     eval "se=\${SPEC_SNAP_E_$n}"
     eval "sc=\${SPEC_SNAP_C_$n}"
     n=$((n + 1))
-    f="${PROJECT_DIR%/}/$sp"
     if [ "$se" = 1 ]; then
       now=''
       if [ -f "$f" ]; then now=$(cat "$f" 2>/dev/null; printf X); now=${now%X}; fi
@@ -364,7 +456,7 @@ is_phase_state() {
 # has already read in the spec. Scaffolding before Clarify would mean guessing
 # the module boundary before the design exists, and committing that guess as the
 # frontier every later test imports from.
-scaffold_path() { printf '%s/.claude/.spec-scaffold' "${PROJECT_DIR%/}"; }
+scaffold_path() { printf '%s/.spec-scaffold' "$(spec_gate_dir)"; }
 scaffold_armed() { [ -f "$(scaffold_path)" ]; }
 
 # "New" means NOT IN HEAD. The two layers have to agree about the same file at
@@ -482,11 +574,13 @@ spec_foreign_state() {   # $1 = the directory the work is happening in
   [ -n "$top" ] || return 0
   top=$(spec_realpath "$top")
   [ -n "$top" ] || return 0
-  [ -f "$top/.claude/.spec-phase" ] && return 0
+  # Each tree's state is under its OWN git dir, so "is that tree armed" is asked
+  # of that tree's gate dir rather than of a fixed path inside it.
+  [ -f "$(spec_gate_dir_for "$top")/.spec-phase" ] && return 0
   while IFS= read -r w; do
     [ -n "$w" ] || continue
     wr=$(spec_realpath "$w")
-    [ -n "$wr" ] && [ "$wr" != "$top" ] && [ -f "$wr/.claude/.spec-phase" ] \
+    [ -n "$wr" ] && [ "$wr" != "$top" ] && [ -f "$(spec_gate_dir_for "$wr")/.spec-phase" ] \
       && { printf '%s\n' "$wr"; return 0; }
   done <<< "$(spec_worktrees "$top")"
   return 0
@@ -512,7 +606,7 @@ spec_related_siblings() {   # $1 = the tree the gate is armed in
   spec_worktrees_exist "$1" || return 0
   base=$(spec_realpath "$1")
   [ -n "$base" ] || return 0
-  task=$(sed -n 's/^task=//p' "$base/.claude/.spec-phase" 2>/dev/null | head -1)
+  task=$(sed -n 's/^task=//p' "$(spec_gate_dir_for "$base")/.spec-phase" 2>/dev/null | head -1)
   [ -n "$task" ] || return 0
   while IFS= read -r w; do
     [ -n "$w" ] || continue
@@ -580,20 +674,22 @@ in_project() {
 # 5 -> 3 boundary or the close-out. Correctness here cannot rest on an install
 # step having been done properly.
 #
-# Built from STATE_DIR_REL rather than from eight hardcoded prefixes. The
-# directory is already a shared name that three layers quote in their refusals;
-# having the list that enumerates its contents spell it out again meant the
-# variable and the paths could disagree, and relocating the state directory was
-# not a change anyone could make in one place.
+# Built from STATE_DIR_REL rather than from hardcoded prefixes. The directory is
+# already a shared name that three layers quote in their refusals; having the
+# list that enumerates its contents spell it out again meant the variable and the
+# paths could disagree, and relocating the state directory was not a change
+# anyone could make in one place.
+#
+# Two entries, not eight. The six phase-state files now live under the git
+# directory, which the working tree never sees — `git status` cannot report them
+# and no pathspec can reach them — so excluding them from a review fingerprint
+# computed out of `git diff` and `git ls-files` is describing a case that can no
+# longer arise. What is left is what is genuinely in the tree and genuinely
+# gitignored: the journal, which is prose the model writes, and the review log,
+# which is the append-only record of the verdicts.
 spec_state_list() {
   local d="${STATE_DIR_REL:-.claude}"
   printf '%s\n' \
-    "$d/.spec-phase" \
-    "$d/.spec-baseline" \
-    "$d/.spec-red" \
-    "$d/.spec-approval" \
-    "$d/.spec-scaffold" \
-    "$d/.spec-validation" \
     "$d/spec-journal.md" \
     "$d/review-log.jsonl"
 }
@@ -602,7 +698,7 @@ review_exclude_list() {
   gate_config_list
   spec_state_list
 
-  f="${PROJECT_DIR%/}/.claude/spec-gate-review-exclude"
+  f="${PROJECT_DIR%/}/$STATE_DIR_REL/spec-gate-review-exclude"
   if [ -r "$f" ]; then
     while IFS= read -r l; do
       case "$l" in ''|\#*) continue ;; esac
@@ -657,7 +753,7 @@ review_pending_paths() {
 # every phase, so a bad value is not a user's choice, it is something that should
 # not have been able to write the file at all.
 slice_raw() {
-  sed -n 's/^slice=//p' "${PROJECT_DIR%/}/.claude/.spec-phase" 2>/dev/null | head -1
+  sed -n 's/^slice=//p' "$(spec_gate_dir)/.spec-phase" 2>/dev/null | head -1
 }
 
 # ok | absent | corrupt
@@ -766,12 +862,12 @@ snapshot_line_path() {
 #
 # Sourced by phase.sh (writes it) and phase-guard.sh (reads it to decide whether
 # 3 -> 4 may be offered as a prompt). Both need PROJECT_DIR set.
-red_receipt_path() { printf '%s/.claude/.spec-red' "${PROJECT_DIR%/}"; }
+red_receipt_path() { printf '%s/.spec-red' "$(spec_gate_dir)"; }
 
 # "<content-hash> <path>" lines for the test files changed since the phase began,
 # from the same snapshot the Stop scan uses. Must run from the project root.
 changed_test_snapshot() {
-  base=$(cat "${PROJECT_DIR%/}/.claude/.spec-baseline" 2>/dev/null)
+  base=$(cat "$(spec_gate_dir)/.spec-baseline" 2>/dev/null)
   tree_snapshot | while IFS= read -r line; do
     [ -z "$line" ] && continue
     case $'\n'"$base"$'\n' in
@@ -1038,7 +1134,7 @@ gate_options() {
 # answer and the act on the `pr` path, because opening the PR is the commit; a
 # content pin there would void every approval it was meant to carry. What guards
 # that path instead is review_pending_paths, checked at the point of use.
-approval_path() { printf '%s/.claude/.spec-approval' "${PROJECT_DIR%/}"; }
+approval_path() { printf '%s/.spec-approval' "$(spec_gate_dir)"; }
 
 # Content hashes of the spec documents, in the tree_snapshot format. Untracked
 # specs are hashed too: the first spec of a task is always untracked, and a
@@ -1064,7 +1160,7 @@ gate_subject() {
     spec) spec_snapshot ;;
     # The RED receipt already pins the test contents, so pinning the receipt
     # itself inherits that and costs one hash instead of a re-walk.
-    red)  git hash-object "${PROJECT_DIR%/}/.claude/.spec-red" 2>/dev/null ;;
+    red)  git hash-object "$(spec_gate_dir)/.spec-red" 2>/dev/null ;;
     # These pin no content, for close-out's reason: there is no document being
     # approved, so there is nothing whose edit should void the answer. What holds
     # them is the phase/task/slice pin every receipt carries — an answer about
@@ -1102,7 +1198,7 @@ approval_status() {
     v=$(sed -n 's/^verdict=//p' "$a" | head -1)
     [ -n "$v" ] || { printf 'stale\n'; exit 0; }
 
-    s="${PROJECT_DIR%/}/.claude/.spec-phase"
+    s="$(spec_gate_dir)/.spec-phase"
     [ -r "$s" ] || { printf 'expired\n'; exit 0; }
     for k in phase task slice; do
       [ "$(sed -n "s/^$k=//p" "$a" | head -1)" = "$(sed -n "s/^$k=//p" "$s" | head -1)" ] \

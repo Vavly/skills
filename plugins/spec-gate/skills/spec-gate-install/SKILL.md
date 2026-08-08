@@ -87,22 +87,27 @@ to verify anything, and 3 → 4 then rests on an assertion instead of on output.
 
 ## 5. `.gitignore`
 
-Eight entries, and each one is state the gate writes about itself:
+Two entries:
 
 ```
-.claude/.spec-phase
-.claude/.spec-baseline
-.claude/.spec-red
-.claude/.spec-approval*
-.claude/.spec-scaffold
-.claude/.spec-validation
 .claude/spec-journal.md
 .claude/review-log.jsonl
 ```
 
-**Append only what is missing.** An untracked state file is work the review gate
-considers owed, so a name absent here is a gate that arms itself every time it
-writes its own bookkeeping.
+**Append only what is missing.** An untracked file the gate writes is work the
+review gate considers owed, so a name absent here is a gate that arms itself
+every time it records its own bookkeeping.
+
+There used to be eight. The other six — `.spec-phase`, `.spec-baseline`,
+`.spec-red`, `.spec-approval`, `.spec-scaffold`, `.spec-validation` — are no
+longer in the working tree at all: they live under `.git/spec-gate/`, which git
+never reports and no pathspec reaches. Nothing to ignore, and nothing an install
+can forget. That was not a tidiness change: being gitignored was exactly what put
+them in reach of `git clean -fdx` and `git stash --all`, and being under
+`.claude/` put them in a directory the model legitimately writes.
+
+If a repo still has the old six lines, they are harmless and can stay. The two
+above are the ones that matter.
 
 ## 6. `permissions.ask`
 

@@ -67,17 +67,28 @@ ask() { decide ask "$1"; }
 
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$(json_get cwd)}"
 PROJECT_DIR="${PROJECT_DIR:-$PWD}"
-STATE="$PROJECT_DIR/.claude/.spec-phase"
 
 # The policy file is read before the "is anything armed here" check, because the
-# answer to that question now lives in it: a tree with no state of its own may
-# still be the wrong half of a split.
+# answer to that question now lives in it — twice over. A tree with no state of
+# its own may still be the wrong half of a split, and where the state file even
+# IS is policy: it moved out of the working tree and under the git directory, so
+# a guard that located it by hand would be a second copy of spec_gate_dir waiting
+# to disagree with the real one.
+#
+# Failing closed when the policy is unreadable therefore cannot test for the
+# state file first. It tests for a gate directory instead, which is the same
+# question one level up and needs nothing from the file that is missing.
 if [ ! -r "$HOOK_DIR/phase-policy.sh" ]; then
-  [ -f "$STATE" ] && deny "phase-guard cannot read phase-policy.sh next to it in $HOOK_DIR. Failing closed rather than guessing at the policy."
+  for _g in "$PROJECT_DIR/.git/spec-gate/.spec-phase" "$PROJECT_DIR/.claude/.spec-phase"; do
+    [ -f "$_g" ] && deny "phase-guard cannot read phase-policy.sh next to it in $HOOK_DIR. Failing closed rather than guessing at the policy."
+  done
   exit 0
 fi
 # shellcheck source=phase-policy.sh
 . "$HOOK_DIR/phase-policy.sh"
+
+GATE_DIR="$(spec_gate_dir)"
+STATE="$GATE_DIR/.spec-phase"
 
 # No state HERE is not the same as no state. It also describes a session standing
 # in a worktree while the task is armed next door, and that used to exit 0 — the
@@ -100,8 +111,8 @@ fi
 PHASE=$(sed -n 's/^phase=//p' "$STATE" 2>/dev/null | head -1)
 case "$PHASE" in
   1|2|3|4|5) ;;
-  "") [ -n "$SPLIT" ] || deny "phase-guard: .claude/.spec-phase is unreadable. Failing closed." ;;
-  *) deny "phase-guard: .claude/.spec-phase is corrupt (phase=$PHASE). Failing closed, because a broken state file must not silently disable the gate. Ask the user with 'phase.sh ask abandon', or repair the file." ;;
+  "") [ -n "$SPLIT" ] || deny "phase-guard: $STATE is unreadable. Failing closed." ;;
+  *) deny "phase-guard: $STATE is corrupt (phase=$PHASE). Failing closed, because a broken state file must not silently disable the gate. Ask the user with 'phase.sh ask abandon', or repair the file." ;;
 esac
 
 # --- What would this Bash command write? -------------------------------------
@@ -622,17 +633,34 @@ fi
 # the same degradation the other shared names get.
 : "${STATE_DIR_REL:=.claude}"
 
+# The gate directory as this project would name it. Empty when it is not inside
+# the project at all — a linked worktree keeps its state under the main
+# checkout's .git/worktrees/<name>, which no relative token from here can reach.
+GATE_DIR_REL="$(spec_gate_dir_rel)"
+
 # True when a path, once normalised, is the directory holding the state files or
-# an ancestor of it. `rm -rf .claude` and `rm -rf .` remove every state file
-# without naming one.
+# an ancestor of it. `rm -rf .` and `rm -rf .git` remove every state file without
+# naming one.
+#
+# The state lives under the git directory now, so the ancestor chain this has to
+# walk is `.git/spec-gate`, `.git`, `.` — not `.claude`. That is the whole point
+# of the move: `.claude` is a directory the model legitimately writes, so every
+# rule about it had to carve out the parts that are fine, and the carve-outs were
+# where the holes kept appearing. Nothing legitimate removes `.git`.
 covers_state_dir() {
-  local p=$1
+  local p=$1 d
   p=${p%/}; p=${p#./}
   [ -z "$p" ] && return 0
   case "$p" in
     .|..) return 0 ;;
-    "$STATE_DIR_REL") return 0 ;;
-    /*) case "${PROJECT_DIR%/}/$STATE_DIR_REL" in
+  esac
+  d=$GATE_DIR_REL
+  while [ -n "$d" ] && [ "$d" != . ] && [ "$d" != / ]; do
+    [ "$p" = "$d" ] && return 0
+    case "$d" in */*) d=${d%/*} ;; *) d='' ;; esac
+  done
+  case "$p" in
+    /*) case "$(spec_gate_dir)" in
           "$p"|"$p"/*) return 0 ;;
         esac ;;
   esac
@@ -655,10 +683,17 @@ SPEC_STATE_ABS=()
 while IFS= read -r _s; do
   [ -z "$_s" ] && continue
   is_phase_state "$_s" || continue
-  SPEC_STATE_PATHS+=("$_s")
+  # The list is absolute now. A glob still has to be tried against the form the
+  # command would have written — `rm -f .git/spec-gate/.spec-*` is relative —
+  # so the project-relative spelling is carried alongside it when there is one.
+  SPEC_STATE_ABS+=("$_s")
   SPEC_STATE_BASES+=("${_s##*/}")
-  SPEC_STATE_ABS+=("${PROJECT_DIR%/}/$_s")
-done <<< "$(spec_state_list)"
+  if [ -n "$GATE_DIR_REL" ]; then
+    SPEC_STATE_PATHS+=("$GATE_DIR_REL/${_s##*/}")
+  else
+    SPEC_STATE_PATHS+=("$_s")
+  fi
+done <<< "$(spec_phase_state_list)"
 SPEC_KEY_PATH_CACHE=$(spec_key_path 2>/dev/null) || SPEC_KEY_PATH_CACHE=""
 
 # A glob is matched the other way round from an ordinary path: the token is the
@@ -771,6 +806,32 @@ names_gate_key() {
       [ -n "$SPEC_KEY_PATH_CACHE" ] && case "$SPEC_KEY_PATH_CACHE" in $1) return 0 ;; esac
       # shellcheck disable=SC2254
       case ".git/spec-gate-key" in $1) return 0 ;; esac ;;
+  esac
+  return 1
+}
+
+# The phase state left .claude/, but the journal and the review log did not, and
+# they are the two things git has no copy of: what previous sessions did, and
+# every verdict a reviewer returned. `rm -rf .claude` takes both, along with the
+# hooks that would have noticed.
+#
+# Deliberately only the whole directory, and only under a destroying verb. The
+# carve-out problem that made .claude the wrong home for phase state was about
+# NARROW operations — `rm -f .claude/.spec-*`, `cd .claude && rm -f .spec-*` —
+# which now reach nothing and are allowed again. Sweeping the directory is not
+# something any legitimate step does.
+RECORD_DIR_MSG="That removes $STATE_DIR_REL, which holds this task's journal and the reviewer verdict log — the record of what previous sessions did, which findings were acted on, and how far Execute got. Both are gitignored by design, so git has no copy and nothing brings them back. It also removes the hooks. If the intent is to end the task, that is 'phase.sh off'."
+
+covers_record_dir() {
+  local p=$1
+  p=${p%/}; p=${p#./}
+  [ -z "$p" ] && return 0
+  case "$p" in
+    .|..) return 0 ;;
+    "$STATE_DIR_REL") return 0 ;;
+    /*) case "${PROJECT_DIR%/}/$STATE_DIR_REL" in
+          "$p"|"$p"/*) return 0 ;;
+        esac ;;
   esac
   return 1
 }
@@ -1006,7 +1067,7 @@ scan_state_tokens() {
           TPRE=${T%%[\$\`]*}
           case "$TPRE" in
             */*) covers_state_dir "${TPRE%/*}" \
-                   && deny "This writes to a target the shell computes at runtime ($T), inside $STATE_DIR_REL where the phase state lives. phase-guard cannot evaluate what it would resolve to, so it cannot rule out a state file. $STATE_MSG" ;;
+                   && deny "This writes to a target the shell computes at runtime ($T), inside ${GATE_DIR_REL:-the gate directory} where the phase state lives. phase-guard cannot evaluate what it would resolve to, so it cannot rule out a state file. $STATE_MSG" ;;
           esac ;;
       esac
     fi
@@ -1082,15 +1143,17 @@ scan_state_tokens() {
             esac
           fi ;;
       esac
-      # `git clean -x` and `-X` are the only ordinary commands that remove these
-      # files, and they do it precisely because the files are gitignored by
-      # design — so no commit can protect them and nothing else in this hook
-      # would ever see a path.
+      # `git clean -x` and `-X` no longer reach the phase state — that is under
+      # the git directory, which git itself never cleans — but they do still
+      # reach the journal and the review log, which are in the tree and
+      # gitignored by design. Those are the durable record of what a previous
+      # session did and of every verdict a reviewer returned, so no commit can
+      # protect them and nothing else in this hook would ever see a path.
       if [ "$GITCLEAN" = 1 ]; then
         case "$T" in
           --) ;;
           -[!-]*) case "$T" in
-                    *x*|*X*) deny "git clean -x/-X removes ignored files, and every spec-gate state file is ignored by design — this would disarm the workflow silently, leaving no phase, no receipts and no record that a gate was ever armed. Clean specific paths instead, or run 'phase.sh off' if the intent is to end the task." ;;
+                    *x*|*X*) deny "git clean -x/-X removes ignored files, and the journal and the review log are ignored by design — this would take the record of what previous sessions did and every verdict a reviewer returned, with nothing in git holding a copy. The phase state itself is safe under the git directory; this is about the history, which is the part that cannot be rebuilt. Clean specific paths instead, or run 'phase.sh off' if the intent is to end the task." ;;
                   esac ;;
         esac
       fi
@@ -1100,10 +1163,10 @@ scan_state_tokens() {
       # takes untracked files and leaves ignored ones, so it never reaches these.
       if [ "$GITSTASH" = 1 ]; then
         case "$T" in
-          --all) deny "git stash --all stashes ignored files as well as untracked ones, and every spec-gate state file is ignored by design — this would disarm the workflow exactly as 'git clean -x' would. Use 'git stash -u' if the intent is to set untracked work aside, or 'phase.sh off' if the intent is to end the task." ;;
+          --all) deny "git stash --all stashes ignored files as well as untracked ones, and the journal and the review log are ignored by design — this would take the record of what previous sessions did and every verdict a reviewer returned, exactly as 'git clean -x' would. Use 'git stash -u' if the intent is to set untracked work aside, or 'phase.sh off' if the intent is to end the task." ;;
           --) ;;
           -[!-]*) case "$T" in
-                    *a*) deny "git stash -a stashes ignored files as well as untracked ones, and every spec-gate state file is ignored by design — this would disarm the workflow exactly as 'git clean -x' would. Use 'git stash -u' if the intent is to set untracked work aside, or 'phase.sh off' if the intent is to end the task." ;;
+                    *a*) deny "git stash -a stashes ignored files as well as untracked ones, and the journal and the review log are ignored by design — this would take the record of what previous sessions did and every verdict a reviewer returned, exactly as 'git clean -x' would. Use 'git stash -u' if the intent is to set untracked work aside, or 'phase.sh off' if the intent is to end the task." ;;
                   esac ;;
         esac
       fi
@@ -1119,7 +1182,7 @@ scan_state_tokens() {
       if [ "$FINDHIT" = 1 ] || { [ "$FINDDIR" = 1 ] && [ "$FINDNAMED" = 0 ]; }; then
         case "$T" in
           -delete|-exec|-execdir|-fprint|-fprintf)
-            deny "This find would delete or overwrite inside $STATE_DIR_REL, where the phase state lives. $STATE_MSG" ;;
+            deny "This find would delete or overwrite inside ${GATE_DIR_REL:-the gate directory}, where the phase state lives. $STATE_MSG" ;;
         esac
       fi
       # An interpreter is handed code, not shell. It cannot be lexed here, so
@@ -1217,10 +1280,12 @@ scan_state_tokens() {
           -*) ;;
           *) covers_state_dir "$T" && deny "$STATE_MSG"
              covers_git_dir "$T" && deny "$GATE_KEY_MSG"
+             covers_record_dir "$T" && deny "$RECORD_DIR_MSG"
              # `D=.claude; rm -rf $D` reaches the directory through a binding.
              resolve_tok "$T"
              covers_state_dir "$RT" && deny "$STATE_MSG"
-             covers_git_dir "$RT" && deny "$GATE_KEY_MSG" ;;
+             covers_git_dir "$RT" && deny "$GATE_KEY_MSG"
+             covers_record_dir "$RT" && deny "$RECORD_DIR_MSG" ;;
         esac ;;
     esac
   done <<< "$(lex_command "$1")"

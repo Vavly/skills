@@ -201,7 +201,9 @@ cp -R "$SPEC_GATE"/hooks "$SPEC_GATE"/agents "$SPEC_GATE"/skills .claude/
 # cannot be verified in-band and falls back to being terminal-only.
 printf 'yarn jest $SPEC_GATE_TEST_FILES\n' > .claude/spec-gate-test-cmd
 
-printf '.claude/.spec-phase\n.claude/.spec-baseline\n.claude/.spec-red\n.claude/.spec-approval*\n.claude/.spec-scaffold\n.claude/.spec-validation\n.claude/spec-journal.md\n.claude/review-log.jsonl\n' >> .gitignore
+# Two entries. The phase state itself lives under .git/spec-gate/ and never
+# enters the working tree, so there is nothing there to ignore.
+printf '.claude/spec-journal.md\n.claude/review-log.jsonl\n' >> .gitignore
 git add .claude .gitignore && git commit -m "add review gate + spec-driven workflow"
 ```
 
@@ -312,7 +314,9 @@ two.
 
 ### One tree per task
 
-The gate covers the worktree holding `.claude/.spec-phase`, and only that one.
+The gate covers the worktree holding `.git/spec-gate/.spec-phase`, and only that
+one — in a linked worktree that resolves to `.git/worktrees/<name>/spec-gate/`,
+so each tree keeps its own.
 Nothing here spans two: `PROJECT_DIR` decides where the state is read from and
 `in_project` decides which paths are the gate's business, and the moment someone
 runs `git worktree add` those two answers can come from different trees.

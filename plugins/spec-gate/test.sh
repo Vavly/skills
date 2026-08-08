@@ -18,6 +18,23 @@ SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK=$(mktemp -d 2>/dev/null || mktemp -d -t specgate)
 trap 'rm -rf "$WORK"' EXIT
 
+# Where the phase state lives, relative to the repo root. Under the git dir, not
+# under .claude/, so that no operation which sweeps the working tree reaches it —
+# see phase-policy.sh. A linked worktree keeps its own under
+# .git/worktrees/<name>/spec-gate, which is what gate_dir_of resolves.
+SPD='.git/spec-gate'
+
+gate_dir_of() {   # $1 = a worktree path -> its absolute gate dir
+  local l
+  if [ -d "$1/.git" ]; then printf '%s/.git/spec-gate\n' "$1"; return 0; fi
+  if [ -f "$1/.git" ]; then
+    l=$(sed -n 's/^gitdir: //p' "$1/.git" | head -1)
+    case "$l" in /*) ;; *) l="$1/$l" ;; esac
+    printf '%s/spec-gate\n' "$l"; return 0
+  fi
+  printf '%s/.claude\n' "$1"
+}
+
 PASS=0; FAIL=0
 if [ -t 1 ]; then G=$'\033[32m'; R=$'\033[31m'; B=$'\033[1m'; N=$'\033[0m'; else G=""; R=""; B=""; N=""; fi
 
@@ -37,10 +54,12 @@ setup_repo() {
   echo 'orig' > src/x.ts
   echo 'orig' > src/x.test.ts
   echo 'orig' > tests/helper.ts
-  # Must stay identical to the install block in README.md. An untracked state
-  # file is work the review gate considers owed, so a name missing here is a gate
-  # that arms itself every time it writes its own bookkeeping.
-  printf '.claude/.spec-phase\n.claude/.spec-baseline\n.claude/.spec-red\n.claude/.spec-approval*\n.claude/.spec-scaffold\n.claude/.spec-validation\n.claude/spec-journal.md\n.claude/review-log.jsonl\n' > .gitignore
+  # Must stay identical to the install block in README.md. An untracked file the
+  # gate writes is work the review gate considers owed, so a name missing here is
+  # a gate that arms itself every time it records its own bookkeeping. Two names,
+  # not eight: the phase state is under .git/spec-gate/ now, which git never
+  # reports, so there is nothing there to ignore.
+  printf '.claude/spec-journal.md\n.claude/review-log.jsonl\n' > .gitignore
   git add -A >/dev/null 2>&1; git commit -qm init
   export CLAUDE_PROJECT_DIR="$PWD"
   rm -f .git/claude-review-gate
@@ -66,7 +85,7 @@ setup_repo() {
 phase() {
   local p
   case "$*" in
-    5) p=$(sed -n 's/^phase=//p' .claude/.spec-phase 2>/dev/null | head -1)
+    5) p=$(sed -n 's/^phase=//p' $SPD/.spec-phase 2>/dev/null | head -1)
        case "$p" in
          1|2) .claude/hooks/phase.sh 3 >/dev/null 2>&1; p=3 ;;
        esac
@@ -352,15 +371,15 @@ EOF
 echo sneaky > src/y.ts"
 
 group "Phase state is never the model's [#8]"
-expect_b "redirect into phase file denied"     DENY  'echo phase=5 > .claude/.spec-phase'
-expect_b "rm of phase file denied"             DENY  'rm .claude/.spec-phase'
-expect_b "mv of phase file denied"             DENY  'mv /tmp/x .claude/.spec-phase'
-expect_b "baseline file denied"                DENY  'rm .claude/.spec-baseline'
-expect_b "forging the RED receipt denied"      DENY  'printf x > .claude/.spec-red'
-expect_w "Write to the RED receipt denied"     DENY  .claude/.spec-red
-expect_w "Write to phase file denied"          DENY  .claude/.spec-phase
+expect_b "redirect into phase file denied"     DENY  'echo phase=5 > .git/spec-gate/.spec-phase'
+expect_b "rm of phase file denied"             DENY  'rm .git/spec-gate/.spec-phase'
+expect_b "mv of phase file denied"             DENY  'mv /tmp/x .git/spec-gate/.spec-phase'
+expect_b "baseline file denied"                DENY  'rm .git/spec-gate/.spec-baseline'
+expect_b "forging the RED receipt denied"      DENY  'printf x > .git/spec-gate/.spec-red'
+expect_w "Write to the RED receipt denied"     DENY  .git/spec-gate/.spec-red
+expect_w "Write to phase file denied"          DENY  .git/spec-gate/.spec-phase
 phase 5
-expect_b "phase 5 cannot rewrite state [#8]"   DENY  'echo phase=4 > .claude/.spec-phase'
+expect_b "phase 5 cannot rewrite state [#8]"   DENY  'echo phase=4 > .git/spec-gate/.spec-phase'
 
 group "The gate's own config is writable in every phase [#11]"
 # The complement of the group above: phase STATE is never the model's, but gate
@@ -384,7 +403,7 @@ expect_w "settings.json stays denied"          DENY  .claude/settings.json
 expect_w "the guard script stays denied"       DENY  .claude/hooks/phase-guard.sh
 expect_w "the policy file stays denied"        DENY  .claude/hooks/phase-policy.sh
 expect_w "a lookalike name stays denied"       DENY  .claude/spec-gate-test-cmd.sh
-expect_w "phase state is still denied"         DENY  .claude/.spec-red
+expect_w "phase state is still denied"         DENY  .git/spec-gate/.spec-red
 
 # The deadlock, end to end: what `phase.sh red` instructs must be a write the
 # guard permits. These two drifting apart is the actual defect, so pin them
@@ -410,7 +429,7 @@ out=$(.claude/hooks/phase.sh red 2>&1)
 printf '%s' "$out" | grep -q 'command: exit 1' \
   && ok "red echoes the command it ran" \
   || bad "red does not show the command: $(printf '%s' "$out" | tr '\n' ' ')"
-grep -q '^cmd=exit 1$' .claude/.spec-red \
+grep -q '^cmd=exit 1$' $SPD/.spec-red \
   && ok "the receipt records the command" \
   || bad "the receipt does not record the command it ran"
 
@@ -525,7 +544,7 @@ else
 fi
 
 group "Corrupt state fails closed [#7]"
-printf 'phase=notanumber\ntask=x\n' > .claude/.spec-phase
+printf 'phase=notanumber\ntask=x\n' > $SPD/.spec-phase
 expect_w "corrupt phase denies writes"    DENY src/x.ts
 out=$(.claude/hooks/phase.sh status 2>&1); rc=$?
 if [ $rc -eq 0 ] && ! printf '%s' "$out" | grep -qi 'unbound variable'; then
@@ -533,7 +552,7 @@ if [ $rc -eq 0 ] && ! printf '%s' "$out" | grep -qi 'unbound variable'; then
 else
   bad "phase.sh status on corrupt state — rc=$rc out=$out"
 fi
-printf 'task=only\n' > .claude/.spec-phase
+printf 'task=only\n' > $SPD/.spec-phase
 expect_w "missing phase= denies writes"   DENY src/x.ts
 
 # phase.sh degrades rather than erroring when the policy file is gone, and the
@@ -550,7 +569,7 @@ else
   bad "phase.sh red without a policy file — rc=$rc out=$(printf '%s' "$out" | tr '\n' ' ')"
 fi
 .claude/hooks/phase.sh 4 >/dev/null 2>&1
-[ "$(sed -n 's/^phase=//p' .claude/.spec-phase)" = 3 ] \
+[ "$(sed -n 's/^phase=//p' $SPD/.spec-phase)" = 3 ] \
   && ok "phase.sh 4 does not advance without a policy file" \
   || bad "phase.sh 4 advanced with no policy file to check against"
 mv "$WORK/policy.bak" .claude/hooks/phase-policy.sh
@@ -1474,7 +1493,7 @@ printf '%s' "$OUT" | grep -q "phase 1" \
 # being enforced is not the one being written.
 shim "$SHIMREPO/src/deep" status >/dev/null 2>&1
 NSTATE=$(find "$SHIMREPO" -name '.spec-phase' | wc -l | tr -d ' ')
-if [ "$NSTATE" = 1 ] && [ -f "$SHIMREPO/.claude/.spec-phase" ]; then
+if [ "$NSTATE" = 1 ] && [ -f "$SHIMREPO/$SPD/.spec-phase" ]; then
   ok "invoked from a subdirectory, state still lands at the repo root"
 else
   bad "subdirectory invocation forked the phase state — $NSTATE .spec-phase files found"
@@ -1498,7 +1517,7 @@ mkdir -p "$DIRECT/src/deep"
     && git config user.name test ) >/dev/null 2>&1
 ( cd "$DIRECT/src/deep" && unset CLAUDE_PROJECT_DIR \
     && bash "$SRC/hooks/phase.sh" start direct ) >/dev/null 2>&1
-if [ -f "$DIRECT/.claude/.spec-phase" ] && [ ! -f "$DIRECT/src/deep/.claude/.spec-phase" ]; then
+if [ -f "$DIRECT/$SPD/.spec-phase" ] && [ ! -f "$DIRECT/src/deep/$SPD/.spec-phase" ]; then
   ok "phase.sh run directly from a subdirectory still writes state at the repo root"
 else
   bad "phase.sh wrote state beside the caller, not at the repo root — the hooks read the other one"
@@ -1604,7 +1623,7 @@ phase start sliced
 # A task nobody sliced must be indistinguishable from the old single-pass
 # workflow, output included — otherwise everyone pays for a feature they did not
 # ask for.
-grep -q '^slice=1/1$' .claude/.spec-phase \
+grep -q '^slice=1/1$' $SPD/.spec-phase \
   && ok "start writes slice=1/1" || bad "start did not write a slice field"
 
 # Capture before matching, never `phase.sh status | grep -q`. Under `pipefail`
@@ -1619,14 +1638,14 @@ printf '%s' "$(st)" | grep -qiE 'slice [0-9]+ of' \
   && bad "status mentions slices for a 1/1 task" || ok "1/1 says nothing about slices"
 
 .claude/hooks/phase.sh slices 4 >/dev/null 2>&1
-grep -q '^slice=1/4$' .claude/.spec-phase \
+grep -q '^slice=1/4$' $SPD/.spec-phase \
   && ok "slices 4 sets the total, keeps the position" || bad "slices 4 did not set 1/4"
 printf '%s' "$(st)" | grep -q 'slice 1 of 4' \
   && ok "status reports slice 1 of 4" || bad "status does not report the slice"
 
 # The task name survived a write that had nothing to do with it — the reason the
 # state file is written from one place.
-grep -q '^task=sliced$' .claude/.spec-phase \
+grep -q '^task=sliced$' $SPD/.spec-phase \
   && ok "slices preserves the task name" || bad "slices dropped the task name"
 
 for bad_n in 0 -1 abc ''; do
@@ -1639,7 +1658,7 @@ done
 
 # Absent reads as 1/1; malformed fails closed. A bad value cannot come from the
 # user — the guard denies every write to this file — so it means corruption.
-printf 'phase=3\ntask=t\n' > .claude/.spec-phase
+printf 'phase=3\ntask=t\n' > $SPD/.spec-phase
 printf '%s' "$(st)" | grep -qi 'corrupt' \
   && bad "absent slice field reported as corrupt" || ok "absent slice field reads as 1/1"
 # Matched with `case` rather than a pipe into grep -q. This file runs under
@@ -1648,14 +1667,14 @@ printf '%s' "$(st)" | grep -qi 'corrupt' \
 # text it wanted is sitting in the output. That race made this loop flaky —
 # observed failing on '1/2/3' alone, on a run where every other case passed.
 for junk in 'abc' '2/' '/5' '0/3' '4/2' '1/2/3'; do
-  printf 'phase=3\ntask=t\nslice=%s\n' "$junk" > .claude/.spec-phase
+  printf 'phase=3\ntask=t\nslice=%s\n' "$junk" > $SPD/.spec-phase
   if grep -qi 'corrupt' <<< "$(st)"; then
     ok "slice='$junk' fails closed"
   else
     bad "slice='$junk' was accepted"
   fi
 done
-printf 'phase=4\ntask=t\nslice=2/2\n' > .claude/.spec-phase
+printf 'phase=4\ntask=t\nslice=2/2\n' > $SPD/.spec-phase
 .claude/hooks/phase.sh slices 1 >/dev/null 2>&1 \
   && bad "slices dropped the total below the current slice" \
   || ok "slices refuses a total below the current slice"
@@ -1664,7 +1683,7 @@ group "The slice boundary is a commit [5 -> 3]"
 setup_repo
 phase start sliced
 .claude/hooks/phase.sh slices 3 >/dev/null 2>&1
-printf 'phase=5\ntask=sliced\nslice=1/3\n' > .claude/.spec-phase
+printf 'phase=5\ntask=sliced\nslice=1/3\n' > $SPD/.spec-phase
 
 # Dirty tree: the next slice would fold this diff into its baseline and the
 # review gate would never see it again. That is the escape Phase 5 exists to
@@ -1696,18 +1715,18 @@ else
   bad "5 -> 3 blocked on a clean tree: $(printf '%s' "$out" | head -c 120)"
 fi
 .claude/hooks/phase.sh 3 >/dev/null 2>&1
-grep -q '^slice=2/3$' .claude/.spec-phase \
+grep -q '^slice=2/3$' $SPD/.spec-phase \
   && ok "5 -> 3 advances the slice position" || bad "slice position did not advance"
 
 # The last slice has no next one. Closing out is `off`, which is the user's.
-printf 'phase=5\ntask=sliced\nslice=3/3\n' > .claude/.spec-phase
+printf 'phase=5\ntask=sliced\nslice=3/3\n' > $SPD/.spec-phase
 reason=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh 3')")
 [ -n "$reason" ] && ok "5 -> 3 denied on the final slice" \
                  || bad "5 -> 3 allowed past the final slice"
 # Every other move off 5 stays denied, sliced or not.
 reason=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh 4')")
 [ -n "$reason" ] && ok "5 -> 4 still denied" || bad "5 -> 4 escaped the review gate"
-printf 'phase=5\ntask=sliced\nslice=1/3\n' > .claude/.spec-phase
+printf 'phase=5\ntask=sliced\nslice=1/3\n' > $SPD/.spec-phase
 reason=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh 2')")
 [ -n "$reason" ] && ok "5 -> 2 still denied mid-slice" || bad "5 -> 2 escaped the review gate"
 
@@ -1723,7 +1742,7 @@ for p in 1 2; do
 done
 # Phase 3+: the total is part of what was approved at 2 -> 3.
 for p in 3 4 5; do
-  printf 'phase=%s\ntask=sliced\nslice=1/5\n' "$p" > .claude/.spec-phase
+  printf 'phase=%s\ntask=sliced\nslice=1/5\n' "$p" > $SPD/.spec-phase
   d=$(pl_bash '.claude/hooks/phase.sh slices 8' | .claude/hooks/phase-guard.sh \
       | python3 -c 'import json,sys
 try: print(json.load(sys.stdin).get("hookSpecificOutput",{}).get("permissionDecision",""))
@@ -1740,7 +1759,7 @@ done
 group "Closing out names the unfinished slices"
 setup_repo
 phase start sliced
-printf 'phase=5\ntask=sliced\nslice=2/5\n' > .claude/.spec-phase
+printf 'phase=5\ntask=sliced\nslice=2/5\n' > $SPD/.spec-phase
 reason=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh off')")
 if printf '%s' "$reason" | grep -q 'slice 2 of 5'; then
   ok "the close-out prompt names the slice position"
@@ -1749,7 +1768,7 @@ else
 fi
 printf '%s' "$reason" | grep -q '3 more are unimplemented' \
   && ok "close-out counts what is left" || bad "close-out does not count the remainder"
-printf 'phase=5\ntask=sliced\nslice=5/5\n' > .claude/.spec-phase
+printf 'phase=5\ntask=sliced\nslice=5/5\n' > $SPD/.spec-phase
 reason=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh off')")
 printf '%s' "$reason" | grep -qi 'unimplemented' \
   && bad "close-out warns about slices on a finished task" \
@@ -1824,7 +1843,7 @@ echo 'hand written' >> src/x.ts
 expect_gate "non-excluded code still arms it" 2
 
 group "RED verification — phase.sh red"
-cur_phase() { sed -n 's/^phase=//p' .claude/.spec-phase 2>/dev/null | head -1; }
+cur_phase() { sed -n 's/^phase=//p' $SPD/.spec-phase 2>/dev/null | head -1; }
 red() { # <label> <expect-rc> <expect-substring>
   local out rc; out=$(.claude/hooks/phase.sh red 2>&1); rc=$?
   if [ "$rc" = "$2" ] && printf '%s' "$out" | grep -qi "$3"; then
@@ -1833,7 +1852,7 @@ red() { # <label> <expect-rc> <expect-substring>
     bad "$1 — rc=$rc (want $2); output: $(printf '%s' "$out" | head -3 | tr '\n' ' ')"
   fi
 }
-receipt() { [ -f .claude/.spec-red ] && echo yes || echo no; }
+receipt() { [ -f $SPD/.spec-red ] && echo yes || echo no; }
 
 setup_repo; phase start v; phase 3
 printf 'exit 1\n' > .claude/spec-gate-test-cmd      # tests fail = RED
@@ -2054,17 +2073,17 @@ expect_b "a close-out answer does not open 2 -> 3" ASK '.claude/hooks/phase.sh 3
 
 # The receipt is the file that says the user said yes, so it is the one the model
 # must never be able to write. Every vector, the same as the other state files.
-expect_w "the approval receipt is not writable"    DENY .claude/.spec-approval
-expect_b "echo into the receipt denied"            DENY 'echo verdict=approve > .claude/.spec-approval'
-expect_b "cp onto the receipt denied"              DENY 'cp /tmp/x .claude/.spec-approval'
-expect_b "rm of the receipt denied"                DENY 'rm .claude/.spec-approval'
-expect_b "naming it at all is denied"              DENY 'cat .claude/.spec-approval'
+expect_w "the approval receipt is not writable"    DENY .git/spec-gate/.spec-approval
+expect_b "echo into the receipt denied"            DENY 'echo verdict=approve > .git/spec-gate/.spec-approval'
+expect_b "cp onto the receipt denied"              DENY 'cp /tmp/x .git/spec-gate/.spec-approval'
+expect_b "rm of the receipt denied"                DENY 'rm .git/spec-gate/.spec-approval'
+expect_b "naming it at all is denied"              DENY 'cat .git/spec-gate/.spec-approval'
 
 # Answering while the workflow is off must not leave a receipt lying around for
 # the next task to spend.
 phase off
 answer spec 'Approve the spec'
-if [ ! -e .claude/.spec-approval ]; then
+if [ ! -e $SPD/.spec-approval ]; then
   ok "no receipt is written while the gate is disarmed"
 else
   bad "a receipt was written with no phase file"
@@ -2152,7 +2171,7 @@ group "Close-out at a slice boundary offers the next slice"
 # used it only in the no-receipt fallback, so it fired when the model skipped the
 # question and stayed silent when the model asked properly.
 setup_repo; phase start sliced
-printf 'phase=5\ntask=sliced\nslice=1/8\n' > .claude/.spec-phase
+printf 'phase=5\ntask=sliced\nslice=1/8\n' > $SPD/.spec-phase
 
 Q=$(gate_q close-out)
 printf '%s' "$Q" | grep -qi 'slice 1 of 8' \
@@ -2197,7 +2216,7 @@ done
 
 # The last slice is the case close-out was written for, and it must not grow a
 # next-slice option that goes nowhere.
-printf 'phase=5\ntask=sliced\nslice=8/8\n' > .claude/.spec-phase
+printf 'phase=5\ntask=sliced\nslice=8/8\n' > $SPD/.spec-phase
 Q=$(gate_q close-out)
 printf '%s' "$Q" | grep -qi 'slice' \
   && bad "the final slice is asked about as though more were coming: '$Q'" \
@@ -2208,7 +2227,7 @@ printf '%s' "$Q" | grep -qi 'slice' \
   || ok "no next slice is offered once the last one is reviewed"
 
 # An unsliced task must be indistinguishable from before any of this existed.
-printf 'phase=5\ntask=sliced\nslice=1/1\n' > .claude/.spec-phase
+printf 'phase=5\ntask=sliced\nslice=1/1\n' > $SPD/.spec-phase
 .claude/hooks/phase.sh ask close-out 2>/dev/null | grep -qiE 'slice' \
   && bad "a 1/1 task is asked about slices it never had" \
   || ok "a 1/1 task closes out with no slice wording"
@@ -2299,7 +2318,7 @@ setup_repo; phase start v; phase 2
 printf 'the spec\n' > docs/specs/demo.md
 git add -A >/dev/null 2>&1; git commit -qm spec
 answer spec 'Approve the spec'
-if [ -e .claude/.spec-approval ]; then
+if [ -e $SPD/.spec-approval ]; then
   ok "the receipt was actually written (the check below means something)"
 else
   bad "no receipt written — the arming check below would pass vacuously"
@@ -2313,8 +2332,11 @@ fi
 # The install block in the README is the only thing that puts it there, so the
 # fixture and the docs have to agree or this test proves nothing about a real
 # install.
-for n in .spec-phase .spec-baseline .spec-red .spec-approval .spec-scaffold \
-         .spec-validation spec-journal.md review-log.jsonl; do
+# Two names, not eight. The six phase-state files are under .git/spec-gate/ and
+# never enter the working tree, so there is nothing for a .gitignore to say about
+# them and nothing an install can leave out — which is the failure this loop was
+# written for, made structural instead of checked.
+for n in spec-journal.md review-log.jsonl; do
   if grep -qF "$n" .gitignore && grep -qF "$n" "$SRC/README.md"; then
     ok "$n is gitignored by the documented install"
   else
@@ -2640,9 +2662,9 @@ kind "a failure behind a pipe still counts"  'printf "AssertionError\n"; exit 1 
 
 # The receipt says which kind of red it saw, so the claim it carries is the one
 # that was actually established.
-grep -q '^kind=assertion$' .claude/.spec-red \
+grep -q '^kind=assertion$' $SPD/.spec-red \
   && ok "the receipt records that the failure was an assertion" \
-  || bad "the receipt does not record the failure kind: $(grep -c . .claude/.spec-red) lines"
+  || bad "the receipt does not record the failure kind: $(grep -c . $SPD/.spec-red) lines"
 
 # Cross-language module-resolution patterns, checked directly so the list is
 # pinned rather than inferred from whichever runner the fixture happens to use.
@@ -2706,7 +2728,7 @@ expect_b "unasked, scaffold prompts rather than proceeds" ASK '.claude/hooks/pha
 # approval instead — which is where the surface being created is described.
 answer spec 'Approve the spec'
 expect_b "the plain approval does not authorise it"  DENY '.claude/hooks/phase.sh scaffold'
-[ -f .claude/.spec-scaffold ] && bad "scaffold armed itself without an answer" \
+[ -f $SPD/.spec-scaffold ] && bad "scaffold armed itself without an answer" \
                              || ok "a plain spec approval arms nothing"
 
 answer spec 'Approve, and create the files first'
@@ -2719,7 +2741,7 @@ expect_b "and 2 -> 3 still honours the same answer" ALLOW '.claude/hooks/phase.s
 # scaffold, and had no way to do it — a hard block introduced by making
 # import-red refuse. beforeShellExecution does carry `ask`, so the fallback every
 # other gate already has works there too.
-rm -f .claude/.spec-approval .claude/.spec-scaffold
+rm -f $SPD/.spec-approval $SPD/.spec-scaffold
 expect_b "unasked, scaffold falls back to a prompt" ASK '.claude/hooks/phase.sh scaffold'
 reason=$(guard_reason "$(pl_bash '.claude/hooks/phase.sh scaffold')")
 printf '%s' "$reason" | grep -qi 'not been approved' \
@@ -2739,11 +2761,11 @@ answer spec 'Approve, and create the files first'
 printf 'and one more requirement nobody approved\n' >> docs/specs/newfeature.md
 expect_b "a stale answer is not re-prompted"   DENY '.claude/hooks/phase.sh scaffold'
 answer spec 'Approve, and create the files first'
-printf 'phase=2\ntask=newfeature\nslice=1/2\n' > .claude/.spec-phase
+printf 'phase=2\ntask=newfeature\nslice=1/2\n' > $SPD/.spec-phase
 expect_b "an expired answer is not re-prompted" DENY '.claude/hooks/phase.sh scaffold'
-printf 'phase=2\ntask=newfeature\nslice=1/1\n' > .claude/.spec-phase
+printf 'phase=2\ntask=newfeature\nslice=1/1\n' > $SPD/.spec-phase
 .claude/hooks/phase.sh scaffold >/dev/null 2>&1
-[ -f .claude/.spec-scaffold ] && ok "scaffold mode is recorded on disk" \
+[ -f $SPD/.spec-scaffold ] && ok "scaffold mode is recorded on disk" \
                              || bad "phase.sh scaffold left no marker"
 printf '%s' "$(.claude/hooks/phase.sh status 2>&1)" | grep -qi 'scaffold' \
   && ok "status says the gate is in scaffold mode" \
@@ -2768,9 +2790,9 @@ git add src/scaffolded.ts >/dev/null 2>&1
 expect_w "and the same file after staging"  ALLOW src/scaffolded.ts
 expect_gate "staging it is not a phase violation" 0
 git rm -q --cached src/scaffolded.ts >/dev/null 2>&1; rm -f src/scaffolded.ts
-expect_w "phase state is still not writable"   DENY  .claude/.spec-phase
-expect_w "and neither is the scaffold marker"  DENY  .claude/.spec-scaffold
-expect_b "naming the marker at all is denied"  DENY  'rm .claude/.spec-scaffold'
+expect_w "phase state is still not writable"   DENY  .git/spec-gate/.spec-phase
+expect_w "and neither is the scaffold marker"  DENY  .git/spec-gate/.spec-scaffold
+expect_b "naming the marker at all is denied"  DENY  'rm .git/spec-gate/.spec-scaffold'
 
 # Both layers have to agree, or prevention and detection contradict each other
 # on the same file. The Stop scan asks git the same question the guard did.
@@ -2793,21 +2815,21 @@ out=$(.claude/hooks/phase.sh red 2>&1); rc=$?
 # approval the user already gave still covers it.
 printf 'export const parse = () => null\n' > src/parser.ts
 .claude/hooks/phase.sh 3 >/dev/null 2>&1
-[ -f .claude/.spec-scaffold ] && bad "the scaffold marker survived a phase change" \
+[ -f $SPD/.spec-scaffold ] && bad "the scaffold marker survived a phase change" \
                              || ok "advancing to Phase 3 clears scaffold mode"
 expect_w "and production is blocked again at Phase 3" DENY src/another.ts
 
 # Scaffold belongs to Phase 2 and nowhere else. This is what makes it unable to
 # serve as the free retreat a numbered phase would have been.
 for p in 1 3 4 5; do
-  printf 'phase=%s\ntask=newfeature\nslice=1/1\n' "$p" > .claude/.spec-phase
+  printf 'phase=%s\ntask=newfeature\nslice=1/1\n' "$p" > $SPD/.spec-phase
   .claude/hooks/phase.sh scaffold >/dev/null 2>&1
-  [ -f .claude/.spec-scaffold ] && bad "scaffold armed from phase $p" \
+  [ -f $SPD/.spec-scaffold ] && bad "scaffold armed from phase $p" \
                                || ok "scaffold is refused at phase $p"
 done
-printf 'phase=2\ntask=newfeature\nslice=1/1\n' > .claude/.spec-phase
+printf 'phase=2\ntask=newfeature\nslice=1/1\n' > $SPD/.spec-phase
 .claude/hooks/phase.sh off >/dev/null 2>&1
-[ -f .claude/.spec-scaffold ] && bad "off left the scaffold marker behind" \
+[ -f $SPD/.spec-scaffold ] && bad "off left the scaffold marker behind" \
                              || ok "off clears scaffold mode too"
 
 group "One tree per task: the gate fails closed on a split"
@@ -2845,7 +2867,7 @@ expect_b "but a write through Bash is denied" DENY  'echo x > src/x.ts'
 # exists to close, from the mirror direction. The third one disarms the gate.
 expect_b "a write INTO the armed tree"       DENY  "echo x > $MAIN/src/x.ts"
 expect_b "a cp INTO the armed tree"          DENY  "cp /tmp/e $MAIN/src/x.ts"
-expect_b "rewriting the armed tree's state"  DENY  "printf 'phase=5' > $MAIN/.claude/.spec-phase"
+expect_b "rewriting the armed tree's state"  DENY  "printf 'phase=5' > $MAIN/.git/spec-gate/.spec-phase"
 # The escape hatch matched *phase.sh* anywhere in the command, so naming it in a
 # comment or a string skipped the check entirely.
 expect_b "phase.sh in a comment is not it"   DENY  'echo x > src/x.ts # phase.sh'
@@ -2886,7 +2908,7 @@ printf '%s' "$BOUT" | grep -qF "$MAIN" \
   || bad "brief does not say where the task actually is: '$BOUT'"
 
 out=$("$MAIN"/.claude/hooks/phase.sh 4 2>&1)
-[ "$(sed -n 's/^phase=//p' "$MAIN/.claude/.spec-phase" | head -1)" = 3 ] \
+[ "$(sed -n 's/^phase=//p' "$MAIN/$SPD/.spec-phase" | head -1)" = 3 ] \
   && ok "phase.sh does not advance a task living in another tree" \
   || bad "the cross-tree call moved the real state"
 # "not started" is the OLD answer and it is wrong: something IS started, next
@@ -2908,7 +2930,7 @@ printf '%s' "$out" | grep -qF "$MAIN" \
 # task does not have it.
 cd "$MAIN" || exit 1
 export CLAUDE_PROJECT_DIR="$MAIN"
-printf 'phase=5\ntask=feature\nslice=1/1\n' > "$MAIN/.claude/.spec-phase"
+printf 'phase=5\ntask=feature\nslice=1/1\n' > "$MAIN/$SPD/.spec-phase"
 printf 'someone elses branch\n' > "$WT/src/unrelated.ts"
 rc=$(gate)
 [ "$rc" = 0 ] && ok "an unrelated dirty worktree is not this task's business" \
@@ -2924,7 +2946,7 @@ rm -rf "$WT/docs/specs" "$WT/src/newthing.ts" "$WT/src/unrelated.ts"
 rc=$(gate)
 [ "$rc" = 0 ] && ok "and goes quiet once no related tree is dirty" \
               || bad "the Stop gate stayed blocked with no related tree left (exit $rc)"
-printf 'phase=3\ntask=feature\nslice=1/1\n' > "$MAIN/.claude/.spec-phase"
+printf 'phase=3\ntask=feature\nslice=1/1\n' > "$MAIN/$SPD/.spec-phase"
 cd "$WT" || exit 1
 export CLAUDE_PROJECT_DIR="$WT"
 
@@ -2951,7 +2973,7 @@ expect_w "a path outside any worktree is ignored"  ALLOW /tmp/scratch.ts
 cd "$WT" || exit 1
 export CLAUDE_PROJECT_DIR="$WT"
 "$MAIN"/.claude/hooks/phase.sh start wt-task >/dev/null 2>&1
-[ -f "$WT/.claude/.spec-phase" ] \
+[ -f "$(gate_dir_of "$WT")/.spec-phase" ] \
   && bad "start armed a second tree while another was already armed" \
   || ok "start is refused while a sibling tree holds the task"
 
@@ -2964,7 +2986,7 @@ cd "$WT" || exit 1
 export CLAUDE_PROJECT_DIR="$WT"
 "$MAIN"/.claude/hooks/phase.sh start wt-task >/dev/null 2>&1
 "$MAIN"/.claude/hooks/phase.sh 3 >/dev/null 2>&1
-[ "$(sed -n 's/^phase=//p' "$WT/.claude/.spec-phase" 2>/dev/null | head -1)" = 3 ] \
+[ "$(sed -n 's/^phase=//p' "$(gate_dir_of "$WT")/.spec-phase" 2>/dev/null | head -1)" = 3 ] \
   && ok "once the other tree is disarmed, this one arms normally" \
   || bad "the reconciliation the refusal names does not work"
 expect_w "the newly armed tree denies production" DENY  "$WT/src/x.ts"
@@ -2998,7 +3020,7 @@ phase start jrnl; phase 2; phase 3; phase 4 --force
 .claude/hooks/phase.sh 5 >/dev/null 2>&1 \
   && bad "4 -> 5 advanced with no validation report on record" \
   || ok "4 -> 5 refused without a validation report"
-VP=$(sed -n 's/^phase=//p' .claude/.spec-phase | head -1)
+VP=$(sed -n 's/^phase=//p' $SPD/.spec-phase | head -1)
 [ "$VP" = 4 ] && ok "and the refusal left the phase at 4" \
   || bad "refused but the phase moved to '$VP'"
 
@@ -3006,7 +3028,7 @@ printf 'Commands: make test\nSource: the Makefile\nResult: pass\nNot covered: ty
   | .claude/hooks/phase.sh validation >/dev/null 2>&1 \
   && ok "phase.sh validation records the report" \
   || bad "phase.sh validation failed inside Phase 4"
-[ -f .claude/.spec-validation ] && ok "and writes the marker" \
+[ -f $SPD/.spec-validation ] && ok "and writes the marker" \
   || bad "no .spec-validation marker was written"
 grep -q 'VALIDATION REPORT' .claude/spec-journal.md 2>/dev/null \
   && ok "and the report lands in the journal" \
@@ -3019,7 +3041,7 @@ grep -q 'make test' .claude/spec-journal.md 2>/dev/null \
   || bad "4 -> 5 still refused with a report on record"
 
 # The marker is spent by the phase it described, exactly like the RED receipt.
-[ -f .claude/.spec-validation ] \
+[ -f $SPD/.spec-validation ] \
   && bad "the validation marker survived the phase change" \
   || ok "the marker is cleared by the phase change"
 # A plain retreat: 5 -> 4 asserts nothing, so there is no check for --force to
@@ -3045,10 +3067,10 @@ group "the validation marker is phase state, not the model's to write"
 setup_repo
 phase start vstate; phase 2; phase 3; phase 4 --force
 
-expect_w "Write to the validation marker denied"  DENY  .claude/.spec-validation
-expect_w "Edit to it denied too"                  DENY  .claude/.spec-validation Edit
-expect_b "forging the marker from bash denied"    DENY  'printf x > .claude/.spec-validation'
-expect_b "and removing it is denied"              DENY  'rm -f .claude/.spec-validation'
+expect_w "Write to the validation marker denied"  DENY  .git/spec-gate/.spec-validation
+expect_w "Edit to it denied too"                  DENY  .git/spec-gate/.spec-validation Edit
+expect_b "forging the marker from bash denied"    DENY  'printf x > .git/spec-gate/.spec-validation'
+expect_b "and removing it is denied"              DENY  'rm -f .git/spec-gate/.spec-validation'
 # The command that legitimately writes it must still get through, or the only
 # way past the gate is the override.
 expect_b "phase.sh validation is still allowed"   ALLOW '.claude/hooks/phase.sh validation'
@@ -3059,7 +3081,7 @@ expect_b "phase.sh validation is still allowed"   ALLOW '.claude/hooks/phase.sh 
 printf '' | .claude/hooks/phase.sh validation >/dev/null 2>&1 \
   && bad "an empty validation report was accepted" \
   || ok "an empty validation report is refused"
-[ -f .claude/.spec-validation ] \
+[ -f $SPD/.spec-validation ] \
   && bad "the empty report still wrote the marker" \
   || ok "and it wrote no marker"
 printf '   \n\n  \n' | .claude/hooks/phase.sh validation >/dev/null 2>&1 \
@@ -3083,9 +3105,9 @@ phase start vpin; phase 2; phase 3; phase 4 --force
 .claude/hooks/phase.sh slices 2 >/dev/null 2>&1
 printf 'Commands: make test\nResult: pass\n' \
   | .claude/hooks/phase.sh validation >/dev/null 2>&1
-grep -q '^slice=1/2$' .claude/.spec-validation \
+grep -q '^slice=1/2$' $SPD/.spec-validation \
   && ok "the marker records the slice it was written on" \
-  || bad "the marker does not carry the slice: $(cat .claude/.spec-validation)"
+  || bad "the marker does not carry the slice: $(cat $SPD/.spec-validation)"
 .claude/hooks/phase.sh slices 3 >/dev/null 2>&1
 .claude/hooks/phase.sh 5 >/dev/null 2>&1 \
   && bad "a report written for slice 1/2 cleared 4 -> 5 after a re-slice" \
@@ -3099,7 +3121,7 @@ printf '%s' "$VOUT" | grep -q 'different point in this task' \
 # Two rounds of review moved the *token* path forward — ARG, the write-target
 # loop — and left the phase-state check reading raw command text. The text is
 # not what the shell runs. `.spec-vali''dation` reaches the same inode while
-# containing no `.spec-validation`; `rm -f .claude/.spec-*` names no state file
+# containing no `.spec-validation`; `rm -f $SPD/.spec-*` names no state file
 # until the glob expands; `git clean -fdx` names nothing at all and removes
 # every one of them, because they are gitignored by design. All of these were
 # ALLOW, so the 4 -> 5 marker was the model's to write after all, and the whole
@@ -3109,26 +3131,33 @@ setup_repo
 phase start ptok; phase 2; phase 3
 
 expect_b "rm through a glob that covers the state files" \
-  DENY 'rm -f .claude/.spec-*'
+  DENY 'rm -f .git/spec-gate/.spec-*'
 expect_b "git clean -fdx, which removes every gitignored state file" \
   DENY 'git clean -fdx'
 expect_b "and -X, which removes the ignored ones and nothing else" \
   DENY 'git clean -fdX'
 expect_b "mv of a quote-split state path" \
-  DENY "mv .claude/.spec-pha''se /tmp/parked"
+  DENY "mv .git/spec-gate/.spec-pha''se /tmp/parked"
 expect_b "truncating a quote-split state path to nothing" \
-  DENY "truncate -s 0 .claude/.spec-pha''se"
+  DENY "truncate -s 0 .git/spec-gate/.spec-pha''se"
 expect_b "a backslash-split state path" \
-  DENY 'rm -f .claude/.spec-phas\e'
+  DENY 'rm -f .git/spec-gate/.spec-phas\e'
 expect_b "rm -rf on the directory that holds them" \
+  DENY 'rm -rf .git/spec-gate'
+expect_b "and on the git directory that holds that" \
+  DENY 'rm -rf .git'
+# .claude/ no longer holds any phase state, but it does hold the journal and the
+# review log — the record of what previous sessions did and every verdict a
+# reviewer returned, neither of which git has a copy of.
+expect_b "rm -rf on the directory holding the journal and the log" \
   DENY 'rm -rf .claude'
 # A quoted string handed to a shell is not data, it is shell — the rule this
 # suite already applies to write targets. Reading the raw text used to cover
 # this for free; reading tokens does not, unless the payload is re-read.
 expect_b "a state path inside a nested shell payload" \
-  DENY 'bash -c "rm -f .claude/.spec-red && echo done"'
+  DENY 'bash -c "rm -f .git/spec-gate/.spec-red && echo done"'
 expect_b "and one nested two deep" \
-  DENY 'sh -c "bash -c \"rm -f .claude/.spec-phase\""'
+  DENY 'sh -c "bash -c \"rm -f .git/spec-gate/.spec-phase\""'
 
 # Blunt is fine on the state files themselves; blunt on their directory is not.
 # `.claude` holds the hooks, the settings and the skills, and the model reads
@@ -3144,7 +3173,7 @@ expect_b "and an ordinary rm is not a phase question" ALLOW 'rm -rf build/'
 # denied a journal entry for describing the state file it was denied from
 # touching — the workflow's own record blocked by the gate it records.
 expect_b "a journal entry may name a state file" ALLOW ".claude/hooks/phase.sh journal <<'EOF'
-tried to write .claude/.spec-phase directly and the guard refused, correctly
+tried to write .git/spec-gate/.spec-phase directly and the guard refused, correctly
 EOF"
 
 # Phase >= 4 returns to the normal permission flow, and that early exit sat
@@ -3152,8 +3181,8 @@ EOF"
 # the validation marker exists in, the substring was the whole defence.
 setup_repo; phase start ptok3; phase 2; phase 3; phase 4 --force
 expect_b "the split marker write is refused at Phase 4" \
-  DENY "printf 'task=ptok3\nslice=1/1\n' > .claude/.spec-vali''dation"
-[ -f .claude/.spec-validation ] \
+  DENY "printf 'task=ptok3\nslice=1/1\n' > .git/spec-gate/.spec-vali''dation"
+[ -f $SPD/.spec-validation ] \
   && bad "the refused command still wrote the marker" \
   || ok "and no marker was written"
 .claude/hooks/phase.sh 5 >/dev/null 2>&1 \
@@ -3165,7 +3194,7 @@ expect_b "the split marker write is refused at Phase 4" \
 # was placed above the exit to prevent.
 setup_repo; phase start ptok4; phase 2; phase 3; phase 4 --force; phase 5
 expect_b "and a split phase rewrite is refused at Phase 5" \
-  DENY "printf 'phase=4\ntask=ptok4\nslice=1/1\n' > .claude/.spec-pha''se"
+  DENY "printf 'phase=4\ntask=ptok4\nslice=1/1\n' > .git/spec-gate/.spec-pha''se"
 
 ################################################################################
 # 5 --force and 4 --force are spelled the same and skip different checks. One
@@ -3258,60 +3287,72 @@ expect_b "the real thing is still gated" \
   DENY '.claude/hooks/phase.sh 4 --force'
 
 ################################################################################
-# An untracked state file counts as work owed review, so a name the install
-# forgot to gitignore arms the gate on the gate's own bookkeeping — and nothing
-# clears it, because the path is meant to be ignored and cannot be committed.
+# An untracked file the gate writes counts as work owed review, so a name the
+# install forgot to gitignore arms the gate on the gate's own bookkeeping — and
+# nothing clears it, because the path is meant to be ignored and cannot be
+# committed.
+#
+# Most of that class is now structurally impossible rather than excluded: the six
+# phase-state files live under .git/spec-gate/, which `git status` and
+# `git ls-files` never report, so no .gitignore is involved and none can be
+# forgotten. What is left in the tree is the journal and the review log, and the
+# exclusion still has to hold for those without a correct install.
 group "the gate does not arm on its own state files"
 setup_repo
-# Deliberately the pre-fix .gitignore: this is the install that shipped, and the
-# exclusion has to hold without it.
-printf '.claude/.spec-phase\n.claude/.spec-baseline\n.claude/.spec-red\n' > .gitignore
+# Deliberately an EMPTY .gitignore: the exclusion has to hold with no install
+# having been done at all.
+: > .gitignore
 git add -A >/dev/null 2>&1; git commit -qm base >/dev/null 2>&1
 phase start vexcl; phase 2
 
-# Each marker is checked at a phase where it is actually on disk. Every
-# transition deletes most of them, so a single checkpoint at the end would be
-# asserting that files which no longer exist are not listed — which passes
-# whatever the exclusion list says, and proves nothing.
 printf 'the spec\n' > docs/specs/vexcl.md
 answer spec 'Approve the spec'
 .claude/hooks/phase.sh scaffold >/dev/null 2>&1
 printf 'a note\n' | .claude/hooks/phase.sh journal >/dev/null 2>&1
 printf '{"t":"now","agent":"adversary","msg":"x"}\n' > .claude/review-log.jsonl
-for n in .spec-scaffold .spec-approval spec-journal.md review-log.jsonl; do
+for n in spec-journal.md review-log.jsonl; do
   [ -e ".claude/$n" ] && ok "$n exists, so the pending check below is not vacuous" \
     || bad "$n was never created — the check below would pass on nothing"
 done
 # review_pending_paths is what the Stop gate and the 5 -> 3 boundary both read,
 # so it is asked directly rather than through a command that summarises it.
 PEND=$( . "$SRC/hooks/phase-policy.sh"; PROJECT_DIR="$PWD" review_pending_paths )
-for n in .spec-scaffold .spec-approval spec-journal.md review-log.jsonl; do
+for n in spec-journal.md review-log.jsonl; do
   printf '%s' "$PEND" | grep -q "$n" \
     && bad "$n is owed review — the gate armed on its own bookkeeping" \
     || ok "$n does not arm the review gate even when ungitignored"
 done
 
-# The receipt is written through a temp file beside itself. The exclusion list
-# holds exact names, and `.spec-approval` is not `.spec-approval.tmp.4321` — so
-# on an install whose .gitignore lacks the glob, a Stop scan landing inside that
-# window arms on the write of a receipt, which is the exact failure this list
-# exists to make impossible without a correct install.
-printf 'x\n' > ".claude/.spec-approval.tmp.$$"
+# The phase state cannot arm it at all now, and that is a stronger claim than
+# being excluded: there is no path for a fingerprint built out of git to see.
+for n in .spec-scaffold .spec-approval; do
+  [ -e "$SPD/$n" ] && ok "$n exists under the git dir, so this check is not vacuous" \
+    || bad "$n was never created — the check below would pass on nothing"
+  [ -e ".claude/$n" ] && bad "$n is still in the working tree" \
+    || ok "$n is not in the working tree at all"
+  printf '%s' "$PEND" | grep -q "$n" \
+    && bad "$n is owed review" || ok "$n cannot arm the review gate"
+done
+
+# The receipt is written through a temp file beside itself, which is now also
+# outside the tree. Checked anyway: the exclusion holds exact names, and the day
+# a receipt moves back into the tree this is the assertion that catches it.
+printf 'x\n' > "$SPD/.spec-approval.tmp.$$"
 PEND=$( . "$SRC/hooks/phase-policy.sh"; PROJECT_DIR="$PWD" review_pending_paths )
 printf '%s' "$PEND" | grep -q '.spec-approval.tmp' \
   && bad "the approval receipt's temp file is owed review" \
   || ok "and neither does the temp file it is written through"
-rm -f ".claude/.spec-approval.tmp.$$"
+rm -f "$SPD/.spec-approval.tmp.$$"
 
 phase 3; phase 4 --force
 printf 'Commands: make test\nResult: pass\n' \
   | .claude/hooks/phase.sh validation >/dev/null 2>&1
-[ -e .claude/.spec-validation ] && ok ".spec-validation exists, so the check below is not vacuous" \
+[ -e $SPD/.spec-validation ] && ok ".spec-validation exists, so the check below is not vacuous" \
   || bad ".spec-validation was never created"
 PEND=$( . "$SRC/hooks/phase-policy.sh"; PROJECT_DIR="$PWD" review_pending_paths )
 printf '%s' "$PEND" | grep -q '.spec-validation' \
   && bad ".spec-validation is owed review" \
-  || ok ".spec-validation does not arm the review gate even when ungitignored"
+  || ok ".spec-validation does not arm the review gate"
 
 # The other side of the same coin, and the reason this is a list of exact names
 # rather than a hole in .claude/: ordinary files there are still work.
@@ -3536,7 +3577,7 @@ setup_repo; phase start budget; phase 2; phase 3
 BIGARGS=$(python3 -c "print(' '.join('w%d' % i for i in range(6000)))")
 T0=$(date +%s)
 expect_b "a command with more tokens than the budget is refused, not scanned" \
-  DENY "bash $BIGARGS ; rm -f .claude/.spec-phase"
+  DENY "bash $BIGARGS ; rm -f .git/spec-gate/.spec-phase"
 T1=$(date +%s)
 [ $((T1 - T0)) -le 5 ] \
   && ok "and the refusal lands in $((T1 - T0))s, well inside the 15s timeout" \
@@ -3575,14 +3616,14 @@ group "a target the shell computes is refused at every phase"
 setup_repo; phase start runtime; phase 2; phase 3; phase 4 --force
 
 expect_b "a command-substituted marker path is refused at Phase 4" \
-  DENY 'printf "task=runtime\nslice=1/1\n" > "$(echo .claude/.spec-validation)"'
-[ -f .claude/.spec-validation ] \
+  DENY 'printf "task=runtime\nslice=1/1\n" > "$(echo .git/spec-gate/.spec-validation)"'
+[ -f $SPD/.spec-validation ] \
   && bad "the refused command still wrote the marker" \
   || ok "and no marker was written"
 expect_b "so is one built from a variable" \
   DENY 'V=.spec-validation; printf "task=runtime\nslice=1/1\n" > .claude/$V'
 expect_b "and one built with backticks" \
-  DENY 'printf x > `echo .claude/.spec-phase`'
+  DENY 'printf x > `echo .git/spec-gate/.spec-phase`'
 .claude/hooks/phase.sh 5 >/dev/null 2>&1 \
   && bad "4 -> 5 cleared with nothing run" \
   || ok "so 4 -> 5 still refuses"
@@ -3601,23 +3642,23 @@ group "the deletion routes the verb list missed"
 setup_repo; phase start spell; phase 2; phase 3
 
 expect_b "a glob relative to a cd'd directory" \
-  DENY 'cd .claude && rm -f .spec-*'
+  DENY 'cd .git/spec-gate && rm -f .spec-*'
 expect_b "find -delete by name" \
-  DENY "find .claude -name '.spec-*' -delete"
+  DENY "find .git/spec-gate -name '.spec-*' -delete"
 expect_b "find -delete with no name at all" \
-  DENY 'find .claude -type f -delete'
+  DENY 'find .git/spec-gate -type f -delete'
 expect_b "find -exec rm" \
-  DENY 'find .claude -name ".spec-*" -exec rm {} ;'
+  DENY 'find .git/spec-gate -name ".spec-*" -exec rm {} ;'
 expect_b "git stash --all, which removes ignored files exactly as clean -x does" \
   DENY 'git stash --all'
 expect_b "and its short spelling" \
   DENY 'git stash -a'
 expect_b "an interpreter given the unlink as an argument" \
-  DENY "python3 -c \"import os; os.remove('.claude/.spec-phase')\""
+  DENY "python3 -c \"import os; os.remove('.git/spec-gate/.spec-phase')\""
 expect_b "and another interpreter, same shape" \
-  DENY 'node -e "require(`fs`).unlinkSync(`.claude/.spec-phase`)"'
+  DENY 'node -e "require(`fs`).unlinkSync(`.git/spec-gate/.spec-phase`)"'
 expect_b "a fused -c flag, which is one token starting with a dash" \
-  DENY "bash -c'rm -f .claude/.spec-red && echo x'"
+  DENY "bash -c'rm -f .git/spec-gate/.spec-red && echo x'"
 expect_b "an env-assignment prefix whose value contains a slash" \
   DENY 'FOO=a/b git clean -fdx'
 
@@ -3639,7 +3680,7 @@ group "the gate markers are authenticated, not merely present"
 setup_repo; phase start forge; phase 2; phase 3; phase 4 --force
 
 # Written by hand, with every field the tripwire reads set correctly.
-printf 'task=forge\nslice=1/1\n' > .claude/.spec-validation
+printf 'task=forge\nslice=1/1\n' > $SPD/.spec-validation
 .claude/hooks/phase.sh 5 >/dev/null 2>&1 \
   && bad "a hand-written validation marker cleared 4 -> 5" \
   || ok "a hand-written validation marker does not clear 4 -> 5"
@@ -3667,8 +3708,8 @@ Commands: make test
 Result:   pass
 EOF
 sed 's/^mac=.*/mac=0000000000000000000000000000000000000000000000000000000000000000/' \
-  .claude/.spec-validation > .claude/.spec-validation.x
-mv .claude/.spec-validation.x .claude/.spec-validation
+  $SPD/.spec-validation > $SPD/.spec-validation.x
+mv $SPD/.spec-validation.x $SPD/.spec-validation
 .claude/hooks/phase.sh 5 >/dev/null 2>&1 \
   && bad "a marker with a wrong authenticator still cleared 4 -> 5" \
   || ok "a wrong authenticator voids the marker even with the fields intact"
@@ -3696,7 +3737,7 @@ git clean -fdx >/dev/null 2>&1
 # that contradicts the gate it is describing is the one thing brief must not do.
 group "brief agrees with the tripwire about the marker"
 setup_repo; phase start bstale; phase 2; phase 3; phase 4 --force
-printf 'task=somethingelse\nslice=9/9\n' > .claude/.spec-validation
+printf 'task=somethingelse\nslice=9/9\n' > $SPD/.spec-validation
 BOUT=$(.claude/hooks/phase.sh brief 2>&1)
 printf '%s' "$BOUT" | grep -qi 'a validation report is recorded' \
   && bad "brief called a stale marker a recorded report" \
@@ -3727,9 +3768,9 @@ group "the configured test command cannot disarm the gate"
 setup_repo; phase start tcmd; phase 2; phase 3
 echo 'it("fails", () => expect(1).toBe(2))' > src/x.test.ts
 
-printf 'rm -f .claude/.spec-phase .claude/.spec-baseline; exit 1\n' > .claude/spec-gate-test-cmd
+printf 'rm -f .git/spec-gate/.spec-phase .git/spec-gate/.spec-baseline; exit 1\n' > .claude/spec-gate-test-cmd
 .claude/hooks/phase.sh red >/dev/null 2>&1
-[ -f .claude/.spec-phase ] \
+[ -f $SPD/.spec-phase ] \
   && ok "phase.sh red did not let its test command remove the phase state" \
   || bad "the configured test command disarmed the workflow"
 
@@ -3737,7 +3778,7 @@ setup_repo; phase start tcmd2; phase 2; phase 3
 echo 'it("fails", () => expect(1).toBe(2))' > src/x.test.ts
 printf 'rm -rf .claude; exit 1\n' > .claude/spec-gate-test-cmd
 .claude/hooks/phase.sh red >/dev/null 2>&1
-[ -f .claude/.spec-phase ] \
+[ -f $SPD/.spec-phase ] \
   && ok "nor to take the directory instead" \
   || bad "the configured test command removed the state directory"
 
@@ -3791,7 +3832,7 @@ setup_repo; phase start lexbudget; phase 2; phase 3
 MANY=$(python3 -c "print(' '.join('a%d' % i for i in range(200)))")
 T0=$(date +%s)
 expect_b "two hundred nested payloads exhaust the lex budget" \
-  DENY "bash $MANY ; rm -f .claude/.spec-phase"
+  DENY "bash $MANY ; rm -f .git/spec-gate/.spec-phase"
 T1=$(date +%s)
 [ $((T1 - T0)) -le 5 ] \
   && ok "and it refuses in $((T1 - T0))s rather than forking on" \
@@ -3837,25 +3878,25 @@ group "a heredoc handed to a shell is shell, not prose"
 setup_repo; phase start hdoc; phase 2; phase 3
 
 expect_b "bash reading its script from a heredoc" DENY 'bash <<EOF
-rm -f .claude/.spec-phase
+rm -f .git/spec-gate/.spec-phase
 EOF'
 expect_b "python3 reading its program from a heredoc" DENY 'python3 <<EOF
 import os
-os.remove(".claude/.spec-phase")
+os.remove(".git/spec-gate/.spec-phase")
 EOF'
 expect_b "and the explicit stdin form" DENY 'python3 - <<EOF
 import os
-os.remove(".claude/.spec-phase")
+os.remove(".git/spec-gate/.spec-phase")
 EOF'
 expect_b "a phase transition hidden in a heredoc" DENY 'bash <<EOF
 .claude/hooks/phase.sh 4 --force
 EOF'
 # The prose case is the whole reason bodies are data. It must stay allowed.
 expect_b "a journal entry naming a state file is still prose" ALLOW ".claude/hooks/phase.sh journal <<'EOF'
-tried to write .claude/.spec-phase directly and the guard refused, correctly
+tried to write .git/spec-gate/.spec-phase directly and the guard refused, correctly
 EOF"
 expect_b "and a heredoc into a file that is not a shell" ALLOW 'cat > docs/specs/notes.md <<EOF
-rm -f .claude/.spec-phase is what I was told not to do
+rm -f $SPD/.spec-phase is what I was told not to do
 EOF'
 
 ################################################################################
@@ -3925,9 +3966,9 @@ group "the state snapshot cannot be turned against the gate"
 setup_repo; phase start bak; phase 2; phase 3
 echo 'it("f", () => expect(1).toBe(2))' > src/x.test.ts
 
-printf 'rm -f .claude/.spec-phase; rm -rf .git/spec-gate-statebak; exit 1\n' > .claude/spec-gate-test-cmd
+printf 'rm -f .git/spec-gate/.spec-phase; rm -rf .git/spec-gate-statebak; exit 1\n' > .claude/spec-gate-test-cmd
 .claude/hooks/phase.sh red >/dev/null 2>&1
-[ -f .claude/.spec-phase ] \
+[ -f $SPD/.spec-phase ] \
   && ok "deleting the backup does not let the payload through" \
   || bad "the test command deleted the backup and disarmed the gate"
 
@@ -3936,7 +3977,7 @@ echo 'it("f", () => expect(1).toBe(2))' > src/x.test.ts
 printf 'D=$(ls -d .git/spec-gate-statebak 2>/dev/null); [ -n "$D" ] && printf "phase=4\\ntask=bak2\\nslice=1/1\\n" > "$D"/*spec-phase* ; exit 1\n' \
   > .claude/spec-gate-test-cmd
 .claude/hooks/phase.sh red >/dev/null 2>&1
-BP=$(sed -n 's/^phase=//p' .claude/.spec-phase 2>/dev/null | head -1)
+BP=$(sed -n 's/^phase=//p' $SPD/.spec-phase 2>/dev/null | head -1)
 [ "$BP" = 3 ] \
   && ok "rewriting the backup does not get installed as the restore" \
   || bad "the backup was rewritten and restored as phase=$BP"
@@ -3951,10 +3992,10 @@ echo 'it("f", () => expect(1).toBe(2))' > src/x.test.ts
 # directory rather than at the real TMPDIR, which is where this suite keeps its
 # own fixture — the sweep would otherwise delete the repo under test.
 mkdir -p "$WORK/sweep"
-printf 'rm -f .claude/.spec-phase; rm -rf "${TMPDIR%%/}"/* 2>/dev/null; exit 1\n' \
+printf 'rm -f $SPD/.spec-phase; rm -rf "${TMPDIR%%/}"/* 2>/dev/null; exit 1\n' \
   > .claude/spec-gate-test-cmd
 TMPDIR="$WORK/sweep" .claude/hooks/phase.sh red >/dev/null 2>&1
-[ -f .claude/.spec-phase ] \
+[ -f $SPD/.spec-phase ] \
   && ok "a payload sweeping TMPDIR cannot reach the snapshot" \
   || bad "the snapshot was found on disk and the gate was disarmed"
 [ -d .git/spec-gate-statebak ] \
@@ -4010,15 +4051,15 @@ group "a path is judged after the variable holding it is resolved"
 setup_repo; phase start resolv; phase 2; phase 3; phase 4 --force
 
 expect_b "the whole path in a variable, as a redirect target" \
-  DENY 'V=.claude/.spec-phase; printf "phase=4\ntask=t\nslice=1/1\n" > $V'
+  DENY 'V=.git/spec-gate/.spec-phase; printf "phase=4\ntask=t\nslice=1/1\n" > $V'
 expect_b "the signing key the same way" \
   DENY 'K=.git/spec-gate-key; printf deadbeef > $K'
 expect_b "and quoted" \
-  DENY 'V=.claude/.spec-validation; printf x > "$V"'
+  DENY 'V=.git/spec-gate/.spec-validation; printf x > "$V"'
 expect_b "and in braces" \
-  DENY 'V=.claude/.spec-red; printf x > ${V}'
+  DENY 'V=.git/spec-gate/.spec-red; printf x > ${V}'
 expect_b "the same variable handed to rm" \
-  DENY 'V=.claude/.spec-phase; rm -f $V'
+  DENY 'V=.git/spec-gate/.spec-phase; rm -f $V'
 # A variable that does not name state is ordinary work and must stay so.
 expect_b "an ordinary variable target is untouched" \
   ALLOW 'L=build/out.log; echo hi > $L'
@@ -4078,13 +4119,13 @@ group "a herestring handed to a shell is shell"
 setup_repo; phase start herestr; phase 2; phase 3
 
 expect_b "a shell reading its script from a herestring" \
-  DENY "bash <<< 'rm -f .claude/.spec-phase; echo gone'"
+  DENY "bash <<< 'rm -f .git/spec-gate/.spec-phase; echo gone'"
 expect_b "a transition hidden in one" \
   DENY "bash <<< '.claude/hooks/phase.sh 4 --force'"
 expect_b "a production write hidden in one" \
   DENY "bash <<< 'echo pwned > src/evil.ts'"
 expect_b "and an interpreter given one" \
-  DENY "python3 <<< 'import os; os.remove(\".claude/.spec-phase\")'"
+  DENY "python3 <<< 'import os; os.remove(\".git/spec-gate/.spec-phase\")'"
 # A herestring to something that is not a shell is data.
 expect_b "a herestring into grep is just input" ALLOW "grep -q orig <<< 'orig'"
 
@@ -4097,21 +4138,21 @@ group "a heredoc body belongs to the verb that opened it"
 setup_repo; phase start hdverb; phase 2; phase 3
 
 expect_b "a heredoc into a shell, piped onward" DENY 'bash <<EOF | cat
-rm -f .claude/.spec-phase
+rm -f .git/spec-gate/.spec-phase
 EOF'
 expect_b "a transition in one" DENY 'bash <<EOF | cat
 .claude/hooks/phase.sh 4 --force
 EOF'
 expect_b "an interpreter heredoc, piped onward" DENY 'python3 <<EOF | cat
 import os
-os.remove(".claude/.spec-phase")
+os.remove(".git/spec-gate/.spec-phase")
 EOF'
 expect_b "and one joined with &&" DENY 'bash <<EOF && echo done
-rm -f .claude/.spec-phase
+rm -f .git/spec-gate/.spec-phase
 EOF'
 # Prose piped onward is still prose.
 expect_b "a journal entry piped onward is not a program" ALLOW ".claude/hooks/phase.sh journal <<'EOF' | cat
-tried to write .claude/.spec-phase and the guard refused, correctly
+tried to write .git/spec-gate/.spec-phase and the guard refused, correctly
 EOF"
 
 ################################################################################
@@ -4176,7 +4217,7 @@ chan() {   # $1 = channel name, $2 = shell payload
 CHANNELS="bare dash_c nested herestring heredoc heredoc2 after_read seq"
 
 setup_repo; phase start cover; phase 2; phase 3
-for T in .claude/.spec-phase .claude/.spec-validation .git/spec-gate-key; do
+for T in $SPD/.spec-phase $SPD/.spec-validation .git/spec-gate-key; do
   for C in $CHANNELS; do
     expect_b "[$C] rm -f $T" DENY "$(chan "$C" "rm -f $T")"
   done
@@ -4187,7 +4228,7 @@ done
 # the right of an `=` was never looked at, and the resolver took the first
 # assignment rather than the last.
 setup_repo; phase start cover2; phase 2; phase 3
-for T in .claude/.spec-phase .git/spec-gate-key; do
+for T in $SPD/.spec-phase .git/spec-gate-key; do
   expect_b "[literal] $T"           DENY "rm -f $T"
   expect_b "[variable] $T"          DENY "V=$T; rm -f \$V"
   expect_b "[braced] $T"            DENY "V=$T; rm -f \${V}"
@@ -4226,15 +4267,15 @@ for C in $CHANNELS; do
 done
 # Prose that merely names a state file is not a command that touches one.
 expect_b "prose naming a state file stays prose" ALLOW ".claude/hooks/phase.sh journal <<'EOF'
-tried rm -f .claude/.spec-phase and the guard refused, correctly
+tried rm -f .git/spec-gate/.spec-phase and the guard refused, correctly
 EOF"
 expect_b "and a spec document may describe one" ALLOW 'cat > docs/specs/notes.md <<EOF
-never run rm -f .claude/.spec-phase
+never run rm -f .git/spec-gate/.spec-phase
 EOF'
 expect_b "even beside a real shell heredoc" ALLOW 'bash <<CH_A && cat > docs/specs/n2.md <<CH_B
 echo hello
 CH_A
-never run rm -f .claude/.spec-phase
+never run rm -f $SPD/.spec-phase
 CH_B'
 
 ################################################################################
@@ -4249,10 +4290,10 @@ echo 'it("f", () => expect(1).toBe(2))' > src/x.test.ts
 printf 'exit 1\n' > .claude/spec-gate-test-cmd
 
 python3 -c 'import sys
-sys.stdout.write("progress note\x1d.claude/.spec-phase\x1cphase=4\ntask=inject\nslice=1/1")' \
+sys.stdout.write("progress note\x1d$SPD/.spec-phase\x1cphase=4\ntask=inject\nslice=1/1")' \
   | .claude/hooks/phase.sh journal >/dev/null 2>&1
 .claude/hooks/phase.sh red >/dev/null 2>&1
-BP=$(sed -n 's/^phase=//p' .claude/.spec-phase 2>/dev/null | head -1)
+BP=$(sed -n 's/^phase=//p' $SPD/.spec-phase 2>/dev/null | head -1)
 [ "$BP" = 3 ] \
   && ok "a forged record in the journal does not rewrite the phase" \
   || bad "the journal injected a snapshot record and the phase became $BP"
@@ -4358,7 +4399,7 @@ expect_b "a force-validation answer does not buy 1 -> 5" DENY \
   '.claude/hooks/phase.sh 5 --force'
 expect_b "nor does it buy 1 -> 4"                       DENY \
   '.claude/hooks/phase.sh 4 --force'
-P=$(sed -n 's/^phase=//p' .claude/.spec-phase | head -1)
+P=$(sed -n 's/^phase=//p' $SPD/.spec-phase | head -1)
 [ "$P" = 1 ] && ok "and the phase did not move" || bad "the phase became $P"
 
 # phase.sh has to refuse it too. The guard is a hook, and a hook is exactly the
@@ -4366,7 +4407,7 @@ P=$(sed -n 's/^phase=//p' .claude/.spec-phase | head -1)
 # plugin is not installed, this script was the only thing left and it had no
 # adjacency check at all.
 .claude/hooks/phase.sh 5 --force >/dev/null 2>&1
-P=$(sed -n 's/^phase=//p' .claude/.spec-phase | head -1)
+P=$(sed -n 's/^phase=//p' $SPD/.spec-phase | head -1)
 [ "$P" = 1 ] \
   && ok "phase.sh refuses a non-adjacent --force on its own" \
   || bad "phase.sh 5 --force moved phase 1 to $P with no hook involved"
@@ -4374,10 +4415,10 @@ P=$(sed -n 's/^phase=//p' .claude/.spec-phase | head -1)
 # And it still works where it means something.
 phase 2; phase 3
 .claude/hooks/phase.sh 4 --force >/dev/null 2>&1
-P=$(sed -n 's/^phase=//p' .claude/.spec-phase | head -1)
+P=$(sed -n 's/^phase=//p' $SPD/.spec-phase | head -1)
 [ "$P" = 4 ] && ok "3 -> 4 --force still works" || bad "3 -> 4 --force refused, phase=$P"
 .claude/hooks/phase.sh 5 --force >/dev/null 2>&1
-P=$(sed -n 's/^phase=//p' .claude/.spec-phase | head -1)
+P=$(sed -n 's/^phase=//p' $SPD/.spec-phase | head -1)
 [ "$P" = 5 ] && ok "4 -> 5 --force still works" || bad "4 -> 5 --force refused, phase=$P"
 
 # A flag that names no check has nothing to override.
@@ -4405,7 +4446,7 @@ expect_b "a computed shell target is still refused at Phase 3" DENY 'echo x > $(
 # And phase state is off limits at 4 and 5 regardless: that check never depended
 # on the write scan.
 setup_repo; phase start structured3; phase 2; phase 3; phase 4 --force
-expect_w "phase state is still refused at Phase 4" DENY '.claude/.spec-phase'
+expect_w "phase state is still refused at Phase 4" DENY '.git/spec-gate/.spec-phase'
 
 ################################################################################
 # A redirect says where stdin comes from. It does not say where the PROGRAM comes
@@ -4427,7 +4468,7 @@ expect_b "-s with arguments is still stdin"         DENY 'bash -s 4 --force < .c
 expect_b "and the same through a pipe"              DENY 'cat .claude/hooks/phase.sh | bash -s 4 --force'
 # The payload of a visible program is still scanned — allowing the redirect must
 # not stop the program itself being read.
-expect_b "the visible payload is still read"        DENY 'echo hi | bash -c "rm -f .claude/.spec-red"'
+expect_b "the visible payload is still read"        DENY 'echo hi | bash -c "rm -f .git/spec-gate/.spec-red"'
 
 ################################################################################
 # The snapshot exists to keep the configured test command away from THE GATE, and
@@ -4458,9 +4499,9 @@ printf '%s' "$ROUT" | grep -q 'RED verified' \
 # Phase state itself is still put back, which is the whole point of the mechanism.
 setup_repo; phase start snapscope2; phase 2; phase 3
 echo 'it("f", () => expect(1).toBe(2))' > src/x.test.ts
-printf 'rm -f .claude/.spec-phase; exit 1\n' > .claude/spec-gate-test-cmd
+printf 'rm -f .git/spec-gate/.spec-phase; exit 1\n' > .claude/spec-gate-test-cmd
 .claude/hooks/phase.sh red >/dev/null 2>&1
-P=$(sed -n 's/^phase=//p' .claude/.spec-phase 2>/dev/null | head -1)
+P=$(sed -n 's/^phase=//p' $SPD/.spec-phase 2>/dev/null | head -1)
 [ "$P" = 3 ] \
   && ok "a test command that deletes the phase file has it restored" \
   || bad "the phase file was not restored (phase=${P:-gone})"
@@ -4469,16 +4510,16 @@ P=$(sed -n 's/^phase=//p' .claude/.spec-phase 2>/dev/null | head -1)
 # a restore that re-terminates a file puts back one that no longer verifies.
 setup_repo; phase start snapbytes; phase 2; phase 3
 echo 'it("f", () => expect(1).toBe(2))' > src/x.test.ts
-printf 'printf trailing >> .claude/.spec-red; exit 1\n' > .claude/spec-gate-test-cmd
-printf 'a\nb\n\n\n' > .claude/.spec-red
+printf 'printf trailing >> .git/spec-gate/.spec-red; exit 1\n' > .claude/spec-gate-test-cmd
+printf 'a\nb\n\n\n' > $SPD/.spec-red
 .claude/hooks/phase.sh red >/dev/null 2>&1
 setup_repo; phase start snapbytes2; phase 2; phase 3
 echo 'it("f", () => expect(1).toBe(2))' > src/x.test.ts
 printf 'exit 1\n' > .claude/spec-gate-test-cmd
-printf 'phase=3\ntask=snapbytes2\nslice=1/1\n\n\n' > .claude/.spec-phase
-BEFORE=$(cksum < .claude/.spec-phase)
+printf 'phase=3\ntask=snapbytes2\nslice=1/1\n\n\n' > $SPD/.spec-phase
+BEFORE=$(cksum < $SPD/.spec-phase)
 .claude/hooks/phase.sh red >/dev/null 2>&1
-[ "$(cksum < .claude/.spec-phase)" = "$BEFORE" ] \
+[ "$(cksum < $SPD/.spec-phase)" = "$BEFORE" ] \
   && ok "trailing newlines survive a snapshot round trip" \
   || bad "the snapshot normalised the file it saved"
 
@@ -4502,6 +4543,99 @@ BOUT=$(.claude/hooks/phase.sh brief 2>&1)
 printf '%s' "$BOUT" | grep -q 'which is longer' \
   && ok "a long journal still says it is a tail" \
   || bad "a genuinely truncated journal did not say so"
+
+################################################################################
+# The guard's refusals are a list of ways to name a path, and a list of spellings
+# cannot be complete — three review rounds found a new one each time. Moving the
+# state out of the working tree does not make the guard right; it makes being
+# wrong survivable, because the commands that reach a working-tree path do not
+# reach this one at all.
+#
+# These assert the property rather than the refusal: the command RUNS, and the
+# state is still there afterwards. A test that only checked for a deny would keep
+# passing on the day the deny is what breaks.
+group "phase state is out of reach of the commands that sweep a working tree"
+setup_repo; phase start reach; phase 2; phase 3
+
+[ -f "$SPD/.spec-phase" ] \
+  && ok "the phase file is under the git directory" \
+  || bad "no state at $SPD/.spec-phase"
+[ -e .claude/.spec-phase ] \
+  && bad "a second phase file is still in the working tree" \
+  || ok "and nowhere in the working tree"
+
+# git cannot report what is inside its own directory, which is why no .gitignore
+# entry is involved and none can be forgotten.
+git status --porcelain 2>/dev/null | grep -q 'spec-gate' \
+  && bad "git reports the gate directory as work" \
+  || ok "git status cannot see it, so no gitignore entry is load-bearing"
+
+git clean -fdxq 2>/dev/null
+[ "$(sed -n 's/^phase=//p' "$SPD/.spec-phase" 2>/dev/null | head -1)" = 3 ] \
+  && ok "git clean -fdx runs and the phase survives it" \
+  || bad "git clean -fdx removed the phase state"
+
+git stash --all --quiet 2>/dev/null; git stash pop --quiet 2>/dev/null
+[ "$(sed -n 's/^phase=//p' "$SPD/.spec-phase" 2>/dev/null | head -1)" = 3 ] \
+  && ok "git stash --all runs and the phase survives it" \
+  || bad "git stash --all removed the phase state"
+
+rm -rf .claude
+[ "$(sed -n 's/^phase=//p' "$SPD/.spec-phase" 2>/dev/null | head -1)" = 3 ] \
+  && ok "rm -rf .claude runs and the phase survives it" \
+  || bad "rm -rf .claude removed the phase state"
+
+# find is the exception, and it is worth naming rather than glossing. It walks
+# the filesystem, not the working tree, so `find .` descends into .git like any
+# other directory and DOES reach the state — the move buys nothing against it.
+# What covers that is the same thing that covered it before: the guard reads the
+# root and the -name filter and refuses. So this asserts the refusal, not the
+# structure, because the structure is not what holds here.
+#
+# A fresh fixture, because the assertions above deliberately ran `rm -rf .claude`
+# — which took the hooks with it, and a guard that is not installed allows
+# everything. Four tests passed vacuously that way before this line existed.
+setup_repo; phase start reachfind; phase 2; phase 3
+expect_b "find rooted at . still has to be refused, not out-run" \
+  DENY "find . -name '.spec-*' -delete"
+expect_b "and the unfiltered form"      DENY 'find . -type f -delete'
+expect_b "and the -exec spelling"       DENY "find . -name '.spec-*' -exec rm {} ;"
+expect_b "and one rooted at .git itself" DENY 'find .git -type f -delete'
+
+# The narrow operations that used to be holes are now simply allowed, because
+# they reach nothing. That is the point: the carve-outs go away with the thing
+# they were carving around.
+setup_repo; phase start reach2; phase 2; phase 3
+expect_b "a glob under .claude reaches no state and is allowed" ALLOW 'rm -f .claude/.spec-*'
+expect_b "and a cd into .claude"                                ALLOW 'cd .claude && rm -f .spec-*'
+expect_b "an ordinary clean-up under .claude"                   ALLOW 'rm -f .claude/*.log'
+
+# What replaced them is one refusal about one directory, under one class of verb.
+expect_b "sweeping the gate directory is still refused"   DENY 'rm -rf .git/spec-gate'
+expect_b "and the git directory holding it"               DENY 'rm -rf .git'
+expect_b "and .claude, which still holds the record"      DENY 'rm -rf .claude'
+
+# A linked worktree keeps its own state, under its own git dir. The per-tree
+# semantics spec_foreign_state rests on are unchanged by the move — they are the
+# reason spec_key_path uses --git-dir rather than --git-common-dir, and the state
+# follows the key.
+setup_repo
+MAIN2="$PWD"
+WT2="$WORK/wt2"; rm -rf "$WT2"
+git worktree add -q -b wt2branch "$WT2" >/dev/null 2>&1
+if [ -d "$WT2" ]; then
+  G1=$(gate_dir_of "$MAIN2"); G2=$(gate_dir_of "$WT2")
+  [ "$G1" != "$G2" ] \
+    && ok "a linked worktree resolves to its own gate directory" \
+    || bad "both trees resolved to the same gate directory: $G1"
+  case "$G2" in
+    */worktrees/*) ok "and it is under .git/worktrees/<name>/, beside that tree's key" ;;
+    *) bad "the worktree gate dir is not under .git/worktrees: $G2" ;;
+  esac
+  git worktree remove --force "$WT2" >/dev/null 2>&1
+else
+  ok "git worktree add unavailable; per-tree gate dir not exercised"
+fi
 
 ################################################################################
 printf '\n%s%d passed, %d failed%s\n' "$B" "$PASS" "$FAIL" "$N"
