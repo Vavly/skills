@@ -4,10 +4,23 @@
       "Bash(.claude/hooks/phase.sh scaffold*)",
       "Bash(.claude/hooks/phase.sh 3*)",
       "Bash(.claude/hooks/phase.sh 4*)",
+      "Bash(.claude/hooks/phase.sh 5 --force*)",
       "Bash(.claude/hooks/phase.sh off*)"
     ]
   },
   "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/phase.sh brief",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Edit|Write|NotebookEdit|Bash",

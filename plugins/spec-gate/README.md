@@ -48,7 +48,8 @@ spec-gate/
 │   ├── approval-receipt.sh          → .claude/hooks/   PostToolUse hook
 │   ├── review-bookmark.sh           → .claude/hooks/   SubagentStart/Stop hook
 │   ├── phase-policy.sh              → .claude/hooks/   shared policy, sourced
-│   ├── phase.sh                     → .claude/hooks/   phase state CLI
+│   ├── phase.sh                     → .claude/hooks/   phase state CLI, and the
+│   │                                   SessionStart hook (`phase.sh brief`)
 │   ├── phase-shim.sh                → .claude/hooks/phase.sh on a PLUGIN install:
 │   │                                   a pointer to the central copy, no policy
 │   ├── cursor-guard.sh              → .claude/hooks/   Cursor adapter
@@ -145,7 +146,7 @@ Then, from the root of **each** repo you want gated:
 **The plugin installs once; that command runs per project.** Everything the gate
 keeps — the spec, the slice position, the phase, the approvals — is per repo, so
 a central install cannot carry any of it. `spec-gate-install` writes the shim,
-creates `docs/specs/`, adds the five `.gitignore` entries, merges
+creates `docs/specs/`, adds the eight `.gitignore` entries, merges
 `permissions.ask` into any existing `.claude/settings.json`, and works out the
 RED test command from what the repo already has rather than asking cold. It is
 idempotent, and it is also the repair step after a plugin update.
@@ -155,24 +156,27 @@ plugin install used to end up with phase state on disk and no `phase.sh` to read
 it.
 
 **A plugin install cannot carry `permissions.ask`**, and that is a real gap, not a
-detail. The three entries in `settings.json` are what make the agent stop and ask
-before it runs `phase.sh 3`, `4`, or `off` on its own — without them the phase is
-still enforced, but the agent can advance itself through it. There is no plugin
-equivalent, so add them to the target repo's `.claude/settings.json` by hand:
+detail. The five entries in `settings.json` are what make the agent stop and ask
+before it runs `phase.sh scaffold`, `3`, `4`, `5 --force`, or `off` on its own —
+without them the phase is still enforced, but the agent can advance itself
+through it. There is no plugin equivalent, so add them to the target repo's
+`.claude/settings.json` by hand:
 
 ```json
 {
   "permissions": {
     "ask": [
+      "Bash(.claude/hooks/phase.sh scaffold*)",
       "Bash(.claude/hooks/phase.sh 3*)",
       "Bash(.claude/hooks/phase.sh 4*)",
+      "Bash(.claude/hooks/phase.sh 5 --force*)",
       "Bash(.claude/hooks/phase.sh off*)"
     ]
   }
 }
 ```
 
-**Those three rules match a literal path, and under a plugin install it is the
+**Those five rules match a literal path, and under a plugin install it is the
 wrong one.** A plugin install has no `.claude/hooks/`, so the skills resolve
 `phase.sh` to the plugin cache — see [Where phase.sh
 lives](#where-phasesh-lives) — and a rule written against `.claude/hooks/…` never
@@ -197,7 +201,7 @@ cp -R "$SPEC_GATE"/hooks "$SPEC_GATE"/agents "$SPEC_GATE"/skills .claude/
 # cannot be verified in-band and falls back to being terminal-only.
 printf 'yarn jest $SPEC_GATE_TEST_FILES\n' > .claude/spec-gate-test-cmd
 
-printf '.claude/.spec-phase\n.claude/.spec-baseline\n.claude/.spec-red\n.claude/.spec-approval*\n.claude/.spec-scaffold\n.claude/review-log.jsonl\n' >> .gitignore
+printf '.claude/.spec-phase\n.claude/.spec-baseline\n.claude/.spec-red\n.claude/.spec-approval*\n.claude/.spec-scaffold\n.claude/.spec-validation\n.claude/spec-journal.md\n.claude/review-log.jsonl\n' >> .gitignore
 git add .claude .gitignore && git commit -m "add review gate + spec-driven workflow"
 ```
 
@@ -206,21 +210,21 @@ files as reviewable** — correctly, since new files are usually the actual work
 so leaving `.claude/` uncommitted makes the gate fire on its own tooling.
 
 `settings.json` needs **merging, not copying**, if the target already has one.
-Two top-level keys are involved: the five event keys go inside the single
+Two top-level keys are involved: the six event keys go inside the single
 existing `hooks` object as siblings of whatever is there, and the `permissions.ask`
-entry goes into any existing `permissions` object. Replacing either object
+entries go into any existing `permissions` object. Replacing either object
 wholesale silently drops what was there.
 
 `hooks/hooks.json` is the plugin's copy of that same wiring, differing only in how
 it resolves paths — `${CLAUDE_PLUGIN_ROOT}` instead of `$CLAUDE_PROJECT_DIR`. Two
-copies of the same facts drift, so `test.sh` asserts they register the same five
+copies of the same facts drift, so `test.sh` asserts they register the same six
 events with the same matchers, scripts and timeouts. Change one, change the other.
 
 ### Either way
 
 Hooks are re-read by a file watcher, so no session restart is needed. Confirm
-registration with `/hooks` — all five should appear under `PreToolUse`,
-`PostToolUse`, `Stop`, `SubagentStart`, and `SubagentStop`.
+registration with `/hooks` — all six should appear under `SessionStart`,
+`PreToolUse`, `PostToolUse`, `Stop`, `SubagentStart`, and `SubagentStop`.
 
 ### Central install, per-project state
 
@@ -497,7 +501,7 @@ files depend on, and it is the one worth keeping in step.
 /adversarial-review <ref>     ...against a ref or path you name
 ```
 
-**You never type a path.** That is the whole surface: eight gates, all answered
+**You never type a path.** That is the whole surface: nine gates, all answered
 in-conversation, and nothing that sends you to a shell to run a script. The same
 commands work one-shot from outside a session —
 
@@ -1366,6 +1370,47 @@ shipping unexamined. The fingerprint includes content hashes of untracked files,
 so rewriting a brand-new file counts as a change — which is the common case,
 since new files are usually the actual work.
 
+## Surviving the conversation
+
+A sliced task outlives the conversation that started it. Compaction fires
+mid-turn without asking, `/clear` happens, and the session that comes back has
+no memory of the task while the repo is still mid-phase with the gates armed.
+
+Most of what a resuming session needs was already on disk — the phase, the spec,
+the plan, every reviewer verdict, and what shipped in git. Nothing read it back.
+
+**`phase.sh brief`** is a `SessionStart` hook (`startup`, `resume`, `clear`,
+`compact`) whose stdout is added to the model's context. It reports the task,
+the phase, the spec path, what is uncommitted, the answers already given, the
+journal, and the reviewer verdicts recorded since this task started. It is
+silent when no task is armed, and it prints each line only at the phases where
+that line can be true — a briefing that tells a resuming session its verified
+tests were unverified is worse than no briefing.
+
+Three things could previously only be said out loud, and so could not be handed
+over at all:
+
+| Command | Writes | Read back by |
+|---|---|---|
+| `phase.sh validation` | `.claude/.spec-validation` | the 4→5 gate, and `brief` |
+| `phase.sh journal` | `.claude/spec-journal.md` | `brief` |
+| — | `.claude/review-log.jsonl` | `brief` |
+
+Both commands take the body on **stdin** and refuse an empty one, so neither can
+record a header with nothing under it. `phase.sh validation` additionally clears
+the 4→5 gate, which is why it is phase state and not the model's to write.
+
+The journal is the one part of the briefing the model wrote itself, and it is
+labelled as testimony rather than as state — as are the reviewer verdicts, which
+are one agent's reading of a diff. Everything above those two lines was written
+by a hook the model cannot reach.
+
+**The journal is gitignored, so `off` and `start` destroy it unrecoverably.**
+Both say so, as do the restart, abandon and disarm options. The review log is
+*not* deleted — it is the only durable record that a review happened — but
+`brief` shows only the verdicts recorded since the current task started, so a
+new task does not open on the last one's findings.
+
 ## What is actually enforced
 
 `PreToolUse` hooks fire before the permission-mode check, in every mode
@@ -1376,9 +1421,25 @@ covered by a case in `test.sh`:
   per-call for `Edit`/`Write`/`NotebookEdit` and for the Bash write forms whose
   target can be parsed; caught per-turn by the phase scan for everything else.
 - **The model cannot advance its own phase** past the three approval gates, and
-  cannot touch any phase state file by any means — including the RED receipt and
-  the approval receipt. The transitions it may make either restrict it or
-  increase scrutiny.
+  every phase.sh call in a command is judged rather than one of them — appending
+  `; phase.sh status` used to launder any transition. The transitions it may make
+  either restrict it or increase scrutiny.
+- **Writes to a phase state file are denied in the common spellings.** The check
+  reads the *tokens the shell would produce*, not the command text, so a
+  quote-split path (`.spec-vali''dation`), a glob (`rm -f .claude/.spec-*`), a
+  glob relative to a `cd`, `rm -rf .claude`, `find .claude -delete`, an
+  interpreter (`python3 -c "os.remove(...)"`), a nested or fused shell payload
+  (`bash -c'...'`), an env-assignment prefix, and `git clean -x/-X` and
+  `git stash --all` — which remove every state file precisely because they are
+  all gitignored — are each denied. A write target the shell computes at runtime
+  is denied at every phase when the computed text names state. This is a list of
+  spellings and is **not** claimed to be complete; see the threat model below.
+- **The Phase 4 validation marker is authenticated, not merely present.** It
+  carries a keyed hash of its own fields, with the key under `.git/` where no
+  working-tree wipe reaches it. A marker written by hand does not verify and is
+  treated as absent, so a missed write spelling costs a re-run rather than the
+  gate. `phase.sh red` also snapshots and restores the gate's state around the
+  configured test command, which is model-authored shell it must be free to write.
 - **An approval is an answer the user gave, not a claim the model makes.** The
   three gates allow on a receipt written by a `PostToolUse` hook from an
   `AskUserQuestion` response — a value that reaches the hook from the host, which
@@ -1416,6 +1477,14 @@ covered by a case in `test.sh`:
 - **A verified test cannot be edited on the way to Phase 4.** The RED receipt
   pins the content of every test file it saw fail, so verifying red and then
   quietly changing a test puts 3→4 back behind a denial.
+- **Phase 4 cannot be left without a recorded validation report.** `phase.sh 5`
+  is denied until `phase.sh validation` has written one, the same shape as 3→4
+  refusing without a RED receipt. An empty or whitespace-only report is refused
+  rather than recorded, so the marker cannot certify that nothing was run, and
+  the marker pins the task and slice it was written for — re-slicing voids it.
+  `5 --force` overrides this, through its own gate (`force-validation`) with its
+  own question: an answer about unlocking production code without RED is not
+  redeemable for entering review with the checks unrun.
 - **The workflow cannot end silently.** `phase.sh off` prompts from phases 4–5
   and is denied outright from 1–3, so the model cannot close out a task on its
   own judgment. Whether it *asks well* before that prompt is instructed, not
@@ -1436,6 +1505,91 @@ Two limits worth stating plainly, since both look like enforcement and are not:
   second attempt. The same is true of the scan's revert instruction.
 - Phase 4 exit and Phase 5 are unenforced between each other: if the user never
   advances to 5, the diff is never gated. The user *is* the checkpoint by design.
+
+## Threat model
+
+What this gate is for: **keeping a well-behaved model from drifting past a
+checkpoint.** Writing code before anyone agreed what it should do, calling tests
+verified without running them, advancing on its own judgment where the user was
+meant to decide, ending a task on an unreviewed diff. Against that it is
+effective, and the mechanical parts of it are hard to get around by accident.
+
+What it is **not**: a sandbox. It does not contain a model that is actively
+working to get out, and it cannot be made to. The Bash guard reads a command
+string and decides what the shell would do with it — that is an unbounded
+problem, and three review rounds have each found a spelling the previous one
+missed (`printf x > .claude/.spec-vali''dation`, then `git clean -fdx`, then
+`cd .claude && rm -f .spec-*`). Each was closed. The next round will find
+another, because the list is a list and the space is not.
+
+Where that leaves the design:
+
+- **Deletion is contained by the guard; forgery is contained by the marker.**
+  Removing a state file only re-arms a gate — the costly failure is *clearing*
+  one, so the marker that clears 4 → 5 carries a keyed hash and a file written by
+  hand is treated as absent. That is the property worth relying on, and it does
+  not depend on the guard's spelling list being complete.
+- **The key is under `.git/`, not in the working tree**, so the commands that
+  wipe every state file (`git clean -fdx`, `git stash --all`, `rm -rf .claude`)
+  do not reach it, and the guard refuses any command naming it at any phase.
+  That last part is load-bearing and was missing at first: a model does not need
+  to *read* the key to forge a marker, it only needs to **replace** it, and a
+  marker signed with a key of your own choosing verifies perfectly. Reading it is
+  equally fatal. Both are refused by the same check; neither is made impossible
+  by it.
+- **An interpreter payload is checked by substring, not parsed.** `python3 -c`,
+  `node -e` and a heredoc fed to either take code this hook cannot lex. It
+  refuses one that names a state file; it cannot see through obfuscation, and
+  does not claim to.
+- **What the guard cannot resolve, it refuses.** A verb the shell computes
+  (`P=…; $P 4 --force`), a `phase.sh` argument it computes (`F=--force; phase.sh
+  5 $F`), an argument list built by `xargs`, and a shell whose script arrives on
+  stdin (`bash -s < file`, `cat file | bash`, `bash <<< '…'`) are not skipped as
+  unrecognised — they are denied, because a command this hook cannot read could
+  be any command. That is the rule that replaced "add another spelling to the
+  list" for whole channels. Assignments the command makes itself *are* resolved,
+  so `V=.claude/.spec-phase; rm -f $V` is refused on what `$V` holds — while a
+  variable this hook cannot see the value of, like `> $LOGFILE`, stays allowed.
+  The last assignment wins, substitution applies anywhere in a token (`.claude/$A`),
+  and the value on the right of an `=` is itself checked — a resolver can always
+  be walked around, but the literal has to appear somewhere.
+- **A heredoc body belongs to the verb that opened it, by number.** Each `<<`
+  leaves a numbered placeholder where it appeared and the body is spliced back
+  in at that position, so `cat <<A && bash <<B` gives B's body to `bash` and
+  A's to `cat`. Holding separators alone could not express this: one line can
+  open two heredocs for two different verbs, and every body was being attributed
+  to the first — which dropped the second from the scan entirely.
+- **A refusal outranks a permission, and is checked first.** `decide` exits, so
+  whichever check speaks first speaks for the whole command. The write scan runs
+  ahead of the phase walk for that reason: with the order reversed, `phase.sh
+  status ; echo pwned > src/x.ts` was allowed on the strength of the status call,
+  and an explicit hook `allow` bypasses the permission system rather than merely
+  skipping a phase.
+- **A heredoc body belongs to the verb that opened it.** Prose into `phase.sh
+  journal` is data and costs nothing; a script into `bash` or `python3` is a
+  program and is scanned. The lexer holds every separator raised after a heredoc
+  is registered until the body has been consumed, so `bash <<EOF | cat` cannot
+  hand the body to `cat` and have it read as prose.
+- **Running out of scan budget is a denial, and the denial can be delivered.**
+  A hook that gets killed emits no JSON, and no JSON reads as *no decision* — so
+  a command large enough to outrun the timeout would be allowed by default. The
+  scan is bounded on four axes — tokens, bytes, nested payloads, and the length
+  of a single physical line, checked *inside* the lexer, since the lexer builds
+  each word a character at a time and that cost is paid in full before any
+  counter on the shell side can move. Heredoc body lines are exempt from the
+  line bound: they are read whole, never character by character, which is what
+  keeps a long plan document cheap. The subtlety that cost a round: `deny` is printf-then-exit, so a
+  refusal raised inside `$( )` lands in the captured string and exits only the
+  subshell — the hook then prints nothing, and the bypass is the refusal itself.
+  Nothing that can refuse runs inside a command substitution.
+- **Phases 4–5 do not protect the gate's own code.** `.claude/hooks/*` and
+  `.claude/settings.json` are writable there, by the same rule that returns those
+  phases to the normal permission flow. A model at Phase 5 can rewrite the Stop
+  gate that reviews it. This is a known gap, stated rather than closed, because
+  closing it means a never-writable list that the user also cannot edit in-band.
+
+If you need containment rather than a checkpoint, run the agent in a sandbox and
+use this for what it is good at.
 
 **Instructed only** — everything in the SKILL.md bodies and the gate's block
 message: showing real failure output, saying why each failure is the *expected*
@@ -1473,14 +1627,30 @@ you read it.
 
 Builds a throwaway git repo in a temp dir, installs the hooks into it, and drives
 them with synthetic hook payloads. Nothing touches the repo you run it from.
-417 cases: the phase policy, every write vector, the advance-transition matrix,
+986 cases: the phase policy, every write vector, the advance-transition matrix,
 RED verification and the receipt's staleness rules, the approval questions and
 everything the receipt hook refuses to record, fail-closed behavior, the review
 gate with its index-invariance and its between-rounds delta, the slice position
 and its boundary rules, the phase scan with its baseline, every internal link
 in every skill — target file and heading anchor both — and the two install paths,
-which must register the same five events with the same matchers, scripts and
+which must register the same six events with the same matchers, scripts and
 timeouts, since `settings.json` and `hooks/hooks.json` are two copies of one fact.
+
+One group is shaped differently from the rest and is worth reading first: the
+**coverage-equivalence** matrix. It enumerates the protected targets against
+every channel a command can carry a payload through — bare argument, redirect
+target, `-c` payload, herestring, heredoc body, the second of two heredocs on
+one line, behind a variable, behind a re-assigned variable, after a read-only
+call — and asserts every one reaches the same decision as the bare spelling.
+
+That shape exists because it is the failure this component kept having. Four
+review rounds in a row found holes one axis over from the previous round's fix,
+because each round's tests pinned the reproduction they were handed rather than
+the rule. A per-spelling test says "this string is refused"; the matrix says
+"this target is refused however it arrives", and a scanner that learns about a
+token kind in two places out of three fails it rather than shipping. Adding a
+channel costs one line and immediately tests it against every target; adding a
+target costs one line and tests it against every channel.
 
 The approval cases lean hard on the *negative* ones, and that is the point:
 roughly half of them drive `approval-receipt.sh` with a payload it should not

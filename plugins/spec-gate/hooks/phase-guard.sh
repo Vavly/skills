@@ -18,7 +18,7 @@
 set -uo pipefail
 
 INPUT=$(cat)
-HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 
 # --- JSON reading, without a hard jq dependency ------------------------------
 # A missing parser used to make this hook exit 0 silently, i.e. fail open, which
@@ -56,6 +56,7 @@ decide() {  # $1 = allow|deny|ask, $2 = reason
 }
 
 deny() { decide deny "$1"; }
+
 
 # `ask` forces a confirmation prompt instead of refusing outright. Used for the
 # one checkpoint where in-band approval is proportionate — see the advance policy
@@ -129,27 +130,158 @@ esac
 #
 # The single-quote character is built with sprintf rather than written, so the
 # whole program sits inside a single-quoted shell string with nothing escaped.
+#
+# --- The work budget ---------------------------------------------------------
+# How long this hook takes is a security property, not a performance one. A
+# PreToolUse hook that gets killed emits no JSON, and no JSON reads as no
+# decision — so the call proceeds. Anything the model can make arbitrarily slow
+# is therefore an allow it can reach on demand, and both scanners were linear or
+# worse in a word count it chooses: scan_state_tokens forked one awk per
+# argument, and the segment walks below accumulate words into a string, which is
+# quadratic. 6000 arguments took 20s against a 15s timeout.
+#
+# So the scan is bounded, and running out is a DENY rather than a slow allow.
+# Two counters, because they bound different things: tokens caps the total work,
+# lexes caps the number of forks a nested payload can demand. Both are global and
+# shared across every recursion, or the bound is per-call and means nothing.
+#
+# The limits are far above real commands — a legitimate one is tens of tokens,
+# not thousands — and heredoc bodies are consumed as data by the lexer, so a long
+# journal entry or plan document costs one token, not one per word.
+# Three axes, because the cost has three shapes and bounding one leaves the
+# others: many tokens, many nested payloads (one fork each), and total bytes —
+# `${t##*/}` is quadratic in bash 3.2, so ONE 130 KB token outran the timeout
+# while the token count stood at 1.
+SCAN_TOKENS=0
+SCAN_LEXES=0
+SCAN_BYTES=0
+SCAN_TOKEN_BUDGET=2000
+SCAN_LEX_BUDGET=64
+SCAN_BYTE_BUDGET=262144
+MAX_TOKEN_BYTES=65536
+BASENAME_MAX=256
+# One physical line of shell. The lexer builds words a character at a time, so
+# this bounds the quadratic directly and is checked inside awk before the work
+# is done. Heredoc BODY lines are exempt — they are read whole, never scanned
+# character by character, which is why a long plan document stays cheap.
+MAX_LINE_BYTES=65536
+OVERSIZE_MSG="This command is too large for phase-guard to evaluate: it exceeds the scan budget, and a scan that cannot finish inside the hook timeout would emit no decision at all, which reads as permission. Refusing is the only safe answer. Split it into separate commands, or use Write/Edit for file changes so the target is a structured field instead of something to parse out of shell."
+
+# Every one of these must be reached from the CURRENT shell. `deny` is
+# printf-then-exit, so raised inside `$( )` the JSON lands in the captured
+# string and the exit ends only the subshell — the hook then falls off the end
+# having printed nothing, and no output reads as no decision. That is how the
+# budget's own refusal became a fail-open: a command sized to survive the state
+# scan and run out during the phase-call walk was allowed silently. So no
+# scanner may be invoked inside a command substitution, and budget_lex is called
+# at the call sites rather than inside lex_command, which is always `$(...)`.
+budget_token() {
+  SCAN_TOKENS=$((SCAN_TOKENS + 1))
+  [ "$SCAN_TOKENS" -gt "$SCAN_TOKEN_BUDGET" ] && deny "$OVERSIZE_MSG"
+  SCAN_BYTES=$((SCAN_BYTES + ${#1}))
+  [ "$SCAN_BYTES" -gt "$SCAN_BYTE_BUDGET" ] && deny "$OVERSIZE_MSG"
+  [ "${#1}" -gt "$MAX_TOKEN_BYTES" ] && deny "$OVERSIZE_MSG"
+  return 0
+}
+budget_lex() {
+  SCAN_LEXES=$((SCAN_LEXES + 1))
+  [ "$SCAN_LEXES" -gt "$SCAN_LEX_BUDGET" ] && deny "$OVERSIZE_MSG"
+  return 0
+}
+
+# Checked before the text is handed to the lexer, because the lexer is where the
+# cost is. Every budget above counts tokens the lexer has already produced, so
+# none of them can fire until the expensive part is over — which is how 700 KB
+# in one word took 23s with the token count standing at 1.
+budget_input() {
+  [ "${#1}" -gt "$SCAN_BYTE_BUDGET" ] && deny "$OVERSIZE_MSG"
+  return 0
+}
+
+# Each top-level scan gets its own allowance; recursion inside one shares it.
+# A single counter across all of them meant an ordinary command could spend the
+# state scan's budget and leave the phase-call walk to run out — which is how a
+# thousand harmless words in front of a transition became an allow. Total work
+# stays bounded either way, since every scan is bounded on its own.
+budget_reset() {
+  SCAN_TOKENS=0
+  SCAN_BYTES=0
+  SCAN_LEXES=0
+  return 0
+}
+
+# Basename extraction, but never on a token long enough for `##` to be the whole
+# cost of the scan. Nothing that long is a command name, so the full token is
+# handed back and simply matches no verb.
+tok_base() {   # sets TB
+  if [ "${#1}" -gt "$BASENAME_MAX" ]; then TB=$1; else TB=${1##*/}; fi
+}
+
 lex_command() {
-  printf '%s' "$1" | awk '
+  printf '%s' "$1" | awk -v MAXLINE="$MAX_LINE_BYTES" '
     BEGIN { SQ = sprintf("%c", 39); DQ = sprintf("%c", 34); BS = sprintf("%c", 92)
+            HDM = sprintf("%c", 1) "HD"
             hd_head = 1 }   # awk zero-inits, and hd_d[0] is a delimiter that never matches
+    # Output is buffered from the moment a heredoc is registered until its body
+    # has been consumed, then replayed after it. Without that, an operator later
+    # on the same line closed the segment before the body arrived — `bash <<EOF |
+    # cat` handed the body to `cat`, and a body whose verb looks harmless is
+    # discarded as prose. Holding only the end-of-line SEP was not enough,
+    # because `|` and `&&` end a segment too.
+    function out(s) {
+      if (defer) buf = buf s "\n"; else print s
+    }
+    # Each heredoc registration leaves a numbered placeholder where the `<<`
+    # appeared, and the body is spliced back in at that exact position once it
+    # has been read. Holding the separators alone was not enough: one line can
+    # open two heredocs for two different verbs, and `cat <<A && bash <<B` has no
+    # single position where an untagged body is correct — every body ended up
+    # attributed to the first verb, so the second one was dropped whole.
+    function flushbuf(   m, i2, l, k) {
+      m = split(buf, ln, "\n")
+      for (i2 = 1; i2 <= m; i2++) {
+        l = ln[i2]
+        if (l == "") continue
+        if (substr(l, 1, length(HDM)) == HDM) {
+          k = substr(l, length(HDM) + 1) + 0
+          if (k in body) printf "%s", body[k]
+        } else print l
+      }
+      buf = ""; defer = 0
+    }
     function flush() {
-      if (have) print "WORD\t" w
+      if (have) out("WORD\t" w)
       w = ""; have = 0
     }
     function nexthd() {
       if (hd_head <= hd_tail) {
-        hd_active = 1; hd_delim = hd_d[hd_head]; hd_strip = hd_s[hd_head]; hd_head++
+        hd_active = 1; hd_delim = hd_d[hd_head]; hd_strip = hd_s[hd_head]
+        hd_cur = hd_id[hd_head]; hd_head++
       } else hd_active = 0
     }
     {
-      # A heredoc body is data. Consumed whole; nothing inside it is shell.
+      # A heredoc body is data *to the lexer* — nothing in it is tokenised as
+      # shell. But whether it is data at all depends on the verb: prose into
+      # `phase.sh journal` is data, a script into `bash` or `python3` is the
+      # program. So the body is emitted as HBODY rather than discarded, and the
+      # caller decides based on the verb it already knows. Discarding it made an
+      # interpreter reading stdin a channel this scanner looked away from.
+      # (No apostrophes in here: this whole program is one single-quoted string.)
       if (hd_active) {
         t = $0
         if (hd_strip) sub(/^\t+/, "", t)
-        if (t == hd_delim) nexthd()
+        if (t == hd_delim) {
+          nexthd()
+          if (!hd_active) flushbuf()
+        } else body[hd_cur] = body[hd_cur] "HBODY\t" t "\n"
         next
       }
+      # Each word is built one character at a time, which is quadratic, so a
+      # single enormous word is the whole cost of the scan and it is paid here,
+      # before any counter on the bash side can move. 700 KB in one word took
+      # 23s against a 15s timeout, and a killed hook emits no decision at all.
+      # Refusing on length is the only check that can run before the work does.
+      if (MAXLINE > 0 && length($0) > MAXLINE) { print "OVER"; exit }
       line = $0; n = length(line); i = 1
       while (i <= n) {
         c = substr(line, i, 1)
@@ -176,7 +308,12 @@ lex_command() {
         if (c == "#" && !have) break
         if (c == "<") {
           flush()
-          if (substr(line, i+1, 2) == "<<") { print "SEP"; i += 3; continue }
+          # `<<<` is a herestring: the word after it is the text fed to the
+          # command as stdin. Treated as a separator, that text became an
+          # ordinary word opening a new segment, never re-read as shell and
+          # never seen as stdin — so `bash <<< script` was a blind spot with
+          # neither a redirect nor a pipe for the stdin check to notice.
+          if (substr(line, i+1, 2) == "<<") { out("OPHERE"); i += 3; continue }
           if (substr(line, i+1, 1) == "<") {
             i += 2; strip = 0
             if (substr(line, i, 1) == "-") { strip = 1; i++ }
@@ -194,10 +331,19 @@ lex_command() {
             # `$((1<<3))` is an arithmetic shift, not a heredoc. Its "delimiter"
             # parses as `3))`, which no line ever matches, so the rest of the
             # command was swallowed as body and nothing in it was scanned.
-            if (d != "" && d !~ /[()$]/) { hd_tail++; hd_d[hd_tail] = d; hd_s[hd_tail] = strip }
+            if (d != "" && d !~ /[()$]/) {
+              hd_tail++; hd_d[hd_tail] = d; hd_s[hd_tail] = strip
+              hd_id[hd_tail] = ++hd_n
+              defer = 1
+              out(HDM hd_n)
+            }
             continue
           }
-          i++; continue                       # plain input redirect: reads, never writes
+          # A plain input redirect writes nothing, but it decides what a shell
+          # RUNS: `bash -s < script` never names the script anywhere the scanner
+          # can see. Emitted so the caller can refuse the combination.
+          out("OPIN")
+          i++; continue
         }
         if (c == ">") {
           flush()
@@ -215,17 +361,25 @@ lex_command() {
             }
             i++
           }
-          print "OP\t" op; continue
+          out("OP\t" op); continue
         }
-        if (c == ";" || c == "|" || c == "&") { flush(); print "SEP"; i++; continue }
+        # A pipe ends a segment like `;` does, but it also decides where stdin
+        # for the NEXT segment comes from — `cat script | bash -s` runs a script
+        # nothing in the token stream names. Marked so the caller can tell the
+        # two apart; readers that only match KIND=SEP are unaffected.
+        if (c == "|") { flush(); out("SEP\tpipe"); i++; continue }
+        if (c == ";" || c == "&") { flush(); out("SEP"); i++; continue }
         w = w c; have = 1; i++
       }
       if (cont) { cont = 0; next }             # continued line: same word, same segment
       if (q != 0) { w = w " "; next }         # a quoted string spanning lines
-      flush(); print "SEP"
+      flush()
+      out("SEP")
       if (!hd_active) nexthd()
     }
-    END { flush() }
+    # An unterminated heredoc leaves the buffer unflushed; emit it rather than
+    # dropping the segment on the floor.
+    END { flush(); if (buf != "") flushbuf() }
   '
 }
 
@@ -238,19 +392,21 @@ lex_command() {
 # `pytest tests/ex -s`, `bin/ex -s` and `cat notes/patch` into denials, because a
 # path whose basename happens to be `ex` or `patch` is not a command.
 finish_segment() {
-  local seg=$SEGW t verb='' last='' ed='' ipe='' expect_verb=1 payload=''
+  local seg=$SEGW hdoc=$SEGH t verb='' last='' ed='' ipe='' expect_verb=1 payload=''
   SEGW=''
+  SEGH=''
   [ -z "$seg" ] && return 0
   while IFS= read -r t; do
     [ -z "$t" ] && continue
+    tok_base "$t"
     if [ "$expect_verb" = 1 ]; then
-      case "${t##*/}" in
+      case "$TB" in
         *=*|sudo|env|command|nohup|time|xargs|exec) continue ;;
         -*|'{}'|';'|'+') continue ;;
       esac
-      verb=${t##*/}
-      case "${t##*/}" in
-        sed|perl|awk) ed=${t##*/} ;;
+      verb=$TB
+      case "$TB" in
+        sed|perl|awk) ed=$TB ;;
       esac
       case "$t" in
         ex)    ed=ex ;;
@@ -262,8 +418,8 @@ finish_segment() {
     case "$t" in
       -exec|-execdir|-ok) expect_verb=1; continue ;;
     esac
-    case "${t##*/}" in
-      sed|perl|awk) ed=${t##*/}; continue ;;
+    case "$TB" in
+      sed|perl|awk) ed=$TB; continue ;;
     esac
     case "$ed" in
       sed|perl) case "$t" in -i|-i[!-]*|-[!-]*i*|--in-place*) ipe=$ed ;; esac ;;
@@ -296,19 +452,44 @@ finish_segment() {
   done <<< "$seg"
   [ -n "$last" ] && CAND="$CAND$last"$'\n'
   [ -n "${payload# }" ] && NESTED="$NESTED${payload# }"$'\n'
+  # A heredoc body handed to a shell is the script it runs, so it is queued for
+  # re-scanning exactly like a -c payload. Under any other verb it is data.
+  if [ -n "$hdoc" ]; then
+    case "$verb" in
+      sh|bash|zsh|ksh|dash|eval) NESTED="$NESTED$hdoc"$'\n' ;;
+    esac
+  fi
   [ -n "$ipe" ] && deny "spec-driven: in-place editing (sed -i, perl -i, patch, awk -i inplace) is blocked because phase-guard cannot reliably tell which file it targets. Use Edit instead — the gate can evaluate that exactly."
   return 0
 }
 
 scan_command() {
   local KIND VAL
+  budget_input "$1"
+  [ "${SCAN_DEPTH:-0}" = 0 ] && budget_reset
+  budget_lex
   WANT_TARGET=0
   SEGW=''
+  SEGH=''
   while IFS=$'\t' read -r KIND VAL; do
     case "$KIND" in
+      OVER) deny "$OVERSIZE_MSG" ;;
       OP)   WANT_TARGET=1 ;;
       SEP)  finish_segment; WANT_TARGET=0 ;;
+      # The write scan is a third reader of the same token stream, and it was
+      # never taught about heredoc bodies — so `bash <<EOF / echo pwned >
+      # src/x.ts / EOF` wrote production code during the tests-only phase with
+      # the guard emitting nothing, while `bash -c` with the same payload was
+      # refused. A body under a shell verb is a nested payload like any other.
+      # Not budgeted here: whether this body is a program or prose is not known
+      # until the verb is, at the end of the segment. Charging it as tokens up
+      # front refused a 3000-line journal entry, which is prose the workflow
+      # asks for. A body that turns out to be a program is queued into NESTED
+      # and scanned there, where it is budgeted like any other payload; the
+      # total is bounded by budget_input either way.
+      HBODY) SEGH="$SEGH$VAL"$'\n' ;;
       WORD)
+        budget_token "$VAL"
         if [ "$WANT_TARGET" = 1 ]; then
           CAND="$CAND$VAL"$'\n'
           WANT_TARGET=0
@@ -327,7 +508,12 @@ collect_write_targets() {
   CAND=""
   NESTED=""
   local depth=0 queue payload
+  # Its own allowance, like the other two top-level scanners. Without this the
+  # write scan started from whatever the phase walk had already spent, which
+  # silently halved it.
+  SCAN_DEPTH=0
   scan_command "$1"
+  SCAN_DEPTH=1
   while [ -n "$NESTED" ] && [ "$depth" -lt 4 ]; do
     queue=$NESTED; NESTED=""
     depth=$((depth + 1))
@@ -372,7 +558,6 @@ if [ -n "$SPLIT" ]; then
       # it passes on its own merits, and phase.sh refuses across a split by
       # itself anyway.
       collect_write_targets "$CMD"
-      PROOT=$(spec_realpath "${PROJECT_DIR%/}")
       while IFS= read -r P; do
         [ -z "$P" ] && continue
         in_project "$P" && deny "$SPLIT_MSG"
@@ -394,14 +579,505 @@ fi
 # --- Phase state is off limits, in every phase -------------------------------
 # Checked before the phase>=4 early exit below. Otherwise at Phase 5 the model
 # could write phase=4 and suppress the review gate, and at any phase it could
-# `rm` the state file to unlock production writes. Denying every command that
-# so much as mentions the file is blunt but breaks nothing: the model reads
-# phase state through `phase.sh status`, never through the file.
-if [ -n "$CMD" ]; then
-  case "$CMD" in
-    *.spec-phase*|*.spec-baseline*|*.spec-red*|*.spec-approval*|*.spec-scaffold*)
-      deny "The phase state is not yours to edit, move or remove — .spec-red and .spec-approval included, because a receipt you could write by hand would assert RED without running anything, or record an approval the user never gave. Change phases with phase.sh <n>, verify RED with phase.sh red, ask the user with phase.sh ask <gate>, and read the current phase with phase.sh status." ;;
+# `rm` the state file to unlock production writes.
+#
+# This used to conclude on a substring of the raw command, and the raw command
+# is not what the shell runs. Every one of these was ALLOW:
+#
+#   printf x > .claude/.spec-vali''dation   same inode, no `.spec-validation`
+#   rm -f .claude/.spec-*                   names nothing until the glob expands
+#   git clean -fdx                          names nothing, removes all of them
+#   rm -rf .claude                          takes the directory instead
+#
+# The first is the 4 -> 5 marker at the only phase it exists in; the last two
+# sweep the whole gate away with no evasion in them at all. Concluding on text
+# also denied a journal entry for *describing* a state file, because a substring
+# cannot tell shell from a heredoc body — the same mistake in the other
+# direction. So the tokens the shell would actually produce are what decides
+# now, and a phase-state hit is denied wherever it appears, in any verb.
+#
+# Deliberately not gated behind a cheap `case "$CMD"` pre-filter. That is one
+# more list of spellings to be incomplete, which is the bug being fixed; one awk
+# pass on a command line is cheaper than the class of hole it closes.
+# STATE_DIR_REL comes from phase-policy.sh, which all three layers source. It is
+# defaulted here so this file still parses standalone if the policy is missing —
+# the same degradation the other shared names get.
+: "${STATE_DIR_REL:=.claude}"
+
+# True when a path, once normalised, is the directory holding the state files or
+# an ancestor of it. `rm -rf .claude` and `rm -rf .` remove every state file
+# without naming one.
+covers_state_dir() {
+  local p=$1
+  p=${p%/}; p=${p#./}
+  [ -z "$p" ] && return 0
+  case "$p" in
+    .|..) return 0 ;;
+    "$STATE_DIR_REL") return 0 ;;
+    /*) case "${PROJECT_DIR%/}/$STATE_DIR_REL" in
+          "$p"|"$p"/*) return 0 ;;
+        esac ;;
   esac
+  return 1
+}
+
+# A glob is matched the other way round from an ordinary path: the token is the
+# pattern and the state file is the subject, because that is what the shell will
+# do with it.
+glob_hits_state() {
+  local tok=$1 s
+  case "$tok" in
+    *'*'*|*'?'*|*'['*) ;;
+    *) return 1 ;;
+  esac
+  while IFS= read -r s; do
+    [ -z "$s" ] && continue
+    is_phase_state "$s" || continue
+    # shellcheck disable=SC2254
+    case "$s" in $tok) return 0 ;; esac
+    # shellcheck disable=SC2254
+    case "${PROJECT_DIR%/}/$s" in $tok) return 0 ;; esac
+  done <<< "$(spec_state_list)"
+  return 1
+}
+
+# find matches -name against the BASENAME, so the pattern has to be tried the
+# same way. `-name '.spec-*'` names every state file and matches none of their
+# full paths, which is how a filtered find that reaches all of them read as one
+# that reaches none.
+glob_hits_state_base() {
+  local tok=$1 s
+  case "$tok" in
+    *'*'*|*'?'*|*'['*) ;;
+    *) return 1 ;;
+  esac
+  while IFS= read -r s; do
+    [ -z "$s" ] && continue
+    is_phase_state "$s" || continue
+    # shellcheck disable=SC2254
+    case "${s##*/}" in $tok) return 0 ;; esac
+  done <<< "$(spec_state_list)"
+  return 1
+}
+
+STATE_MSG="The phase state is not yours to edit, move or remove — .spec-red, .spec-approval and .spec-validation included, because a receipt you could write by hand would assert RED without running anything, record an approval the user never gave, or claim this repo's checks passed with none of them run. Change phases with phase.sh <n>, verify RED with phase.sh red, record the Phase 4 checks with phase.sh validation, ask the user with phase.sh ask <gate>, and read the current phase with phase.sh status."
+
+# Does this token name a state file, either as written or relative to a directory
+# the same command cd'd into? `cd .claude && rm -f .spec-*` names nothing this
+# hook recognises until the cd is applied, and a cd persists across && and ; —
+# which is why the caller carries it across segments rather than resetting it.
+state_token_hits() {
+  local t=$1 cwd=$2
+  is_phase_state "$t" && return 0
+  glob_hits_state "$t" && return 0
+  if [ -n "$cwd" ]; then
+    case "$t" in
+      /*) ;;
+      *)  is_phase_state "$cwd/$t" && return 0
+          glob_hits_state "$cwd/$t" && return 0 ;;
+    esac
+  fi
+  return 1
+}
+
+# An interpreter's code argument is not shell and cannot be lexed as shell, so
+# there is no token in it to recognise. Substring is the honest check here: it
+# is a heuristic over something this hook genuinely cannot parse, and it errs
+# toward refusing. It cannot see through obfuscation — see the threat model in
+# the README, which says so rather than implying otherwise.
+names_state_file() {
+  case "$1" in
+    *.spec-phase*|*.spec-baseline*|*.spec-red*|*.spec-approval*|\
+    *.spec-scaffold*|*.spec-validation*|*spec-journal.md*|*review-log.jsonl*) return 0 ;;
+  esac
+  return 1
+}
+
+# The key that authenticates the validation marker, and the staging area
+# `phase.sh red` puts the state in while it runs the configured test command.
+# Neither is a working-tree path, which is the point — but neither was in any
+# protected list either, so the marker's whole guarantee could be removed by
+# replacing the key. A model that picks the key can mint any marker it likes,
+# which is cheaper than forging one and was free. Checked at every phase: these
+# are read by gates in phases 4 and 5, where the write-target scan has already
+# exited.
+# $2 = the directory the command cd'd into, if any. state_token_hits already
+# takes it; without it here, `cd .git && rm -f spec-gate-*` named the key in a
+# form no pattern matched.
+names_gate_key() {
+  local t=$1 cwd=${2:-}
+  case "$t" in
+    *spec-gate-key*) return 0 ;;
+  esac
+  if [ -n "$cwd" ]; then
+    case "$t" in
+      /*) ;;
+      *) case "$cwd/$t" in
+           *spec-gate-key*) return 0 ;;
+         esac
+         set -- "$cwd/$t" ;;
+    esac
+  fi
+  # A glob reaches it without naming it: `rm -f .git/spec-gate-*` expands to the
+  # key and matches no literal above. Deliberately narrow — `.claude/spec-gate-*`
+  # must keep matching spec-gate-test-cmd, which is writable in every phase by
+  # design, so the pattern is tried against the key path rather than the reverse.
+  case "$1" in
+    *'*'*|*'?'*|*'['*)
+      k=$(spec_key_path 2>/dev/null) || k=""
+      # shellcheck disable=SC2254
+      [ -n "$k" ] && case "$k" in $1) return 0 ;; esac
+      # shellcheck disable=SC2254
+      case ".git/spec-gate-key" in $1) return 0 ;; esac ;;
+  esac
+  return 1
+}
+
+# `rm -rf .git` takes the key with everything else.
+covers_git_dir() {
+  local p=$1
+  p=${p%/}; p=${p#./}
+  [ -z "$p" ] && return 0
+  case "$p" in
+    .|..|.git) return 0 ;;
+  esac
+  return 1
+}
+
+# --- Variables the command sets for itself -----------------------------------
+# The verb filter skipped an assignment token whole, so nothing ever read its
+# value — and a redirect target that is only `$V` names nothing and has no
+# literal prefix to test, so the computed-target rule found nothing either. Past
+# the phase-4 exit, where the write scan no longer runs, that left every state
+# file writable through one variable.
+#
+# Only assignments this same command makes are resolved. The environment is not
+# consulted: a variable this hook cannot see the value of stays unresolved, which
+# is what keeps `> $LOGFILE` working.
+VARS=""
+
+vars_record() {   # $1 = NAME=VALUE token
+  local n=${1%%=*} line out=""
+  case "$n" in
+    ''|*[!A-Za-z0-9_]*) return 0 ;;
+  esac
+  # The LAST assignment wins, so an earlier binding cannot shadow a later one.
+  # Taking the first match let `V=safe.txt; V=.claude/.spec-phase; rm -f $V`
+  # resolve to safe.txt and pass.
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    case "$line" in "$n="*) continue ;; esac
+    out="$out$line"$'\n'
+  done <<< "$VARS"
+  VARS="$out$1"$'\n'
+  return 0
+}
+
+# Substitution anywhere in the token, not just a whole-token match. `.claude/$A`
+# and `${V}-phase` name a state file just as surely as `$V` does, and a
+# whole-token rule saw neither.
+resolve_tok() {   # sets RT to the token with this command's own bindings applied
+  RT=$1
+  case "$RT" in
+    *'$'*) ;;
+    *) return 0 ;;
+  esac
+  local line n v pat
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    n=${line%%=*}; v=${line#*=}
+    pat="\${$n}"
+    case "$RT" in *"$pat"*) RT=${RT//"$pat"/$v} ;; esac
+    pat="\$$n"
+    case "$RT" in *"$pat"*) RT=${RT//"$pat"/$v} ;; esac
+  done <<< "$VARS"
+  return 0
+}
+
+GATE_KEY_MSG="That path is the gate's own authentication material — the key the Phase 4 validation marker is signed with, or the state snapshot phase.sh red restores from. Neither is yours to write, move or remove: a marker signed with a key you chose proves nothing, and a snapshot you can edit is not a snapshot. Nothing in this workflow requires touching either."
+
+scan_state_tokens() {
+  local KIND VAL T TB IS_VERB VERB='' EXPECT_VERB=1 GITCLEAN=0 GITSTASH=0
+  local FINDDIR=0 WANT_TARGET=0 HDOC='' STDIN_TAKEN=0 PIPED=0
+  local FINDNAMED=0 FINDHIT=0 FINDPAT=0 WAS_TARGET=0 RT AV
+  local depth=${2:-0} cwd=${3:-} CDNEXT=0
+  [ "$depth" -gt 4 ] && deny "$OVERSIZE_MSG"
+  [ "$depth" = 0 ] && budget_reset
+  budget_input "$1"
+  budget_lex
+  while IFS=$'\t' read -r KIND VAL; do
+    case "$KIND" in
+      OVER) deny "$OVERSIZE_MSG" ;;
+      # A cd survives a `;` or `&&`, so cwd deliberately does NOT reset here.
+      SEP)
+        # A heredoc is prose or a program depending on who is reading it, and
+        # the verb is what says which. Decided at the end of the segment, where
+        # both the verb and the whole body are known.
+        if [ -n "$HDOC" ]; then
+          case "$VERB" in
+            sh|bash|zsh|ksh|dash|eval) scan_state_tokens "$HDOC" "$((depth + 1))" "$cwd" ;;
+            python|python3|node|deno|bun|ruby|perl|php)
+              names_state_file "$HDOC" && deny "$STATE_MSG" ;;
+          esac
+        fi
+        # A shell whose script arrives on stdin runs something no token names.
+        # `bash -s < script` and `cat script | bash` are both complete blind
+        # spots — the redirect target is discarded and a pipe carries no text at
+        # all — and both were allowed. Decided here because the redirect is
+        # written after the verb. The heredoc form is handled just above, where
+        # there is a body to read; these two have nothing to read, so they are
+        # refused rather than guessed at.
+        if [ -z "$HDOC" ]; then
+          case "$VERB" in
+            sh|bash|zsh|ksh|dash)
+              if [ "$STDIN_TAKEN" = 1 ] || [ "$PIPED" = 1 ]; then
+                deny "This runs a shell whose script comes from stdin — a redirect or a pipe — so phase-guard has no text to evaluate and cannot tell what it would do. Run the script as an argument, or inline the commands, so the gate can see them."
+              fi ;;
+          esac
+        fi
+        VERB=''; EXPECT_VERB=1; GITCLEAN=0; GITSTASH=0; FINDDIR=0
+        FINDNAMED=0; FINDHIT=0; FINDPAT=0
+        CDNEXT=0; WANT_TARGET=0; HDOC=''; STDIN_TAKEN=0
+        # This SEP ends a segment and opens the next one; if it was a pipe, the
+        # segment now beginning is the one whose stdin comes from it.
+        case "$VAL" in pipe) PIPED=1 ;; *) PIPED=0 ;; esac
+        continue ;;
+      OP)   WANT_TARGET=1; continue ;;    # the redirect target arrives as the next WORD
+      OPIN) STDIN_TAKEN=1; continue ;;    # `< file`: decides what a shell RUNS
+      # Kept only when the verb makes it a program. Prose into `phase.sh
+      # journal` is data and costs nothing — a plan document is legitimately
+      # thousands of lines, and budgeting it would refuse the workflow's own
+      # output. A script into a shell is bounded like any other scanned text.
+      HBODY)
+        case "$VERB" in
+          sh|bash|zsh|ksh|dash|eval|python|python3|node|deno|bun|ruby|perl|php)
+            budget_token "$VAL"; HDOC="$HDOC$VAL"$'\n' ;;
+        esac
+        continue ;;
+    esac
+    T=$VAL
+    [ -z "$T" ] && continue
+    budget_token "$T"
+
+    # A write target the shell computes cannot be judged as a path. Phases 1-3
+    # refuse every one of them further down, but that check sits below the
+    # `PHASE -ge 4` exit — and Phase 4 is the only phase the validation marker
+    # exists in, so the marker gating 4 -> 5 was writable through one `$(...)`.
+    # Here it runs at every phase, narrowed to targets that name state, so
+    # ordinary Phase 4 work like `> $LOGFILE` is untouched.
+    WAS_TARGET=0
+    if [ "$WANT_TARGET" = 1 ]; then
+      WANT_TARGET=0
+      WAS_TARGET=1
+      # A variable this command set for itself is resolved first: `> $V` names
+      # nothing on its own, and past the phase-4 exit nothing else looked.
+      resolve_tok "$T"
+      if [ "$RT" != "$T" ]; then
+        state_token_hits "$RT" "$cwd" && deny "$STATE_MSG"
+        names_gate_key "$RT" "$cwd" && deny "$GATE_KEY_MSG"
+      fi
+      case "$T" in
+        *'$'*|*'`'*)
+          # Two ways a computed target gives itself away. It spells a state name
+          # somewhere in the text — `$(echo .claude/.spec-validation)` — or the
+          # literal part before the first expansion already lands inside the
+          # state directory, which is `.claude/$V`. Everything else is ordinary
+          # work like `> $LOGFILE`, and is left alone at every phase.
+          names_state_file "$T" && deny "This writes to a target the shell computes at runtime ($T), and the computed text names a phase state file. phase-guard cannot evaluate what it would resolve to, and the file it appears to name is one no command may write. $STATE_MSG"
+          TPRE=${T%%[\$\`]*}
+          case "$TPRE" in
+            */*) covers_state_dir "${TPRE%/*}" \
+                   && deny "This writes to a target the shell computes at runtime ($T), inside $STATE_DIR_REL where the phase state lives. phase-guard cannot evaluate what it would resolve to, so it cannot rule out a state file. $STATE_MSG" ;;
+          esac ;;
+      esac
+    fi
+
+    IS_VERB=0
+    if [ "$EXPECT_VERB" = 1 ] && [ "$WAS_TARGET" = 0 ]; then
+      # The verb decides how every other token in the segment is read, so a verb
+      # this hook cannot resolve is a command it cannot classify at all. A path
+      # held in a variable was skipped by the assignment filter before anything
+      # looked at its value: `P=.claude/hooks/phase.sh; $P 4 --force` advanced
+      # the phase with the guard seeing a command whose verb it never knew.
+      # Unresolvable is refused here, the way a computed write target already is.
+      case "$T" in
+        *'$'*|*'`'*)
+          deny "The command in this segment is named by something the shell computes at runtime ($T), so phase-guard cannot tell what is about to run. It will not guess: a verb it cannot resolve could be any command, including the ones this gate exists to refuse. Write the command out literally." ;;
+      esac
+      # `*=*` is tested on the whole token, not the basename. `FOO=a/b` reduced
+      # to `b`, which matches no assignment pattern, so the env prefix became
+      # the verb and the real command was never classified at all.
+      case "$T" in
+        *=*)
+          vars_record "$T"
+          # The value is checked here, not only where the variable is used. A
+          # resolver can always be walked around — indirect assignment, `read`,
+          # a value built in pieces — but the literal has to appear somewhere,
+          # and on the right of an `=` is the one place nothing was looking.
+          AV=${T#*=}
+          state_token_hits "$AV" "$cwd" && deny "$STATE_MSG"
+          names_gate_key "$AV" "$cwd" && deny "$GATE_KEY_MSG"
+          continue ;;
+      esac
+      tok_base "$T"
+      case "$TB" in
+        sudo|env|command|nohup|time|xargs|exec) continue ;;
+        -*) continue ;;
+      esac
+      VERB=$TB
+      EXPECT_VERB=0
+      IS_VERB=1
+      [ "$VERB" = cd ] && CDNEXT=1
+    else
+      if [ "$CDNEXT" = 1 ]; then
+        CDNEXT=0
+        case "$T" in
+          -*) ;;
+          /*) cwd=$T ;;
+          *)  cwd=${cwd:+$cwd/}$T; cwd=${cwd#./} ;;
+        esac
+      fi
+      case "$VERB" in
+        git)
+          [ "$T" = clean ] && GITCLEAN=1
+          [ "$T" = stash ] && GITSTASH=1 ;;
+        find)
+          # A -name/-path pattern narrows what the find can reach. `find . -name
+          # '*.pyc' -delete` roots at a directory that covers the state dir and
+          # reaches none of it, and denying that made ordinary cleanup a phase
+          # question. So a filtered find is judged on whether its filter can
+          # match a state file, and an unfiltered one is judged on its root.
+          if [ "$FINDPAT" = 1 ]; then
+            FINDPAT=0
+            FINDNAMED=1
+            glob_hits_state_base "$T" && FINDHIT=1
+            glob_hits_state "$T" && FINDHIT=1
+            is_phase_state "$T" && FINDHIT=1
+          else
+            case "$T" in
+              -name|-path|-iname|-ipath|-wholename) FINDPAT=1 ;;
+              -*) ;;
+              *) covers_state_dir "$T" && FINDDIR=1
+                 covers_git_dir "$T" && FINDDIR=1
+                 state_token_hits "$T" "$cwd" && FINDDIR=1 ;;
+            esac
+          fi ;;
+      esac
+      # `git clean -x` and `-X` are the only ordinary commands that remove these
+      # files, and they do it precisely because the files are gitignored by
+      # design — so no commit can protect them and nothing else in this hook
+      # would ever see a path.
+      if [ "$GITCLEAN" = 1 ]; then
+        case "$T" in
+          --) ;;
+          -[!-]*) case "$T" in
+                    *x*|*X*) deny "git clean -x/-X removes ignored files, and every spec-gate state file is ignored by design — this would disarm the workflow silently, leaving no phase, no receipts and no record that a gate was ever armed. Clean specific paths instead, or run 'phase.sh off' if the intent is to end the task." ;;
+                  esac ;;
+        esac
+      fi
+      # `git stash --all` stashes ignored files too, which is the same act as
+      # `clean -x` by another name: every state file goes, and `git stash` is
+      # not a command anyone reads as destructive. `-u` is not included — it
+      # takes untracked files and leaves ignored ones, so it never reaches these.
+      if [ "$GITSTASH" = 1 ]; then
+        case "$T" in
+          --all) deny "git stash --all stashes ignored files as well as untracked ones, and every spec-gate state file is ignored by design — this would disarm the workflow exactly as 'git clean -x' would. Use 'git stash -u' if the intent is to set untracked work aside, or 'phase.sh off' if the intent is to end the task." ;;
+          --) ;;
+          -[!-]*) case "$T" in
+                    *a*) deny "git stash -a stashes ignored files as well as untracked ones, and every spec-gate state file is ignored by design — this would disarm the workflow exactly as 'git clean -x' would. Use 'git stash -u' if the intent is to set untracked work aside, or 'phase.sh off' if the intent is to end the task." ;;
+                  esac ;;
+        esac
+      fi
+      # find reaches the same inodes with no path token that any check above
+      # would recognise as a state file: `-delete` names nothing, and `-exec rm`
+      # hides the verb behind an argument. POSIX find takes its paths before its
+      # predicates, so the directory is always known by the time either appears.
+      #
+      # A -name/-path filter is honoured: it decides what the find can reach, so
+      # a pattern that cannot match a state file makes the root irrelevant. An
+      # unfiltered find is judged on its root alone, which is why `find . -type f
+      # -delete` still refuses while `find . -name '*.pyc' -delete` does not.
+      if [ "$FINDHIT" = 1 ] || { [ "$FINDDIR" = 1 ] && [ "$FINDNAMED" = 0 ]; }; then
+        case "$T" in
+          -delete|-exec|-execdir|-fprint|-fprintf)
+            deny "This find would delete or overwrite inside $STATE_DIR_REL, where the phase state lives. $STATE_MSG" ;;
+        esac
+      fi
+      # An interpreter is handed code, not shell. It cannot be lexed here, so
+      # the check is on whether the code names one of these files at all.
+      case "$VERB" in
+        python|python3|node|deno|bun|ruby|perl|php)
+          case "$T" in
+            -*) ;;
+            *) names_state_file "$T" && deny "$STATE_MSG" ;;
+          esac ;;
+      esac
+    fi
+
+    # A quoted string handed to a shell is not data, it is shell. Re-read it,
+    # the way collect_write_targets already does for write targets — otherwise
+    # `bash -c "rm -f .claude/.spec-red"` is one opaque word to every check
+    # below. Reading the raw command text used to cover this by accident.
+    #
+    # Arguments only. Recursing on the verb re-read the word `bash` as a command
+    # whose verb is `bash`, forever, and the hook died on a stack overflow — a
+    # crashed PreToolUse hook produces no JSON, which Claude Code reads as no
+    # decision, so the fail-open was total.
+    #
+    # `-c'...'` with no space is one token beginning with a dash, which the flag
+    # filter dropped whole — the payload rode in on the flag. The remainder after
+    # the flag is the payload, so it is unwrapped rather than skipped.
+    if [ "$IS_VERB" = 0 ]; then
+      case "$VERB" in
+        sh|bash|zsh|ksh|dash|eval)
+          case "$T" in
+            -c?*) scan_state_tokens "${T#-c}" "$((depth + 1))" "$cwd" ;;
+            -*)   ;;
+            *)    scan_state_tokens "$T" "$((depth + 1))" "$cwd" ;;
+          esac ;;
+      esac
+    fi
+
+    state_token_hits "$T" "$cwd" && deny "$STATE_MSG"
+    names_gate_key "$T" "$cwd" && deny "$GATE_KEY_MSG"
+    # The same token with this command's own assignments applied. `rm -f $V`
+    # names a state file only once V is read back.
+    resolve_tok "$T"
+    if [ "$RT" != "$T" ]; then
+      state_token_hits "$RT" "$cwd" && deny "$STATE_MSG"
+      names_gate_key "$RT" "$cwd" && deny "$GATE_KEY_MSG"
+    fi
+
+    # A token carrying a substitution cannot be matched as a path — `` `echo
+    # .claude/.spec-phase` `` splits into words that each end or begin with a
+    # backtick, so no exact pattern reaches them. If such a token spells a state
+    # file at all, that is enough to refuse: nothing legitimate computes a path
+    # that happens to read as this gate's own bookkeeping.
+    case "$T" in
+      *'$'*|*'`'*) names_state_file "$T" && deny "$STATE_MSG" ;;
+    esac
+
+    # Removing the directory is removing the files in it. Restricted to verbs
+    # that destroy, because `.claude` also holds the hooks, the settings and the
+    # skills, and the model reads all three.
+    case "$VERB" in
+      rm|unlink|shred|rmdir|mv)
+        case "$T" in
+          -*) ;;
+          *) covers_state_dir "$T" && deny "$STATE_MSG"
+             covers_git_dir "$T" && deny "$GATE_KEY_MSG"
+             # `D=.claude; rm -rf $D` reaches the directory through a binding.
+             resolve_tok "$T"
+             covers_state_dir "$RT" && deny "$STATE_MSG"
+             covers_git_dir "$RT" && deny "$GATE_KEY_MSG" ;;
+        esac ;;
+    esac
+  done <<< "$(lex_command "$1")"
+  return 0
+}
+
+if [ -n "$CMD" ]; then
+  scan_state_tokens "$CMD"
 fi
 if [ -n "$PATHS" ] && is_phase_state "$PATHS"; then
   deny "The phase state is not yours to edit. Phases change by running phase.sh <n>, and the ones that are the user's change on an answer they gave — never by writing this file."
@@ -431,9 +1107,128 @@ fi
 # were terminal-only for the same limitation, and they stop being terminal-only
 # for the same reason: an answer through the host is evidence the user decided,
 # which a permission prompt on a shell command never was.
-if [ -n "$CMD" ] && printf '%s' "$CMD" | grep -qE '(^|[^[:alnum:]_.+-])phase\.sh([[:space:]]|$)'; then
-  ARG=$(printf '%s' "$CMD" | sed -nE 's|.*phase\.sh[[:space:]]+([^[:space:];&|]+).*|\1|p' | head -1)
-  ARG=${ARG#[\"\']}; ARG=${ARG%[\"\']}
+# One line per phase.sh call in the command, each holding that call's own
+# argument tail, prefixed with ':' so a call with no arguments is still a line.
+#
+# This used to be a regex over the raw command text — the mistake the token
+# rewrite existed to end, still sitting one dispatch down. `.*phase\.sh` is
+# greedy, so on a line with two calls it read the LAST; `head -1` read the first
+# LINE. Either way the guard judged one call while the other ran, so appending
+# `; phase.sh status` laundered any transition and any --force.
+#
+# Nested payloads are re-read for the same reason the state scan re-reads them:
+# `bash -c "phase.sh 4 --force"` is one opaque word otherwise, and the old text
+# regex caught it by accident.
+# The walk calls eval_phase_call directly rather than printing its findings for
+# a caller to read back. That is the whole point: `deny` is printf-then-exit, so
+# collecting these through `$(phase_invocations ...)` put every refusal raised
+# inside the walk — including the budget's — into the captured string, where the
+# exit ended only the subshell and the hook went on to print nothing. No output
+# reads as no decision, so the refusal became permission. Nothing that can refuse
+# may run inside a command substitution.
+phase_walk() {
+  local KIND VAL T TB IN=0 ACC='' VERB='' EXPECT_VERB=1 HDOC='' XARGS=0 RT
+  local depth=${2:-0}
+  [ "$depth" -gt 4 ] && deny "$OVERSIZE_MSG"
+  [ "$depth" = 0 ] && budget_reset
+  budget_input "$1"
+  budget_lex
+  while IFS=$'\t' read -r KIND VAL; do
+    case "$KIND" in
+      OVER) deny "$OVERSIZE_MSG" ;;
+      SEP)
+        [ "$IN" = 1 ] && eval_phase_call "$ACC"
+        # A phase.sh call inside a heredoc handed to a shell is a phase.sh call.
+        if [ -n "$HDOC" ]; then
+          case "$VERB" in
+            sh|bash|zsh|ksh|dash|eval) phase_walk "$HDOC" "$((depth + 1))" ;;
+          esac
+        fi
+        IN=0; ACC=''; VERB=''; EXPECT_VERB=1; HDOC=''; XARGS=0; continue ;;
+      OP|OPIN) continue ;;
+      HBODY)
+        case "$VERB" in
+          sh|bash|zsh|ksh|dash|eval) budget_token "$VAL"; HDOC="$HDOC$VAL"$'\n' ;;
+        esac
+        continue ;;
+    esac
+    T=$VAL
+    [ -z "$T" ] && continue
+    budget_token "$T"
+
+    if [ "$EXPECT_VERB" = 1 ]; then
+      case "$T" in *=*) vars_record "$T"; continue ;; esac
+      tok_base "$T"
+      case "$TB" in
+        # xargs builds the argument list from stdin, so a phase.sh reached
+        # through it is a call whose arguments this hook cannot see at all.
+        xargs) XARGS=1; continue ;;
+        sudo|env|command|nohup|time|exec) continue ;;
+        -*) continue ;;
+      esac
+      VERB=$TB; EXPECT_VERB=0
+    else
+      case "$VERB" in
+        sh|bash|zsh|ksh|dash|eval)
+          case "$T" in
+            -c?*) phase_walk "${T#-c}" "$((depth + 1))" ;;
+            -*)   ;;
+            *)    phase_walk "$T" "$((depth + 1))" ;;
+          esac ;;
+      esac
+    fi
+
+    tok_base "$T"
+    if [ "$TB" = phase.sh ]; then
+      [ "$XARGS" = 1 ] && deny "This reaches phase.sh through xargs, which builds its argument list from stdin — so which phase it would move to, and whether --force is among the arguments, is not visible here. A transition this gate cannot read is one it will not allow. Run phase.sh with its arguments written out."
+      [ "$IN" = 1 ] && eval_phase_call "$ACC"
+      IN=1; ACC=''; continue
+    fi
+    # Arguments carry the destination phase and --force, so they are resolved
+    # the same way a path is. The verb was refused when it could not be read;
+    # the arguments were not, and `F=--force; phase.sh 5 $F` was the whole gate.
+    if [ "$IN" = 1 ]; then
+      resolve_tok "$T"
+      ACC="$ACC $RT"
+    fi
+  done <<< "$(lex_command "$1")"
+  [ "$IN" = 1 ] && eval_phase_call "$ACC"
+  return 0
+}
+
+# Judges one phase.sh call. Every call in a command reaches this, and the first
+# one that decides wins — decide/deny/ask exit, and every caller is in this shell.
+eval_phase_call() {
+  local ARGV=$1
+  # An argument this hook cannot read is a transition it cannot judge, and
+  # phase.sh has no gate of its own to fall back on. The verb was already
+  # refused when unresolvable; the arguments carry the destination phase and
+  # --force, so they get the same rule rather than being evaluated as if the
+  # unreadable part were absent.
+  case "$ARGV" in
+    *'$'*|*'`'*)
+      deny "This phase.sh call has an argument the shell computes at runtime ($ARGV), so which phase it would move to — and whether --force is among the arguments — cannot be read here. A transition this gate cannot evaluate is one it will not allow. Write the arguments out literally." ;;
+  esac
+  # ARG has to name the destination, and a flag never does. Taking the first
+  # token blindly read `phase.sh --force 5` as ARG=--force, which is not 5, so
+  # the force dispatch below fell through to the Phase 4 question — asking the
+  # user about unlocking production code in order to decide a Phase 5 override.
+  # That is the exact confusion the dispatch was split in two to end, reachable
+  # by typing the same two words in the other order. Leading flags are skipped,
+  # so the destination is found on whichever side of one it was written.
+  #
+  # Globbing is off for the walk: these are command-line tokens, and a `*` in
+  # one would otherwise expand against the hook's own working directory.
+  ARG=""
+  set -f
+  for _tok in $ARGV; do
+    _tok=${_tok#[\"\']}; _tok=${_tok%[\"\']}
+    case "$_tok" in
+      ''|-*) continue ;;
+      *) ARG=$_tok; break ;;
+    esac
+  done
+  set +f
 
   # These five used to be "go run it in your own terminal", because a PreToolUse
   # hook cannot tell a Bash call the model chose from one a slash command made.
@@ -476,9 +1271,30 @@ if [ -n "$CMD" ] && printf '%s' "$CMD" | grep -qE '(^|[^[:alnum:]_.+-])phase\.sh
   # which is why it is the one flag the model may never supply on its own. It is
   # still not the model's: what changed is that the user can now answer for it
   # here instead of leaving the session, and the answer is what allows it.
-  case "$CMD" in
+  #
+  # Two flags share the spelling and skip different checks at different costs, so
+  # they cannot share a question. `4 --force` unlocks production code with nothing
+  # shown to fail; `5 --force` enters review with the repo's own checks unrun, at
+  # a point where the code is already written. Routing both to the `force` gate
+  # asked the user about unlocking production code in order to decide something
+  # else entirely — and worse, one answer was then redeemable for the other,
+  # since the receipt records the gate and not the transition. ARG is the first
+  # non-flag token after phase.sh, so it names the destination phase whichever
+  # side of the flag it was typed on.
+  # Matched on ARGV, not on the whole command. Scanning the raw text meant the
+  # flag was "present" when it appeared in a heredoc body — and `journal` and
+  # `validation` exist to write prose about this workflow, which is prose that
+  # says --force. Recording that you forced the RED gate was itself denied, and
+  # the question the user got was about unlocking production code in order to
+  # save a note. `git push --force && phase.sh status` did the same from a
+  # command that has nothing to do with phases. ARGV is bounded to phase.sh's
+  # own segment and stops at the first line, so both are outside it.
+  case "$ARGV" in
     *--force*)
-      gated_advance force "advancing to Phase 4 with --force, which skips the RED check entirely and unlocks production code without anything having been shown to fail" ;;
+      case "$ARG" in
+        5) gated_advance force-validation "advancing to Phase 5 with --force, which enters adversarial review with no record that this repo's own build, lint or test commands were ever run against the finished work" ;;
+        *) gated_advance force "advancing to Phase 4 with --force, which skips the RED check entirely and unlocks production code without anything having been shown to fail" ;;
+      esac ;;
   esac
 
   case "$ARG" in
@@ -688,17 +1504,22 @@ if [ -n "$CMD" ] && printf '%s' "$CMD" | grep -qE '(^|[^[:alnum:]_.+-])phase\.sh
         advance_deny "$ARG"
       fi ;;
   esac
-fi
+  return 0
+}
 
-[ "$PHASE" -ge 4 ] && exit 0            # execute onward: normal permission flow
-
-if [ -n "$CMD" ]; then
+# The write scan comes first, and it can only ever DENY — it has no allow to
+# give. `decide` exits, so whichever check speaks first speaks for the whole
+# command: with the phase walk in front, `phase.sh status ; echo pwned >
+# src/x.ts` was allowed on the strength of the status call, and an explicit hook
+# allow bypasses the permission system rather than merely skipping a phase.
+# Ordering the refusals ahead of the decisions is what makes an allow mean "and
+# nothing else in this command objects".
+if [ "$PHASE" -lt 4 ] && [ -n "$CMD" ]; then
   collect_write_targets "$CMD"
   PATHS=$CAND
 fi
 
-
-[ -z "$PATHS" ] && exit 0
+run_write_scan() {
 
 while IFS= read -r P; do
   [ -z "$P" ] && continue
@@ -742,5 +1563,11 @@ while IFS= read -r P; do
   is_phase_state "$P" && deny "The phase state is not yours to write."
   path_allowed_in_phase "$PHASE" "$P" || deny "$DENY_REASON"
 done <<< "$PATHS"
+  return 0
+}
+
+[ -n "$PATHS" ] && run_write_scan
+
+[ -n "$CMD" ] && phase_walk "$CMD"
 
 exit 0

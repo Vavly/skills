@@ -25,7 +25,7 @@
 set -uo pipefail
 
 INPUT=$(cat)
-HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 
 # --- JSON reading, without a hard jq dependency ------------------------------
 # Falls back to python3. If neither parser exists we cannot read

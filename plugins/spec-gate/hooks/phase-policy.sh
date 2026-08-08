@@ -10,6 +10,197 @@
 #
 # Not executable and not a hook. Sourced only.
 
+# The directory holding the state files, relative to the project root. Shared,
+# because all three layers name it in refusals and one of them getting it wrong
+# would point the reader at a path that does not exist.
+STATE_DIR_REL=.claude
+
+# --- Authenticating the markers that clear a gate ----------------------------
+# Deleting a marker only re-arms a gate; forging one clears it. The guard denies
+# every deletion route it knows, but that list is a list of spellings and cannot
+# be complete — three review rounds found a new one each time. So the two markers
+# that CLEAR a gate carry a keyed hash of their own fields, and a marker that
+# does not verify is treated as absent. One missed write spelling then costs a
+# re-run rather than the gate.
+#
+# The key lives under .git/, alongside review_marker_path's own marker and for
+# the same reason: it is not a working-tree path. `git clean -fdx`, `git stash
+# --all` and `rm -rf .claude` all remove every state file by design — they are
+# gitignored — and none of them reaches this.
+#
+# This is not protection against someone with a shell and patience: anything that
+# can read the key can mint a marker. It closes the gap between "the guard missed
+# a spelling" and "the gate is gone", which is the gap that kept reopening.
+#
+# `--git-dir`, not `--git-common-dir`: in a linked worktree this resolves to
+# .git/worktrees/<name>, so each worktree signs with its own key. That is
+# deliberate — a marker minted for the task in one worktree should not clear the
+# gate for a different task in another, and the markers themselves are per-tree
+# already. Do not "fix" this to the common dir.
+spec_key_path() {
+  d=$(git rev-parse --git-dir 2>/dev/null) || return 1
+  [ -n "$d" ] || return 1
+  case "$d" in /*) ;; *) d="${PROJECT_DIR%/}/$d" ;; esac
+  printf '%s/spec-gate-key\n' "$d"
+}
+
+spec_key() {
+  k=$(spec_key_path) || return 1
+  if [ ! -s "$k" ]; then
+    ( umask 077
+      dd if=/dev/urandom bs=32 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n' > "$k"
+    ) || return 1
+  fi
+  [ -s "$k" ] || return 1
+  cat "$k"
+}
+
+# $1 = message. Prints a hex digest, or fails if the host has no hasher — in
+# which case every caller treats the marker as unverifiable and refuses, since a
+# gate that cannot check its own receipt must not accept it.
+#
+# The key wraps the message on both sides rather than only prefixing it. Plain
+# H(k ‖ m) is length-extendable: an attacker who never sees the key can still
+# append to a signed body and produce a valid tag. Nothing here is exploitable
+# today only because the readers take the FIRST `task=` line, so an appended one
+# loses — which is a property of the reader, not of the construction, and would
+# quietly become a hole the day a reader changed to last-match-wins. Separators
+# keep the two key halves from merging with the body.
+#
+# One construction, deliberately, even though openssl could give a real HMAC.
+# Two constructions meant two different tags for the same input, so a host where
+# openssl was on PATH when the marker was written and absent when it was read
+# reported a genuinely recorded report as FORGED. It failed closed, but "your
+# validation report evaporated because a tool moved on PATH" is not a failure
+# anyone can act on. openssl would also have put the key on the command line,
+# where any local `ps` reads it.
+spec_mac() {
+  _k=$(spec_key) || return 1
+  _m=$(printf '%s\x1f%s\x1f%s' "$_k" "$1" "$_k")
+  if command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$_m" | shasum -a 256 | cut -d' ' -f1
+  elif command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$_m" | sha256sum | cut -d' ' -f1
+  elif command -v openssl >/dev/null 2>&1; then
+    printf '%s' "$_m" | openssl dgst -sha256 | sed 's/.*= *//'
+  else
+    return 1
+  fi
+}
+
+# The authenticated body of a marker: every line except the comment header and
+# the mac line itself. Keeping this one function means the writer and the reader
+# cannot disagree about what was signed.
+spec_mac_body() {
+  sed -e '/^#/d' -e '/^mac=/d' "$1"
+}
+
+spec_mac_write() {   # $1 = path — appends the mac line for what is already there
+  m=$(spec_mac "$(spec_mac_body "$1")") || return 1
+  printf 'mac=%s\n' "$m" >> "$1"
+}
+
+spec_mac_ok() {      # $1 = path — 0 if the file authenticates against the key
+  [ -r "$1" ] || return 1
+  have=$(sed -n 's/^mac=//p' "$1" | head -1)
+  [ -n "$have" ] || return 1
+  want=$(spec_mac "$(spec_mac_body "$1")") || return 1
+  [ "$have" = "$want" ]
+}
+
+# none | forged | stale | valid. Shared by the 4 -> 5 tripwire and by `brief`,
+# which used to test `[ -f ]` alone — so a stale marker was announced to a
+# resuming session as a recorded report and then refused by the transition it
+# was describing. A briefing that contradicts its own gate is the one thing it
+# must not do, so both now read the same answer.
+validation_marker_status() {   # $1 = marker path, $2 = task, $3 = slice
+  [ -f "$1" ] || { printf 'none\n'; return 0; }
+  spec_mac_ok "$1" || { printf 'forged\n'; return 0; }
+  vt=$(sed -n 's/^task=//p' "$1" | head -1)
+  vs=$(sed -n 's/^slice=//p' "$1" | head -1)
+  if [ "$vt" = "$2" ] && [ "$vs" = "$3" ]; then printf 'valid\n'; else printf 'stale\n'; fi
+}
+
+# --- Running the configured test command without handing it the gate ---------
+# .claude/spec-gate-test-cmd has to be writable in every phase — a repo that
+# never configured one otherwise cannot verify RED at all — and `phase.sh red`
+# executes its contents as shell. Two allowed calls therefore disarmed the whole
+# workflow: write the payload, then run the gate's own verifier.
+#
+# A static scan of the payload would be the same losing game as the verb list,
+# so the state is snapshotted instead and restored afterwards. That holds
+# whatever the command does — obfuscated, nested, or spawned — because it is
+# checked on the way out rather than predicted on the way in.
+#
+# The snapshot is held in shell variables, not on disk and not in one blob. A
+# directory — even one from mktemp — is findable: the executed test command can
+# walk $TMPDIR, and deleting the backup was enough to disarm the gate however
+# loudly the restore complained afterwards.
+#
+# One variable per state path, indexed by position, rather than records packed
+# into a single string with in-band separators. The separator version carried a
+# false premise — that the control characters "cannot occur in any of these
+# files" — when one of the files it snapshots is spec-journal.md, whose content
+# the model writes. A journal entry containing a separator therefore forged a
+# record, and `phase.sh red` wrote it back: an arbitrary-path write performed by
+# trusted code, reachable with two allowed commands, which moved the phase to 4
+# with no RED receipt and no approval.
+#
+# Indexing removes the parse entirely. There is no record to forge, the path is
+# never taken from content, and `printf -v` never evaluates what it stores.
+SPEC_SNAP_N=0
+
+spec_state_save() {
+  local n=0 s f
+  while IFS= read -r s; do
+    [ -z "$s" ] && continue
+    n=$((n + 1))
+    printf -v "SPEC_SNAP_P_$n" '%s' "$s"
+    f="${PROJECT_DIR%/}/$s"
+    if [ -f "$f" ]; then
+      printf -v "SPEC_SNAP_E_$n" '%s' 1
+      printf -v "SPEC_SNAP_C_$n" '%s' "$(cat "$f")"
+    else
+      printf -v "SPEC_SNAP_E_$n" '%s' 0
+      printf -v "SPEC_SNAP_C_$n" '%s' ''
+    fi
+  done <<< "$(spec_state_list)"
+  SPEC_SNAP_N=$n
+  return 0
+}
+
+spec_state_discard() { SPEC_SNAP_N=0; return 0; }
+
+# 0 = nothing moved. 1 = something moved and has been put back. 2 = a restore
+# was needed and could not be written, so the caller must not claim the state
+# was recovered.
+spec_state_restore() {
+  local n=1 touched=0 sp se sc f
+  [ "$SPEC_SNAP_N" -gt 0 ] || return 2
+  while [ "$n" -le "$SPEC_SNAP_N" ]; do
+    eval "sp=\${SPEC_SNAP_P_$n}"
+    eval "se=\${SPEC_SNAP_E_$n}"
+    eval "sc=\${SPEC_SNAP_C_$n}"
+    n=$((n + 1))
+    f="${PROJECT_DIR%/}/$sp"
+    if [ "$se" = 1 ]; then
+      if [ ! -f "$f" ] || [ "$(cat "$f" 2>/dev/null)" != "$sc" ]; then
+        touched=1
+        # The directory itself may be gone: `rm -rf .claude` is one of the
+        # payloads this exists to undo.
+        mkdir -p "$(dirname "$f")" 2>/dev/null
+        printf '%s\n' "$sc" > "$f" 2>/dev/null || { spec_state_discard; return 2; }
+      fi
+    elif [ -f "$f" ]; then
+      # Not there before the command ran, so the command invented it.
+      rm -f "$f" 2>/dev/null
+      touched=1
+    fi
+  done
+  spec_state_discard
+  [ "$touched" = 0 ]
+}
+
 # --- What counts as a test ---------------------------------------------------
 # Adjust to the repo's layout. A false negative here means production code
 # slips through Phase 3 — the one failure that makes the whole gate pointless.
@@ -80,9 +271,16 @@ is_gate_config() {
 # .spec-approval is in here for the sharpest version of that reason. It records
 # an answer the *user* gave, and a model that could write it could approve its
 # own spec — which is bug #1 from the review list arriving through a new door.
+#
+# .spec-validation is the same shape as .spec-red one phase later: it is what
+# 4 -> 5 rests on, and a marker the model could touch is a marker that asserts
+# the repo's own checks passed without any of them having run. Note the asymmetry
+# with the journal, which is NOT here — the journal holds prose the model wrote
+# itself, so denying it would protect the model's notes from their own author.
+# What must not be forgeable is the thing a *gate* reads, and that is this file.
 is_phase_state() {
   case "$1" in
-    *.spec-phase|*.spec-baseline|*.spec-red|*.spec-approval|*.spec-scaffold) return 0 ;;
+    *.spec-phase|*.spec-baseline|*.spec-red|*.spec-approval|*.spec-scaffold|*.spec-validation) return 0 ;;
   esac
   return 1
 }
@@ -315,8 +513,32 @@ in_project() {
 # to them rather than replacing them. They are configuration for the gate, not
 # work the gate should judge — and left uncommitted they arm it, so writing a
 # config file would otherwise demand a review of having written a config file.
+#
+# The gate's own state files are excluded on the same terms and for a sharper
+# reason. The documented install gitignores every one of them, which would make
+# this redundant — but a name missing from the target repo's .gitignore is
+# exactly the failure this has to survive, and that is not hypothetical: this
+# repo shipped two releases with .spec-scaffold absent from its own. An
+# untracked state file counts as work owed review, so the gate arms itself on
+# having recorded that it was armed, and nothing clears it: the paths are
+# gitignored-by-intent, so there is no commit a human can make to satisfy the
+# 5 -> 3 boundary or the close-out. Correctness here cannot rest on an install
+# step having been done properly.
+spec_state_list() {
+  printf '%s\n' \
+    '.claude/.spec-phase' \
+    '.claude/.spec-baseline' \
+    '.claude/.spec-red' \
+    '.claude/.spec-approval' \
+    '.claude/.spec-scaffold' \
+    '.claude/.spec-validation' \
+    '.claude/spec-journal.md' \
+    '.claude/review-log.jsonl'
+}
+
 review_exclude_list() {
   gate_config_list
+  spec_state_list
 
   f="${PROJECT_DIR%/}/.claude/spec-gate-review-exclude"
   if [ -r "$f" ]; then
@@ -329,11 +551,17 @@ review_exclude_list() {
   fi
 }
 
+# The `.tmp.<pid>` arm covers the sibling a state file is written through.
+# .spec-approval is written atomically via .spec-approval.tmp.$$ and renamed, and
+# `.spec-approval.tmp.4321` is not `.spec-approval`, so a Stop scan landing
+# inside that window armed the gate on the act of recording an answer — the
+# failure this list exists to make impossible regardless of how the install
+# gitignored things.
 is_review_excluded() {
   p="$1"
   while IFS= read -r e; do
     [ -z "$e" ] && continue
-    case "$p" in "$e"|"$e"/*) return 0 ;; esac
+    case "$p" in "$e"|"$e"/*|"$e".tmp.*) return 0 ;; esac
   done <<< "$(review_exclude_list)"
   return 1
 }
@@ -619,7 +847,7 @@ write_review_marker() {   # $1 = fingerprint text
 # missing from any one of them is a question whose answer nothing redeems, which
 # looks exactly like a user who was never asked. Adding a gate means adding it
 # here and nowhere else.
-gate_list() { printf 'spec red close-out skip abandon leave-review restart force\n'; }
+gate_list() { printf 'spec red close-out skip abandon leave-review restart force force-validation\n'; }
 
 # The last five replaced a terminal. They existed as "go run this in your own
 # shell" for one stated reason: a PreToolUse hook cannot tell a Bash call the
@@ -642,6 +870,7 @@ gate_header() {
     leave-review) printf 'Leave review' ;;
     restart)      printf 'Discard task' ;;
     force)        printf 'Force unlock' ;;
+    force-validation) printf 'Skip checks' ;;
   esac
 }
 
@@ -666,6 +895,14 @@ gate_question() {
     leave-review) printf 'Leave Phase 5 with a diff that is still owed review?' ;;
     restart)      printf 'Discard the task in progress and re-arm at Phase 1?' ;;
     force)        printf 'Unlock production code without verified failing tests?' ;;
+    # Deliberately not the `force` wording. Both flags are called --force and
+    # both skip a check, but they skip different ones at different costs: `force`
+    # unlocks production code on nothing having been shown to fail, while this
+    # one enters review with the repo's own checks unrun. Routing both to one
+    # question meant the user was asked about unlocking production code at a
+    # point where production code was already written — an answer given about
+    # the wrong risk, and one the receipt would then honour.
+    force-validation) printf 'Enter adversarial review with no validation report recorded?' ;;
   esac
 }
 
@@ -697,22 +934,25 @@ gate_options() {
                printf '%s\n' \
       'pr	Open a pull request	The PR is opened first, then the gate is disarmed. That order is load-bearing: disarming on an uncommitted tree makes the review gate fire on every turn.' \
       'continue	Keep iterating	Stay in Phase 5. Anything that changes from here gets reviewed exactly like the last round did.' \
-      'disarm	Disarm and leave it	The phase gate stops and the working tree is what you are left with. The review gate goes back to firing every turn while anything is uncommitted.' ;;
+      'disarm	Disarm and leave it	The phase gate stops and the working tree is what you are left with. The review gate goes back to firing every turn while anything is uncommitted, and the journal is deleted along with the rest of the state.' ;;
     skip) printf '%s\n' \
       'approve	Skip the phases between	You are giving up the approvals in the phases being jumped over — spec approval, or reading the tests fail, or both. Nothing later asks for them again. Choose this only if you already know what those phases would have shown you.' \
       'decline	Go one phase at a time	The workflow advances normally and each gate is asked in its turn.' ;;
     abandon) printf '%s\n' \
-      'approve	Turn the gate off	Before Phase 4 the gate is what blocks production code, so turning it off here is the same as unlocking Phase 4 without a spec or a failing test. The review gate then fires on every turn while the tree is dirty.' \
+      'approve	Turn the gate off	Before Phase 4 the gate is what blocks production code, so turning it off here is the same as unlocking Phase 4 without a spec or a failing test. The review gate then fires on every turn while the tree is dirty, and the journal is deleted — it is gitignored, so it does not come back.' \
       'decline	Keep the gate on	The task stays where it is. Retreating to an earlier phase is always available and does not need this.' ;;
     leave-review) printf '%s\n' \
       'approve	Leave the review behind	Phases 1 to 4 suppress the review gate, so moving there parks a diff nothing will look at again — it gets folded into the next baseline as though it had been reviewed.' \
       'decline	Stay in Phase 5	The diff keeps being owed review until it is reviewed and committed.' ;;
     restart) printf '%s\n' \
-      'approve	Discard it and restart	The task in progress is thrown away: phase, slice position and every approval already given. The working tree is untouched, so whatever was built stays, unreviewed and no longer tracked by the gate.' \
+      'approve	Discard it and restart	The task in progress is thrown away: phase, slice position, every approval already given, and the journal — the validation report, which findings were acted on, and how far Execute got. The journal is gitignored, so that part is gone for good rather than recoverable from git. The working tree is untouched, so whatever was built stays, unreviewed and no longer tracked by the gate.' \
       'decline	Keep the current task	The task continues from where it is.' ;;
     force) printf '%s\n' \
       'approve	Unlock without RED	The check refused: the new tests either passed with no implementation written, or no test files changed at all. Either way nothing has been shown to fail, so Phase 4 unlocks production code on your word rather than on evidence.' \
       'decline	Fix the tests first	Phase 3 continues. Run the RED check again once the tests fail for the reason the spec expects.' ;;
+    force-validation) printf '%s\n' \
+      'approve	Review it unvalidated	No report of this repo checks passing exists for the work Phase 4 just finished. Phase 5 hands the reviewer a diff whose build and test status nobody has established, and the session that resumes after this one has nothing to hand over either.' \
+      'decline	Run the checks first	Phase 4 continues. Run what this repo gates on, record it with phase.sh validation, and 4 -> 5 clears on its own.' ;;
   esac
 }
 
@@ -769,7 +1009,11 @@ gate_subject() {
     # skipping ahead from Phase 2 is spent in Phase 2 and nowhere else — plus a
     # re-check at the point of use, which is where `force` re-reads the RED
     # receipt and `leave-review` re-reads what is owed.
-    close-out|skip|abandon|leave-review|restart|force) : ;;
+    # force-validation is here rather than left to fall through the case. An
+    # unlisted gate produces the same empty subject and would behave correctly by
+    # accident, which is the kind of correct that stops being true the moment a
+    # default is added below.
+    close-out|skip|abandon|leave-review|restart|force|force-validation) : ;;
   esac
 }
 

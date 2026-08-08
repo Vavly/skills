@@ -9,7 +9,8 @@
 #
 # Install: .claude/hooks/phase.sh  (chmod +x), or via the spec-gate-install skill
 # Add .claude/.spec-phase, .claude/.spec-baseline, .claude/.spec-red,
-# .claude/.spec-approval* and .claude/.spec-scaffold to .gitignore
+# .claude/.spec-approval*, .claude/.spec-scaffold, .claude/.spec-validation
+# and .claude/spec-journal.md to .gitignore
 
 set -uo pipefail
 
@@ -26,12 +27,14 @@ BASELINE="$STATE_DIR/.spec-baseline"
 RECEIPT="$STATE_DIR/.spec-red"
 APPROVAL="$STATE_DIR/.spec-approval"
 SCAFFOLD="$STATE_DIR/.spec-scaffold"
+VALIDATION="$STATE_DIR/.spec-validation"
+JOURNAL="$STATE_DIR/spec-journal.md"
 TEST_CMD_FILE="$STATE_DIR/spec-gate-test-cmd"
 
 # tree_snapshot comes from phase-policy.sh, shared with review-gate.sh so the
 # baseline and the scan that reads it are computed the same way. Without it this
 # script still reports and clears state; only the baseline is skipped.
-HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 if [ -r "$HOOK_DIR/phase-policy.sh" ]; then
   # shellcheck source=phase-policy.sh
   . "$HOOK_DIR/phase-policy.sh"
@@ -63,7 +66,19 @@ fi
 # The state file is written from exactly one place, so a field cannot be dropped
 # by a caller that forgot it existed. Adding `slice` to a `printf` in three
 # separate branches is how the task name would have gone missing on the fourth.
-write_state() { printf 'phase=%s\ntask=%s\nslice=%s\n' "$1" "$2" "$3" > "$STATE"; }
+#
+# `started` is carried forward rather than passed in, for the same reason: every
+# transition rewrites this file, and a caller that had to re-supply the stamp
+# would eventually reset it and silently re-date the task. `start` deletes the
+# file first, which is what makes a new task get a new stamp. An older install
+# has no stamp at all, and everything reading it treats absent as "unknown" and
+# falls back to today's behaviour.
+write_state() {
+  local S=''
+  [ -f "$STATE" ] && S=$(sed -n 's/^started=//p' "$STATE" 2>/dev/null | head -1)
+  [ -n "$S" ] || S=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+  printf 'phase=%s\ntask=%s\nslice=%s\nstarted=%s\n' "$1" "$2" "$3" "$S" > "$STATE"
+}
 
 # Indexing an array with an unvalidated value out of the state file used to
 # abort this script with "unbound variable" under set -u. A case is total.
@@ -150,11 +165,48 @@ verify_red() {
   # Captured rather than streamed, because the classification below reads it.
   # bash rather than sh, for pipefail: `pytest | tail` returned the tail's zero,
   # so a genuinely failing suite was reported as PASSED.
+  # The gate's own state is put aside before the command runs and checked back
+  # afterwards. This command is model-authored shell that the guard deliberately
+  # allows in every phase, so without this the shortest route out of the workflow
+  # was to write `rm -f .claude/.spec-phase` here and run the verifier.
+  if ! spec_state_save; then
+    echo "spec-driven: REFUSED — could not put this gate's state aside before running"
+    echo "  the configured test command, so there is nothing to restore it from if"
+    echo "  the command touches it. Refusing rather than running unprotected."
+    return 1
+  fi
+  # A killed run must not leave the snapshot behind: it is the thing a later
+  # payload would go looking for.
+  trap 'spec_state_discard' EXIT INT TERM
   out=$(
     cd "$PROJECT_DIR" 2>/dev/null || exit 0
     SPEC_GATE_TEST_FILES="$files" bash -c "set -o pipefail; $cmd" 2>&1
   )
   rc=$?
+  spec_state_restore; sr=$?
+  trap - EXIT INT TERM
+  if [ "$sr" != 0 ]; then
+    printf '%s\n' "$out"
+    echo
+    rm -f "$RECEIPT"
+    echo "spec-driven: REFUSED — the configured test command changed this gate's own"
+    echo "  state while it ran."
+    if [ "$sr" = 2 ]; then
+      # Deliberately not "has been undone": the snapshot was altered or removed,
+      # so restoring from it would have installed whatever it now contains.
+      echo "  It also reached the snapshot taken to undo that, so the state has NOT"
+      echo "  been restored — nothing here can be trusted to put it back. Check"
+      echo "  $STATE_DIR_REL by hand, and run 'phase.sh status'; if the phase is wrong,"
+      echo "  'phase.sh off' and start the task again."
+    else
+      echo "  Whatever it did to $STATE_DIR_REL has been undone."
+    fi
+    echo "  A test command runs the repo's tests; one that rewrites the phase, the"
+    echo "  receipts or the approval is doing something else, and nothing it printed"
+    echo "  is evidence about anything."
+    echo "  Fix the command in $TEST_CMD_FILE, then run phase.sh red again."
+    return 1
+  fi
   printf '%s\n' "$out"
   echo
   kind=$(red_failure_kind "$rc" "$out")
@@ -240,10 +292,154 @@ red_tripwire() {
   verify_red
   case $? in
     0) return 0 ;;
-    2) return 0 ;;                      # unverifiable: advance on the assertion
+    # Deliberately an advance, and deliberately not the enforcement. This script
+    # is the user's control surface: run in a terminal it reports and proceeds,
+    # having said plainly that nothing was verified. What refuses is phase-guard,
+    # which denies 3 -> 4 on any receipt state but `valid` — including this one,
+    # and including the case where phase-policy.sh is missing entirely, where the
+    # guard refuses every write rather than degrading. Making this refuse too
+    # would only stop the user from doing what they already decided to do.
+    2) return 0 ;;
     *) echo "  Override with: phase.sh 4 --force"
        return 1 ;;
   esac
+}
+
+# --- The journal --------------------------------------------------------------
+# Almost everything this workflow produces already survives a lost session: the
+# phase is in the state file, the spec and the plan are on disk, every reviewer
+# verdict is in review-log.jsonl, and what shipped is in git. Exactly three
+# things were only ever said out loud — the validation report, which findings
+# were acted on and which were declined, and how far through the plan Execute
+# had got. Those are what a resuming session cannot reconstruct unless they were
+# written down, so this is the whole of what the journal is for.
+#
+# It lives in .claude/ and is gitignored for a reason beyond tidiness. The review
+# gate collects what is owed from `git diff HEAD` and `git status --porcelain`,
+# so a journal kept in the spec — or anywhere else tracked — would dirty the tree
+# every time it was written, re-arm the gate, and demand a review round whose
+# only finding would be the entry describing the previous one.
+# Both journal-writing commands take their body on stdin, and both had the same
+# two ways of silently getting nothing. Run with no redirection — which is what
+# the documented /spec-phase path does, since it forwards arguments and never a
+# heredoc — `cat` returns empty against /dev/null and the entry is a stamped
+# header with nothing under it. Run from a terminal, `cat` blocks instead, and a
+# command invoked by a hook that waits forever on stdin is worse than one that
+# fails.
+#
+# An empty body is refused rather than recorded, for the reason an empty `tests:`
+# block voids a RED receipt: a header with no content is indistinguishable from
+# work that was done, and it is the *validation* report that this matters most
+# for — an empty one still wrote the marker that clears 4 -> 5, so the gate
+# certified that nothing had been run. A gate that produces evidence of a check
+# nobody performed is worse than no gate, because the next session reads it and
+# stops asking.
+#
+# The check lives in the function that writes rather than in its callers, and
+# that placement is the point. Guarding at each call site leaves the next caller
+# free to forget, and what it would silently produce is the empty entry this
+# refusal exists to prevent — the same bug back through a new door. Reading
+# stdin and refusing an empty body are one act here, so there is no way to
+# append without having passed it.
+journal_append() {  # $1 = command name, for the messages; $2 = optional label
+  # 1 = refused, and the reason is already on stderr. 2 = could not write, which
+  # the caller reports itself. Collapsing the two made a refusal print a
+  # "could not write" line on top of a precise explanation of why nothing was.
+  if [ -t 0 ]; then
+    echo "spec-driven: '$1' reads its entry from stdin, and stdin is a terminal." >&2
+    echo "  Nothing was recorded. Pass the text as a heredoc:" >&2
+    echo "      phase.sh $1 <<'EOF'" >&2
+    echo "      ..." >&2
+    echo "      EOF" >&2
+    return 1
+  fi
+  BODY=$(cat)
+  if [ -z "$(printf '%s' "$BODY" | tr -d '[:space:]')" ]; then
+    echo "spec-driven: REFUSED — nothing arrived on stdin, so there is no entry." >&2
+    echo "  This command does not take its content as an argument. It reads stdin," >&2
+    echo "  so it needs a heredoc:" >&2
+    echo "      phase.sh $1 <<'EOF'" >&2
+    echo "      ..." >&2
+    echo "      EOF" >&2
+    return 1
+  fi
+
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 2
+  JP=$(sed -n 's/^phase=//p' "$STATE" 2>/dev/null | head -1)
+  { printf '\n## %s — phase %s, slice %s/%s%s\n\n' \
+      "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "${JP:-?}" \
+      "$(slice_current)" "$(slice_total)" "${2:+ — $2}"
+    printf '%s\n' "$BODY"
+    printf '\n'
+  } >> "$JOURNAL" || return 2
+  return 0
+}
+
+# 0 = go ahead, 1 = refuse. Consulted by `phase.sh 5`.
+#
+# The mirror of red_tripwire, for the mirror reason. Phase 4 cannot exit without
+# the repo's own checks passing, and Phase 5's first act is handing that report
+# to a reviewer — so a report that exists only in the conversation is one the
+# next session cannot hand over and nobody can check was ever run. The marker is
+# cleared by every phase change, exactly like the RED receipt, so it can only
+# describe the Phase 4 that just ended.
+validation_tripwire() {
+  cur=$(sed -n 's/^phase=//p' "$STATE" | head -1)
+  [ "$cur" = "4" ] || return 0          # only 4 -> 5 asserts a report
+  st=$(sed -n 's/^task=//p' "$STATE" | head -1)
+  # The marker carries the task and slice it was written for, and those fields
+  # are read rather than merely recorded — data nothing consults is data that
+  # drifts unnoticed until it is wrong. Deleting the marker on every phase
+  # change covers most of this already, but `phase.sh slices` moves the slice
+  # position with no phase change at all, so without this a report written for
+  # slice 1 of 2 would still clear 4 -> 5 after the task was re-sliced.
+  #
+  # Exact match on the whole `slice` field, matching approval_status rather
+  # than being cleverer than it. Re-sliced work has had its scope redrawn, and
+  # re-running the repo's checks against the new shape is cheap next to
+  # reasoning about which halves of a stale report still apply.
+  case "$(validation_marker_status "$VALIDATION" "$st" "$(slice_current)/$(slice_total)")" in
+    valid) return 0 ;;
+    forged)
+      echo "spec-driven: REFUSED — the validation marker could not be authenticated."
+      echo "  It was not written by phase.sh validation: the marker carries a keyed"
+      echo "  hash of its own fields, and this one does not verify. A marker that can"
+      echo "  be written by hand certifies nothing, which is the whole reason 4 -> 5"
+      echo "  asks for one. (A marker made before this version has no hash and lands"
+      echo "  here too — re-record and it will be accepted.)"
+      echo "  Run the repo's checks, then record them:"
+      echo "    phase.sh validation <<'EOF'"
+      echo "    ..."
+      echo "    EOF"
+      echo "  Override with: phase.sh 5 --force"
+      return 1 ;;
+    stale)
+    vt=$(sed -n 's/^task=//p' "$VALIDATION" | head -1)
+    vs=$(sed -n 's/^slice=//p' "$VALIDATION" | head -1)
+    echo "spec-driven: REFUSED — the validation report on record was written for a"
+    echo "  different point in this task (task '${vt:-?}', slice ${vs:-?}; you are on"
+    echo "  task '${st:-?}', slice $(slice_current)/$(slice_total))."
+    echo "  It describes work of a different shape, so it says nothing about what"
+    echo "  Phase 4 is finishing now. Re-run the checks and record them again:"
+    echo "    phase.sh validation <<'EOF'"
+    echo "    ..."
+    echo "    EOF"
+    echo "  Override with: phase.sh 5 --force"
+      return 1 ;;
+  esac
+  echo "spec-driven: REFUSED — no validation report on record for this Phase 4."
+  echo "  Phase 5 hands the repo's own checks to the reviewer. A report that"
+  echo "  exists only in this conversation cannot be handed over by the session"
+  echo "  that resumes after this one, and nobody can check it was ever run."
+  echo "  Run what this repo gates on, then record it:"
+  echo "    phase.sh validation <<'EOF'"
+  echo "    Commands: <exactly what you ran>"
+  echo "    Source:   <where you got them>"
+  echo "    Result:   <per command: pass, plus its summary line>"
+  echo "    Not covered: <what this repo does not check at all>"
+  echo "    EOF"
+  echo "  Override with: phase.sh 5 --force"
+  return 1
 }
 
 # review_pending_paths now lives in phase-policy.sh — phase-guard.sh gates the
@@ -310,7 +506,14 @@ FOREIGN=""
 if [ ! -f "$STATE" ] && command -v spec_foreign_state >/dev/null 2>&1; then
   FOREIGN=$(spec_foreign_state "$PROJECT_DIR")
 fi
-if [ -n "$FOREIGN" ] && [ "${1:-status}" != status ]; then
+# `brief` joins `status` in being answerable from the wrong tree, and for a
+# stronger reason than symmetry. It is the SessionStart hook, so it runs before
+# the model has done anything — which is the one moment where "a task is armed,
+# but not here" is still cheap to act on. Refusing it instead, as every other
+# command is refused, printed that refusal on stdout, and stdout from this event
+# goes into the model's context: the briefing slot would have been spent on an
+# error message about the briefing.
+if [ -n "$FOREIGN" ] && [ "${1:-status}" != status ] && [ "${1:-status}" != brief ]; then
   echo "spec-driven: REFUSED — $(spec_split_message "$FOREIGN" "$(spec_realpath "$PROJECT_DIR")")"
   exit 1
 fi
@@ -393,10 +596,18 @@ case "${1:-status}" in
     mkdir -p "$STATE_DIR"
     # A newline in the task name would inject extra lines into the state file.
     T=$(printf '%s' "${2:-unnamed}" | tr -d '\n\r')
+    # Removed rather than overwritten, so write_state stamps a new `started`
+    # instead of carrying the previous task's forward. That stamp is what scopes
+    # the reviewer verdicts in `brief` to this task.
+    rm -f "$STATE"
     write_state 1 "$T" "1/1"
-    rm -f "$RECEIPT" "$APPROVAL" "$SCAFFOLD"
+    # The journal goes too: a new task inheriting the last one's validation report
+    # and findings is a briefing that lies, and it lies most convincingly to the
+    # session that was not here for either task.
+    rm -f "$RECEIPT" "$APPROVAL" "$SCAFFOLD" "$VALIDATION" "$JOURNAL"
     snapshot_baseline
     echo "spec-driven: started '${T}' at phase 1 (Clarify)"
+    echo "  Any previous journal was deleted with the rest of that task's state."
     ;;
 
   # Set the number of slices this task lands in. Its own command rather than a
@@ -456,6 +667,9 @@ case "${1:-status}" in
       echo "  Reword it and the answer records nothing, so you would be asking twice."
       echo "  Everything you want to say about the decision goes in your own message"
       echo "  above the question, where it belongs — not in the question."
+      echo "  This turn ends waiting on them, not with the task finished. If your"
+      echo "  harness reads your message text to tell those apart — a background"
+      echo "  job does — say which one it is there. 'needs input:', not 'result:'."
     } >&2
     ;;
 
@@ -497,6 +711,225 @@ case "${1:-status}" in
     esac
     ;;
 
+  journal)
+    [ -f "$STATE" ] || { echo "spec-driven: not started. Run: phase.sh start <task>" >&2; exit 1; }
+    journal_append journal "${2:-}"
+    case $? in
+      0) ;;
+      1) exit 1 ;;                      # refused; journal_append said why
+      *) echo "spec-driven: could not write $JOURNAL" >&2; exit 1 ;;
+    esac
+    echo "spec-driven: recorded in .claude/spec-journal.md"
+    ;;
+
+  validation)
+    [ -f "$STATE" ] || { echo "spec-driven: not started. Run: phase.sh start <task>" >&2; exit 1; }
+    P=$(sed -n 's/^phase=//p' "$STATE" | head -1)
+    if [ "$P" != 4 ]; then
+      echo "spec-driven: the validation report belongs to Phase 4, and you are at $(phase_name "$P")."
+      echo "  It records the repo's own checks passing on the finished plan, which"
+      echo "  is what Phase 4 cannot exit without."
+      exit 1
+    fi
+    # The marker below is written only after this succeeds. That order is what
+    # makes the refusal mean anything: a marker written first would clear 4 -> 5
+    # on a report the journal never received.
+    journal_append validation "VALIDATION REPORT"
+    case $? in
+      0) ;;
+      1) exit 1 ;;                      # refused; journal_append said why
+      *) echo "spec-driven: could not write $JOURNAL" >&2; exit 1 ;;
+    esac
+    T=$(sed -n 's/^task=//p' "$STATE" | head -1)
+    { printf '# spec-gate validation marker — written by phase.sh validation, never by hand\n'
+      printf 'task=%s\nslice=%s/%s\n' "$T" "$(slice_current)" "$(slice_total)"
+    } > "$VALIDATION"
+    # The authenticator, over the fields just written. Without it the marker is
+    # a plain file the model can recreate, so every deletion route the guard
+    # misses becomes a way to clear 4 -> 5 rather than merely to re-arm it.
+    if ! spec_mac_write "$VALIDATION"; then
+      rm -f "$VALIDATION"
+      echo "spec-driven: could not authenticate the validation marker — no key could be" >&2
+      echo "  written under .git/, or this host has no sha256 tool. The report is in the" >&2
+      echo "  journal, but 4 -> 5 will refuse until this is fixed." >&2
+      exit 1
+    fi
+    echo "spec-driven: validation report recorded — 4 -> 5 is clear."
+    echo "  It is in .claude/spec-journal.md, which is where Phase 5 hands it to the"
+    echo "  reviewer from, and where the next session finds it if this one ends first."
+    ;;
+
+  brief)
+    # The read side of all of the above, and the only command here written to be
+    # run by a hook rather than by a person. SessionStart calls it on startup,
+    # resume, clear and compact, and for those events stdout is added to the
+    # model's context — so it says nothing at all when no task is armed, and stays
+    # bounded when one is. A briefing that grew without limit would spend exactly
+    # the context it exists to save.
+    # FOREIGN is only ever set when there is no state file here, so this has to
+    # come before the exit that quietly says "nothing is armed" — which is the
+    # bug the ordering used to have: the branch below was unreachable, and the
+    # one case it existed for exited 0 in silence.
+    if [ -n "$FOREIGN" ]; then
+      echo "spec-driven: a task is armed in ANOTHER WORKTREE ($FOREIGN), not this one."
+      echo "  Run 'phase.sh status' before writing anything you expect the gate to see."
+      exit 0
+    fi
+    [ -f "$STATE" ] || exit 0
+    BP=$(sed -n 's/^phase=//p' "$STATE" | head -1)
+    BT=$(sed -n 's/^task=//p' "$STATE" | head -1)
+    echo "spec-driven: this repo has an ACTIVE spec-driven task."
+    echo "You did not start this conversation with it, so everything below was read"
+    echo "off disk rather than remembered."
+    echo
+    echo "  task:  ${BT:-unnamed}"
+    echo "  phase: $(phase_name "$BP")"
+    [ "$(slice_total)" -gt 1 ] && echo "  slice: $(slice_current) of $(slice_total)"
+    # Phase 1 has no spec yet — writing one is what Phase 2 is — so "NOT FOUND"
+    # there reports the workflow working correctly as though it were damage. The
+    # same holds at Phase 2 itself, where an absent spec means the phase is
+    # unfinished rather than that something went missing: the line stays, because
+    # a resuming session needs to know there is nothing written yet, but it says
+    # which of the two it is.
+    if [ "$BP" != 1 ]; then
+      if [ -n "$BT" ] && [ -f "$PROJECT_DIR/docs/specs/$BT.md" ]; then
+        echo "  spec:  docs/specs/$BT.md"
+      elif [ "$BP" = 2 ]; then
+        echo "  spec:  docs/specs/${BT:-<task>}.md — NOT FOUND; writing it is what Phase 2 is for"
+      else
+        echo "  spec:  docs/specs/${BT:-<task>}.md — NOT FOUND; find it before trusting the rest"
+      fi
+    fi
+    # Each of these is reported only where it can be true, which is narrower than
+    # where it bears on the next move — and the difference is the whole point.
+    # Every phase transition deletes both receipts, so at Phase 4 the RED receipt
+    # is gone by construction and "RED: not verified" is not a finding about the
+    # tests, it is a description of the transition that just happened. Printing
+    # it there told a resuming session its verified tests were unverified, which
+    # is the one thing a briefing must never do. Same for the checks line at
+    # Phase 5: the marker that cleared 4 -> 5 was deleted by 4 -> 5.
+    if [ "$BP" = 3 ]; then
+      case "$(red_receipt_status)" in
+        valid) echo "  RED:   verified" ;;
+        stale) echo "  RED:   receipt STALE — the tests changed since; re-run 'phase.sh red'" ;;
+        *)     echo "  RED:   not verified — run 'phase.sh red'" ;;
+      esac
+    fi
+    if [ "$BP" = 4 ]; then
+      # The same predicate 4 -> 5 reads, not `[ -f ]`. Testing existence alone
+      # announced a stale or unauthenticated marker as a recorded report, and the
+      # transition then refused the very thing the briefing had just promised.
+      BT=$(sed -n 's/^task=//p' "$STATE" | head -1)
+      case "$(validation_marker_status "$VALIDATION" "$BT" "$(slice_current)/$(slice_total)")" in
+        valid)  echo "  checks: a validation report is recorded for this Phase 4" ;;
+        stale)  echo "  checks: the report on record was written for a different task or slice —" ;
+                echo "          4 -> 5 will refuse until 'phase.sh validation' runs again" ;;
+        forged) echo "  checks: the marker on record does not authenticate and will not be" ;
+                echo "          accepted — re-run 'phase.sh validation'" ;;
+        *)      echo "  checks: none recorded — 4 -> 5 will refuse until 'phase.sh validation' runs" ;;
+      esac
+    fi
+    for g in $(gate_list); do
+      A=$(approval_status "$g")
+      case "$A" in
+        none|stale|unverifiable) ;;
+        *) echo "  answered: the user has already answered the '$g' gate: $A" ;;
+      esac
+    done
+    echo
+    # Where Execute got to is the one part of "where was I" that git answers
+    # better than any journal, so it is read live rather than recorded.
+    # Read once and reused. This is a SessionStart hook with a timeout, and the
+    # second identical `git status` bought nothing but another chance to be the
+    # call that runs long on a large repo and takes the whole briefing with it.
+    PORC=$( (cd "$PROJECT_DIR" 2>/dev/null && git status --porcelain 2>/dev/null) )
+    if [ -n "$PORC" ]; then
+      N=$(printf '%s\n' "$PORC" | wc -l | tr -d ' ')
+      echo "Uncommitted right now — $N path(s), first 10:"
+      printf '%s\n' "$PORC" | head -10 | sed 's/^/  /'
+      echo
+    fi
+    if [ -s "$JOURNAL" ]; then
+      # Deliberately not "the state of the work". Everything above this line was
+      # written by a hook the model cannot reach; the journal is prose a previous
+      # session wrote about itself, and it is the only thing here that can be
+      # confidently wrong. Saying so is cheaper than making it unforgeable —
+      # denying the model write access would only protect its own notes from
+      # their author — and a briefing that flattens the two into one register
+      # teaches the reader to trust the weaker half as much as the stronger.
+      echo "Journal tail — the last 40 lines of .claude/spec-journal.md, which is longer."
+      echo "These are a previous session's own notes, not verified state: what they claim"
+      echo "was run or decided is testimony. Read the file in full, and re-check anything"
+      echo "you are about to build on."
+      tail -40 "$JOURNAL" | sed 's/^/  /'
+      echo
+    else
+      echo "Journal: empty. Nothing has been recorded for this task yet."
+      echo
+    fi
+    # The log is append-only and spans the repo, not the task. Printed whole, a
+    # brand-new task's briefing opened with a verdict about work it has nothing
+    # to do with — in the register this briefing reserves for facts read off
+    # disk. It is filtered rather than deleted: it is the only durable record
+    # that a review ever happened, and `start` throwing it away would destroy
+    # the audit trail to fix a display bug.
+    #
+    # SINCE empty (an install predating the stamp) means unfiltered, which is
+    # today's behaviour rather than an empty section.
+    SINCE=$(sed -n 's/^started=//p' "$STATE" 2>/dev/null | head -1)
+    if [ -s "$STATE_DIR/review-log.jsonl" ]; then
+      # Filtered first, THEN the last 5: taking the tail first meant five old
+      # entries hid two current ones. And the header is printed from the result
+      # rather than ahead of it — jq aborts the whole stream on the first
+      # malformed line, so a log torn by a killed hook produced the sentence
+      # "Reviewer verdicts on record" with nothing underneath it.
+      VERD=''
+      if command -v jq >/dev/null 2>&1; then
+        # -R with fromjson? skips a torn line instead of ending the stream.
+        VERD=$(jq -Rr --arg since "$SINCE" '
+          fromjson? // empty
+          | select($since == "" or (.t // "") >= $since)
+          | "  \(.t) \(.agent): \(((.msg // "") | split("\n") | map(select(length > 0)) | first // "")[0:160])"' \
+          "$STATE_DIR/review-log.jsonl" 2>/dev/null | tail -5)
+      elif command -v python3 >/dev/null 2>&1; then
+        # Same fallback phase-guard.sh already relies on. Silently skipping this
+        # section on a machine without jq made a briefing with no reviewer
+        # history look like a task that had never been reviewed.
+        VERD=$(python3 -c '
+import sys, json
+since = sys.argv[1]
+for line in sys.stdin:
+    try: d = json.loads(line)
+    except Exception: continue
+    if since and (d.get("t") or "") < since: continue
+    msg = (d.get("msg") or "").split("\n")
+    first = next((s for s in msg if s), "")
+    print("  %s %s: %s" % (d.get("t"), d.get("agent"), first[:160]))' \
+          "$SINCE" < "$STATE_DIR/review-log.jsonl" 2>/dev/null | tail -5)
+      else
+        VERD="  (neither jq nor python3 is installed, so the verdicts could not be read;
+   they are in .claude/review-log.jsonl)"
+      fi
+      if [ -n "$VERD" ]; then
+        echo "Reviewer verdicts on record for this task — the last 5, oldest first."
+        echo "Like the journal, these are a reviewer's claims about the work, not"
+        echo "verified state: a verdict of 'sound' is one agent's reading, and the"
+        echo "fixes it describes are only as done as the diff says they are."
+        printf '%s\n' "$VERD"
+        echo
+      fi
+    fi
+    # Only Phase 5 has reviewer sessions to have lost. Said at Phase 1 it is a
+    # warning about something that does not exist yet, and the reader who learns
+    # to skim it here is the reader who skims it where it matters.
+    if [ "$BP" = 5 ]; then
+      echo "Your reviewer sessions did NOT survive. Spawn fresh ones and record in the"
+      echo "evidence log that the round started cold — a reviewer that has forgotten its"
+      echo "own findings cannot tell you whether a fix landed."
+    fi
+    echo "Run 'phase.sh status' for what you may write and who owns the next move."
+    ;;
+
   1|2|3|4|5)
     [ -f "$STATE" ] || { echo "spec-driven: not started. Run: phase.sh start <task>"; exit 1; }
     if [ "$1" = 4 ]; then
@@ -505,6 +938,14 @@ case "${1:-status}" in
           echo "spec-driven: --force — skipping the RED tripwire on your assertion." ;;
         *)
           red_tripwire || exit 1 ;;
+      esac
+    fi
+    if [ "$1" = 5 ]; then
+      case "${2:-}" in
+        --force)
+          echo "spec-driven: --force — advancing with no validation report recorded." ;;
+        *)
+          validation_tripwire || exit 1 ;;
       esac
     fi
     T=$(sed -n 's/^task=//p' "$STATE" | head -1)
@@ -528,7 +969,11 @@ case "${1:-status}" in
     # one phase and spent in it. It is also pinned to the phase it was answered
     # in, so this delete is the second of two locks — cheap, and the kind of
     # redundancy worth having on the file that says the user said yes.
-    rm -f "$RECEIPT" "$APPROVAL" "$SCAFFOLD"
+    # The validation marker rides with the RED receipt for the same reason: it
+    # describes one Phase 4, and every phase change ends that Phase 4 — including
+    # a retreat back into it. The journal itself survives; it is the history, and
+    # the history is what a resuming session has instead of a memory.
+    rm -f "$RECEIPT" "$APPROVAL" "$SCAFFOLD" "$VALIDATION"
     snapshot_baseline
     echo "spec-driven: -> $(phase_name "$1")"
     if [ "$ADVANCED" = 1 ]; then
@@ -537,20 +982,41 @@ case "${1:-status}" in
     ;;
 
   off)
-    rm -f "$STATE" "$BASELINE" "$RECEIPT" "$APPROVAL" "$SCAFFOLD"
+    rm -f "$STATE" "$BASELINE" "$RECEIPT" "$APPROVAL" "$SCAFFOLD" "$VALIDATION" "$JOURNAL"
     echo "spec-driven: phase gate off"
     echo "  This ends the phase workflow. It does not stop review — with no phase"
     echo "  file the Stop gate returns to its default and runs EVERY turn."
+    # Said out loud because it is the one thing here that git cannot give back.
+    # The phase is re-declarable and the code is committed or in the tree; the
+    # journal is gitignored by design, so `off` is the only destructive act in
+    # this script that has no undo.
+    echo "  The journal went with it: .claude/spec-journal.md is deleted, and it is"
+    echo "  gitignored, so nothing in git has a copy. The validation report, which"
+    echo "  findings were acted on and which declined, and how far Execute got are"
+    echo "  gone. Copy anything you still need into the PR or the spec before now."
     report_review_state
     ;;
 
   *)
-    echo "usage: phase.sh [status | start <task> | ask <gate> | red | scaffold | slices <n> | 1..5 | off]"
+    echo "usage: phase.sh [status | brief | start <task> | ask <gate> | red | scaffold |"
+    echo "                slices <n> | journal | validation | 1..5 | off]"
+    # Derived, not retyped. This line said "spec | red | close-out" while
+    # gate_list had grown to nine, and the `ask` command a few hundred lines up
+    # already builds its own error from gate_list — so the usage was the only
+    # copy that could drift, and had.
     echo "       phase.sh ask <gate>  print the question for a gate as an"
-    echo "                            AskUserQuestion payload: spec | red | close-out"
+    echo "                            AskUserQuestion payload:"
+    echo "                            $(gate_list | tr ' ' '|')"
     echo "       phase.sh red         run the Phase 3 tests and record RED if they fail"
     echo "       phase.sh slices <n>  set how many slices this task lands in"
+    echo "       phase.sh brief       reconstruct the task from disk, for a session"
+    echo "                            that has lost it — run by the SessionStart hook"
+    echo "       phase.sh journal [label] < entry"
+    echo "                            append a stamped entry to .claude/spec-journal.md"
+    echo "       phase.sh validation < report"
+    echo "                            record the Phase 4 validation report; 4 -> 5 needs it"
     echo "       phase.sh 4 --force   advance without the RED check"
+    echo "       phase.sh 5 --force   advance without a recorded validation report"
     exit 1
     ;;
 esac

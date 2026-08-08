@@ -29,7 +29,7 @@
 set -uo pipefail
 
 INPUT=$(cat)
-HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 
 PARSER=""
 command -v jq      >/dev/null 2>&1 && PARSER=jq
