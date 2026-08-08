@@ -1550,6 +1550,15 @@ Where that leaves the design:
   list" for whole channels. Assignments the command makes itself *are* resolved,
   so `V=.claude/.spec-phase; rm -f $V` is refused on what `$V` holds — while a
   variable this hook cannot see the value of, like `> $LOGFILE`, stays allowed.
+  The last assignment wins, substitution applies anywhere in a token (`.claude/$A`),
+  and the value on the right of an `=` is itself checked — a resolver can always
+  be walked around, but the literal has to appear somewhere.
+- **A heredoc body belongs to the verb that opened it, by number.** Each `<<`
+  leaves a numbered placeholder where it appeared and the body is spliced back
+  in at that position, so `cat <<A && bash <<B` gives B's body to `bash` and
+  A's to `cat`. Holding separators alone could not express this: one line can
+  open two heredocs for two different verbs, and every body was being attributed
+  to the first — which dropped the second from the scan entirely.
 - **A refusal outranks a permission, and is checked first.** `decide` exits, so
   whichever check speaks first speaks for the whole command. The write scan runs
   ahead of the phase walk for that reason: with the order reversed, `phase.sh
@@ -1618,7 +1627,7 @@ you read it.
 
 Builds a throwaway git repo in a temp dir, installs the hooks into it, and drives
 them with synthetic hook payloads. Nothing touches the repo you run it from.
-913 cases: the phase policy, every write vector, the advance-transition matrix,
+986 cases: the phase policy, every write vector, the advance-transition matrix,
 RED verification and the receipt's staleness rules, the approval questions and
 everything the receipt hook refuses to record, fail-closed behavior, the review
 gate with its index-invariance and its between-rounds delta, the slice position
@@ -1626,6 +1635,22 @@ and its boundary rules, the phase scan with its baseline, every internal link
 in every skill — target file and heading anchor both — and the two install paths,
 which must register the same six events with the same matchers, scripts and
 timeouts, since `settings.json` and `hooks/hooks.json` are two copies of one fact.
+
+One group is shaped differently from the rest and is worth reading first: the
+**coverage-equivalence** matrix. It enumerates the protected targets against
+every channel a command can carry a payload through — bare argument, redirect
+target, `-c` payload, herestring, heredoc body, the second of two heredocs on
+one line, behind a variable, behind a re-assigned variable, after a read-only
+call — and asserts every one reaches the same decision as the bare spelling.
+
+That shape exists because it is the failure this component kept having. Four
+review rounds in a row found holes one axis over from the previous round's fix,
+because each round's tests pinned the reproduction they were handed rather than
+the rule. A per-spelling test says "this string is refused"; the matrix says
+"this target is refused however it arrives", and a scanner that learns about a
+token kind in two places out of three fails it rather than shipping. Adding a
+channel costs one line and immediately tests it against every target; adding a
+target costs one line and tests it against every channel.
 
 The approval cases lean hard on the *negative* ones, and that is the point:
 roughly half of them drive `approval-receipt.sh` with a payload it should not

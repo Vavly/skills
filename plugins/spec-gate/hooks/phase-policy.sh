@@ -132,61 +132,71 @@ validation_marker_status() {   # $1 = marker path, $2 = task, $3 = slice
 # whatever the command does — obfuscated, nested, or spawned — because it is
 # checked on the way out rather than predicted on the way in.
 #
-# The snapshot is held in a shell variable, not on disk. A directory — even one
-# from mktemp — is findable: the executed test command can walk $TMPDIR, and
-# deleting the backup was enough to disarm the gate even though the restore
-# refused loudly afterwards. There is nothing on disk to find now, and nothing
-# for the payload to rewrite, so the whole "the snapshot was compromised" branch
-# disappears rather than being defended.
+# The snapshot is held in shell variables, not on disk and not in one blob. A
+# directory — even one from mktemp — is findable: the executed test command can
+# walk $TMPDIR, and deleting the backup was enough to disarm the gate however
+# loudly the restore complained afterwards.
 #
-# Records are <path>FS<content>GS. Those two control characters cannot occur in
-# any of these files, all of which are line-oriented text.
-SPEC_SNAP=""
+# One variable per state path, indexed by position, rather than records packed
+# into a single string with in-band separators. The separator version carried a
+# false premise — that the control characters "cannot occur in any of these
+# files" — when one of the files it snapshots is spec-journal.md, whose content
+# the model writes. A journal entry containing a separator therefore forged a
+# record, and `phase.sh red` wrote it back: an arbitrary-path write performed by
+# trusted code, reachable with two allowed commands, which moved the phase to 4
+# with no RED receipt and no approval.
+#
+# Indexing removes the parse entirely. There is no record to forge, the path is
+# never taken from content, and `printf -v` never evaluates what it stores.
+SPEC_SNAP_N=0
 
 spec_state_save() {
-  SPEC_SNAP=""
+  local n=0 s f
   while IFS= read -r s; do
     [ -z "$s" ] && continue
+    n=$((n + 1))
+    printf -v "SPEC_SNAP_P_$n" '%s' "$s"
     f="${PROJECT_DIR%/}/$s"
-    [ -f "$f" ] || continue
-    SPEC_SNAP="$SPEC_SNAP$s"$'\034'"$(cat "$f")"$'\035'
+    if [ -f "$f" ]; then
+      printf -v "SPEC_SNAP_E_$n" '%s' 1
+      printf -v "SPEC_SNAP_C_$n" '%s' "$(cat "$f")"
+    else
+      printf -v "SPEC_SNAP_E_$n" '%s' 0
+      printf -v "SPEC_SNAP_C_$n" '%s' ''
+    fi
   done <<< "$(spec_state_list)"
+  SPEC_SNAP_N=$n
   return 0
 }
 
-spec_state_discard() { SPEC_SNAP=""; return 0; }
+spec_state_discard() { SPEC_SNAP_N=0; return 0; }
 
 # 0 = nothing moved. 1 = something moved and has been put back. 2 = a restore
 # was needed and could not be written, so the caller must not claim the state
 # was recovered.
 spec_state_restore() {
-  touched=0
-  rest=$SPEC_SNAP
-  seen=""
-  while [ -n "$rest" ]; do
-    rec=${rest%%$'\035'*}
-    rest=${rest#*$'\035'}
-    [ -z "$rec" ] && continue
-    sp=${rec%%$'\034'*}
-    sc=${rec#*$'\034'}
+  local n=1 touched=0 sp se sc f
+  [ "$SPEC_SNAP_N" -gt 0 ] || return 2
+  while [ "$n" -le "$SPEC_SNAP_N" ]; do
+    eval "sp=\${SPEC_SNAP_P_$n}"
+    eval "se=\${SPEC_SNAP_E_$n}"
+    eval "sc=\${SPEC_SNAP_C_$n}"
+    n=$((n + 1))
     f="${PROJECT_DIR%/}/$sp"
-    seen="$seen$sp"$'\n'
-    if [ ! -f "$f" ] || [ "$(cat "$f" 2>/dev/null)" != "$sc" ]; then
+    if [ "$se" = 1 ]; then
+      if [ ! -f "$f" ] || [ "$(cat "$f" 2>/dev/null)" != "$sc" ]; then
+        touched=1
+        # The directory itself may be gone: `rm -rf .claude` is one of the
+        # payloads this exists to undo.
+        mkdir -p "$(dirname "$f")" 2>/dev/null
+        printf '%s\n' "$sc" > "$f" 2>/dev/null || { spec_state_discard; return 2; }
+      fi
+    elif [ -f "$f" ]; then
+      # Not there before the command ran, so the command invented it.
+      rm -f "$f" 2>/dev/null
       touched=1
-      mkdir -p "$(dirname "$f")" 2>/dev/null
-      printf '%s\n' "$sc" > "$f" 2>/dev/null || { spec_state_discard; return 2; }
     fi
   done
-  # Anything that was not there before and is now was invented while the command
-  # ran, so it goes.
-  while IFS= read -r s; do
-    [ -z "$s" ] && continue
-    case "$seen" in
-      *"$s"$'\n'*) continue ;;
-    esac
-    f="${PROJECT_DIR%/}/$s"
-    if [ -f "$f" ]; then rm -f "$f" 2>/dev/null; touched=1; fi
-  done <<< "$(spec_state_list)"
   spec_state_discard
   [ "$touched" = 0 ]
 }

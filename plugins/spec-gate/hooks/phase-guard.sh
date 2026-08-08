@@ -220,6 +220,7 @@ tok_base() {   # sets TB
 lex_command() {
   printf '%s' "$1" | awk -v MAXLINE="$MAX_LINE_BYTES" '
     BEGIN { SQ = sprintf("%c", 39); DQ = sprintf("%c", 34); BS = sprintf("%c", 92)
+            HDM = sprintf("%c", 1) "HD"
             hd_head = 1 }   # awk zero-inits, and hd_d[0] is a delimiter that never matches
     # Output is buffered from the moment a heredoc is registered until its body
     # has been consumed, then replayed after it. Without that, an operator later
@@ -230,13 +231,32 @@ lex_command() {
     function out(s) {
       if (defer) buf = buf s "\n"; else print s
     }
+    # Each heredoc registration leaves a numbered placeholder where the `<<`
+    # appeared, and the body is spliced back in at that exact position once it
+    # has been read. Holding the separators alone was not enough: one line can
+    # open two heredocs for two different verbs, and `cat <<A && bash <<B` has no
+    # single position where an untagged body is correct — every body ended up
+    # attributed to the first verb, so the second one was dropped whole.
+    function flushbuf(   m, i2, l, k) {
+      m = split(buf, ln, "\n")
+      for (i2 = 1; i2 <= m; i2++) {
+        l = ln[i2]
+        if (l == "") continue
+        if (substr(l, 1, length(HDM)) == HDM) {
+          k = substr(l, length(HDM) + 1) + 0
+          if (k in body) printf "%s", body[k]
+        } else print l
+      }
+      buf = ""; defer = 0
+    }
     function flush() {
       if (have) out("WORD\t" w)
       w = ""; have = 0
     }
     function nexthd() {
       if (hd_head <= hd_tail) {
-        hd_active = 1; hd_delim = hd_d[hd_head]; hd_strip = hd_s[hd_head]; hd_head++
+        hd_active = 1; hd_delim = hd_d[hd_head]; hd_strip = hd_s[hd_head]
+        hd_cur = hd_id[hd_head]; hd_head++
       } else hd_active = 0
     }
     {
@@ -252,8 +272,8 @@ lex_command() {
         if (hd_strip) sub(/^\t+/, "", t)
         if (t == hd_delim) {
           nexthd()
-          if (!hd_active) { defer = 0; printf "%s", buf; buf = "" }
-        } else print "HBODY\t" t
+          if (!hd_active) flushbuf()
+        } else body[hd_cur] = body[hd_cur] "HBODY\t" t "\n"
         next
       }
       # Each word is built one character at a time, which is quadratic, so a
@@ -311,7 +331,12 @@ lex_command() {
             # `$((1<<3))` is an arithmetic shift, not a heredoc. Its "delimiter"
             # parses as `3))`, which no line ever matches, so the rest of the
             # command was swallowed as body and nothing in it was scanned.
-            if (d != "" && d !~ /[()$]/) { hd_tail++; hd_d[hd_tail] = d; hd_s[hd_tail] = strip; defer = 1 }
+            if (d != "" && d !~ /[()$]/) {
+              hd_tail++; hd_d[hd_tail] = d; hd_s[hd_tail] = strip
+              hd_id[hd_tail] = ++hd_n
+              defer = 1
+              out(HDM hd_n)
+            }
             continue
           }
           # A plain input redirect writes nothing, but it decides what a shell
@@ -354,7 +379,7 @@ lex_command() {
     }
     # An unterminated heredoc leaves the buffer unflushed; emit it rather than
     # dropping the segment on the floor.
-    END { flush(); if (buf != "") printf "%s", buf }
+    END { flush(); if (buf != "") flushbuf() }
   '
 }
 
@@ -367,8 +392,9 @@ lex_command() {
 # `pytest tests/ex -s`, `bin/ex -s` and `cat notes/patch` into denials, because a
 # path whose basename happens to be `ex` or `patch` is not a command.
 finish_segment() {
-  local seg=$SEGW t verb='' last='' ed='' ipe='' expect_verb=1 payload=''
+  local seg=$SEGW hdoc=$SEGH t verb='' last='' ed='' ipe='' expect_verb=1 payload=''
   SEGW=''
+  SEGH=''
   [ -z "$seg" ] && return 0
   while IFS= read -r t; do
     [ -z "$t" ] && continue
@@ -426,6 +452,13 @@ finish_segment() {
   done <<< "$seg"
   [ -n "$last" ] && CAND="$CAND$last"$'\n'
   [ -n "${payload# }" ] && NESTED="$NESTED${payload# }"$'\n'
+  # A heredoc body handed to a shell is the script it runs, so it is queued for
+  # re-scanning exactly like a -c payload. Under any other verb it is data.
+  if [ -n "$hdoc" ]; then
+    case "$verb" in
+      sh|bash|zsh|ksh|dash|eval) NESTED="$NESTED$hdoc"$'\n' ;;
+    esac
+  fi
   [ -n "$ipe" ] && deny "spec-driven: in-place editing (sed -i, perl -i, patch, awk -i inplace) is blocked because phase-guard cannot reliably tell which file it targets. Use Edit instead — the gate can evaluate that exactly."
   return 0
 }
@@ -437,11 +470,24 @@ scan_command() {
   budget_lex
   WANT_TARGET=0
   SEGW=''
+  SEGH=''
   while IFS=$'\t' read -r KIND VAL; do
     case "$KIND" in
       OVER) deny "$OVERSIZE_MSG" ;;
       OP)   WANT_TARGET=1 ;;
       SEP)  finish_segment; WANT_TARGET=0 ;;
+      # The write scan is a third reader of the same token stream, and it was
+      # never taught about heredoc bodies — so `bash <<EOF / echo pwned >
+      # src/x.ts / EOF` wrote production code during the tests-only phase with
+      # the guard emitting nothing, while `bash -c` with the same payload was
+      # refused. A body under a shell verb is a nested payload like any other.
+      # Not budgeted here: whether this body is a program or prose is not known
+      # until the verb is, at the end of the segment. Charging it as tokens up
+      # front refused a 3000-line journal entry, which is prose the workflow
+      # asks for. A body that turns out to be a program is queued into NESTED
+      # and scanned there, where it is budgeted like any other payload; the
+      # total is bounded by budget_input either way.
+      HBODY) SEGH="$SEGH$VAL"$'\n' ;;
       WORD)
         budget_token "$VAL"
         if [ "$WANT_TARGET" = 1 ]; then
@@ -655,10 +701,23 @@ names_state_file() {
 # which is cheaper than forging one and was free. Checked at every phase: these
 # are read by gates in phases 4 and 5, where the write-target scan has already
 # exited.
+# $2 = the directory the command cd'd into, if any. state_token_hits already
+# takes it; without it here, `cd .git && rm -f spec-gate-*` named the key in a
+# form no pattern matched.
 names_gate_key() {
-  case "$1" in
+  local t=$1 cwd=${2:-}
+  case "$t" in
     *spec-gate-key*) return 0 ;;
   esac
+  if [ -n "$cwd" ]; then
+    case "$t" in
+      /*) ;;
+      *) case "$cwd/$t" in
+           *spec-gate-key*) return 0 ;;
+         esac
+         set -- "$cwd/$t" ;;
+    esac
+  fi
   # A glob reaches it without naming it: `rm -f .git/spec-gate-*` expands to the
   # key and matches no literal above. Deliberately narrow — `.claude/spec-gate-*`
   # must keep matching spec-gate-test-cmd, which is writable in every phase by
@@ -698,27 +757,39 @@ covers_git_dir() {
 VARS=""
 
 vars_record() {   # $1 = NAME=VALUE token
-  case "${1%%=*}" in
+  local n=${1%%=*} line out=""
+  case "$n" in
     ''|*[!A-Za-z0-9_]*) return 0 ;;
   esac
-  VARS="$VARS$1"$'\n'
+  # The LAST assignment wins, so an earlier binding cannot shadow a later one.
+  # Taking the first match let `V=safe.txt; V=.claude/.spec-phase; rm -f $V`
+  # resolve to safe.txt and pass.
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    case "$line" in "$n="*) continue ;; esac
+    out="$out$line"$'\n'
+  done <<< "$VARS"
+  VARS="$out$1"$'\n'
   return 0
 }
 
-resolve_tok() {   # sets RT to the token with a known whole-token expansion applied
+# Substitution anywhere in the token, not just a whole-token match. `.claude/$A`
+# and `${V}-phase` name a state file just as surely as `$V` does, and a
+# whole-token rule saw neither.
+resolve_tok() {   # sets RT to the token with this command's own bindings applied
   RT=$1
-  local n line
   case "$RT" in
-    '$'*) n=${RT#\$} ;;
+    *'$'*) ;;
     *) return 0 ;;
   esac
-  case "$n" in
-    '{'*'}') n=${n#\{}; n=${n%\}} ;;
-  esac
-  case "$n" in ''|*[!A-Za-z0-9_]*) return 0 ;; esac
+  local line n v pat
   while IFS= read -r line; do
     [ -z "$line" ] && continue
-    case "$line" in "$n="*) RT=${line#*=}; return 0 ;; esac
+    n=${line%%=*}; v=${line#*=}
+    pat="\${$n}"
+    case "$RT" in *"$pat"*) RT=${RT//"$pat"/$v} ;; esac
+    pat="\$$n"
+    case "$RT" in *"$pat"*) RT=${RT//"$pat"/$v} ;; esac
   done <<< "$VARS"
   return 0
 }
@@ -728,7 +799,7 @@ GATE_KEY_MSG="That path is the gate's own authentication material — the key th
 scan_state_tokens() {
   local KIND VAL T TB IS_VERB VERB='' EXPECT_VERB=1 GITCLEAN=0 GITSTASH=0
   local FINDDIR=0 WANT_TARGET=0 HDOC='' STDIN_TAKEN=0 PIPED=0
-  local FINDNAMED=0 FINDHIT=0 FINDPAT=0 WAS_TARGET=0 RT
+  local FINDNAMED=0 FINDHIT=0 FINDPAT=0 WAS_TARGET=0 RT AV
   local depth=${2:-0} cwd=${3:-} CDNEXT=0
   [ "$depth" -gt 4 ] && deny "$OVERSIZE_MSG"
   [ "$depth" = 0 ] && budget_reset
@@ -803,7 +874,7 @@ scan_state_tokens() {
       resolve_tok "$T"
       if [ "$RT" != "$T" ]; then
         state_token_hits "$RT" "$cwd" && deny "$STATE_MSG"
-        names_gate_key "$RT" && deny "$GATE_KEY_MSG"
+        names_gate_key "$RT" "$cwd" && deny "$GATE_KEY_MSG"
       fi
       case "$T" in
         *'$'*|*'`'*)
@@ -837,7 +908,16 @@ scan_state_tokens() {
       # to `b`, which matches no assignment pattern, so the env prefix became
       # the verb and the real command was never classified at all.
       case "$T" in
-        *=*) vars_record "$T"; continue ;;
+        *=*)
+          vars_record "$T"
+          # The value is checked here, not only where the variable is used. A
+          # resolver can always be walked around — indirect assignment, `read`,
+          # a value built in pieces — but the literal has to appear somewhere,
+          # and on the right of an `=` is the one place nothing was looking.
+          AV=${T#*=}
+          state_token_hits "$AV" "$cwd" && deny "$STATE_MSG"
+          names_gate_key "$AV" "$cwd" && deny "$GATE_KEY_MSG"
+          continue ;;
       esac
       tok_base "$T"
       case "$TB" in
@@ -878,6 +958,7 @@ scan_state_tokens() {
               -name|-path|-iname|-ipath|-wholename) FINDPAT=1 ;;
               -*) ;;
               *) covers_state_dir "$T" && FINDDIR=1
+                 covers_git_dir "$T" && FINDDIR=1
                  state_token_hits "$T" "$cwd" && FINDDIR=1 ;;
             esac
           fi ;;
@@ -958,13 +1039,13 @@ scan_state_tokens() {
     fi
 
     state_token_hits "$T" "$cwd" && deny "$STATE_MSG"
-    names_gate_key "$T" && deny "$GATE_KEY_MSG"
+    names_gate_key "$T" "$cwd" && deny "$GATE_KEY_MSG"
     # The same token with this command's own assignments applied. `rm -f $V`
     # names a state file only once V is read back.
     resolve_tok "$T"
     if [ "$RT" != "$T" ]; then
       state_token_hits "$RT" "$cwd" && deny "$STATE_MSG"
-      names_gate_key "$RT" && deny "$GATE_KEY_MSG"
+      names_gate_key "$RT" "$cwd" && deny "$GATE_KEY_MSG"
     fi
 
     # A token carrying a substitution cannot be matched as a path — `` `echo
@@ -984,7 +1065,11 @@ scan_state_tokens() {
         case "$T" in
           -*) ;;
           *) covers_state_dir "$T" && deny "$STATE_MSG"
-             covers_git_dir "$T" && deny "$GATE_KEY_MSG" ;;
+             covers_git_dir "$T" && deny "$GATE_KEY_MSG"
+             # `D=.claude; rm -rf $D` reaches the directory through a binding.
+             resolve_tok "$T"
+             covers_state_dir "$RT" && deny "$STATE_MSG"
+             covers_git_dir "$RT" && deny "$GATE_KEY_MSG" ;;
         esac ;;
     esac
   done <<< "$(lex_command "$1")"

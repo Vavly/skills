@@ -3882,6 +3882,10 @@ expect_b "the key is protected past the phase-4 exit" \
   DENY 'printf x > .git/spec-gate-key'
 expect_b "a glob that would expand onto the key" \
   DENY 'rm -f .git/spec-gate-*'
+expect_b "the same glob reached through a cd" \
+  DENY 'cd .git && rm -f spec-gate-*'
+expect_b "and find aimed at the directory holding it" \
+  DENY 'find .git -type f -delete'
 expect_b "and taking the whole directory it lives in" \
   DENY 'rm -rf .git'
 # The .claude sibling must stay writable: spec-gate-test-cmd is gate config the
@@ -4122,6 +4126,141 @@ T1=$(date +%s)
 [ $((T1 - T0)) -le 5 ] \
   && ok "and costs $((T1 - T0))s" \
   || bad "a long document took $((T1 - T0))s"
+
+################################################################################
+# Four review rounds running, each one found holes one axis over from the last
+# round's fix, because each round's tests pinned the reproduction it was given
+# rather than the rule. This group is shaped the other way: it enumerates the
+# protected targets against every channel a command can deliver a payload
+# through, and asserts they all reach the same decision as the bare spelling.
+#
+# The point is that adding a channel here costs one line and immediately tests
+# it against every target, and adding a target costs one line and immediately
+# tests it against every channel. A scanner that learns about a token kind in
+# two places out of three fails this group rather than shipping.
+group "coverage equivalence: every channel reaches the same decision"
+
+# One payload, wrapped in each way a shell can carry it to the same effect.
+chan() {   # $1 = channel name, $2 = shell payload
+  case "$1" in
+    bare)      printf '%s' "$2" ;;
+    dash_c)    printf 'bash -c "%s"' "$2" ;;
+    nested)    printf 'sh -c "bash -c \\"%s\\""' "$2" ;;
+    herestring) printf "bash <<< '%s'" "$2" ;;
+    heredoc)   printf 'bash <<CH_EOF\n%s\nCH_EOF' "$2" ;;
+    heredoc2)  printf 'cat <<CH_A && bash <<CH_B\nprose\nCH_A\n%s\nCH_B' "$2" ;;
+    after_read) printf '.claude/hooks/phase.sh status ; %s' "$2" ;;
+    seq)       printf 'true ; %s' "$2" ;;
+  esac
+}
+CHANNELS="bare dash_c nested herestring heredoc heredoc2 after_read seq"
+
+setup_repo; phase start cover; phase 2; phase 3
+for T in .claude/.spec-phase .claude/.spec-validation .git/spec-gate-key; do
+  for C in $CHANNELS; do
+    expect_b "[$C] rm -f $T" DENY "$(chan "$C" "rm -f $T")"
+  done
+done
+
+# The same targets, reached by every way of spelling the PATH rather than every
+# way of carrying the command. C1 of the sixth round lived here: the value on
+# the right of an `=` was never looked at, and the resolver took the first
+# assignment rather than the last.
+setup_repo; phase start cover2; phase 2; phase 3
+for T in .claude/.spec-phase .git/spec-gate-key; do
+  expect_b "[literal] $T"           DENY "rm -f $T"
+  expect_b "[variable] $T"          DENY "V=$T; rm -f \$V"
+  expect_b "[braced] $T"            DENY "V=$T; rm -f \${V}"
+  expect_b "[quoted] $T"            DENY "V=$T; rm -f \"\$V\""
+  expect_b "[reassigned] $T"        DENY "V=safe.txt; V=$T; rm -f \$V"
+  expect_b "[assigned, read] $T"    DENY "V=$T; cat \$V"
+  expect_b "[dir + basename] $T"    DENY "A=${T##*/}; rm -f ${T%/*}/\$A"
+  expect_b "[dir in a variable] $T" DENY "D=${T%/*}; rm -rf \$D"
+done
+
+# Production code during the tests-only phase, through the same channels. The
+# write scan is a separate reader from the state scan and has its own idea of
+# which token kinds exist, which is exactly how it came to miss heredoc bodies.
+setup_repo; phase start cover3; phase 2; phase 3
+for C in $CHANNELS; do
+  expect_b "[$C] write production code" DENY "$(chan "$C" "echo pwned > src/evil.ts")"
+done
+
+# And the transitions, through the same channels: phase.sh has no gate of its
+# own, so every one of these is a complete override if it is not seen.
+setup_repo; phase start cover4; phase 2; phase 3
+for C in $CHANNELS; do
+  expect_b "[$C] force past the RED gate" \
+    DENY "$(chan "$C" ".claude/hooks/phase.sh 4 --force")"
+done
+PH=$(.claude/hooks/phase.sh status 2>&1 | head -1)
+printf '%s' "$PH" | grep -q 'phase 3' \
+  && ok "and none of the channels moved the phase" \
+  || bad "a channel moved the phase: $PH"
+
+# The negative half. Every channel must still carry ordinary work, or the group
+# above is satisfied by a guard that refuses everything.
+setup_repo; phase start cover5; phase 2; phase 3
+for C in $CHANNELS; do
+  expect_b "[$C] ordinary work is untouched" ALLOW "$(chan "$C" "echo hello")"
+done
+# Prose that merely names a state file is not a command that touches one.
+expect_b "prose naming a state file stays prose" ALLOW ".claude/hooks/phase.sh journal <<'EOF'
+tried rm -f .claude/.spec-phase and the guard refused, correctly
+EOF"
+expect_b "and a spec document may describe one" ALLOW 'cat > docs/specs/notes.md <<EOF
+never run rm -f .claude/.spec-phase
+EOF'
+expect_b "even beside a real shell heredoc" ALLOW 'bash <<CH_A && cat > docs/specs/n2.md <<CH_B
+echo hello
+CH_A
+never run rm -f .claude/.spec-phase
+CH_B'
+
+################################################################################
+# The snapshot phase.sh red restores from is keyed by state path. Records used
+# to be separated in-band, and one of the files it snapshots is the journal —
+# whose content the model writes. A separator in a journal entry therefore
+# forged a record, and `phase.sh red` wrote it back: an arbitrary-path write
+# performed by trusted code, reachable with two allowed commands.
+group "the state snapshot cannot be forged through its own contents"
+setup_repo; phase start inject; phase 2; phase 3
+echo 'it("f", () => expect(1).toBe(2))' > src/x.test.ts
+printf 'exit 1\n' > .claude/spec-gate-test-cmd
+
+python3 -c 'import sys
+sys.stdout.write("progress note\x1d.claude/.spec-phase\x1cphase=4\ntask=inject\nslice=1/1")' \
+  | .claude/hooks/phase.sh journal >/dev/null 2>&1
+.claude/hooks/phase.sh red >/dev/null 2>&1
+BP=$(sed -n 's/^phase=//p' .claude/.spec-phase 2>/dev/null | head -1)
+[ "$BP" = 3 ] \
+  && ok "a forged record in the journal does not rewrite the phase" \
+  || bad "the journal injected a snapshot record and the phase became $BP"
+
+setup_repo; phase start inject2; phase 2; phase 3
+echo 'it("f", () => expect(1).toBe(2))' > src/x.test.ts
+printf 'exit 1\n' > .claude/spec-gate-test-cmd
+python3 -c 'import sys
+sys.stdout.write("note\x1dsrc/evil.ts\x1cPWNED")' \
+  | .claude/hooks/phase.sh journal >/dev/null 2>&1
+.claude/hooks/phase.sh red >/dev/null 2>&1
+[ -f src/evil.ts ] \
+  && bad "the snapshot restored a path that is not gate state" \
+  || ok "and it cannot be steered at a path outside the state list"
+
+# The journal itself must still round-trip: it is snapshotted like everything
+# else, and an entry is prose that may contain anything.
+setup_repo; phase start inject3; phase 2; phase 3
+echo 'it("f", () => expect(1).toBe(2))' > src/x.test.ts
+printf 'exit 1\n' > .claude/spec-gate-test-cmd
+.claude/hooks/phase.sh journal >/dev/null 2>&1 <<'EOF'
+an ordinary entry with punctuation: a=b, c|d, e;f
+EOF
+BEFORE=$(cat .claude/spec-journal.md)
+.claude/hooks/phase.sh red >/dev/null 2>&1
+[ "$(cat .claude/spec-journal.md)" = "$BEFORE" ] \
+  && ok "an ordinary journal survives the snapshot unchanged" \
+  || bad "the snapshot altered the journal it saved"
 
 ################################################################################
 printf '\n%s%d passed, %d failed%s\n' "$B" "$PASS" "$FAIL" "$N"
