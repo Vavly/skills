@@ -574,9 +574,39 @@ report_review_state() {
 # concludes there is no gate, and carries on writing production code. Something
 # IS started — just not here. Reported by `status` and refused by everything
 # else, since no command can act on state in a tree this process is not in.
+# State from the layout before the move. Reported, never acted on: a task that
+# was open when the plugin updated must not read as a task that is over, and it
+# must not read as a task that is armed either, because nothing has verified it.
+LEGACY=0
+if [ ! -f "$STATE" ] && command -v spec_legacy_armed >/dev/null 2>&1; then
+  spec_legacy_armed && LEGACY=1
+fi
+legacy_report() {
+  LP=$(sed -n 's/^phase=//p' "$(spec_legacy_state_path)" 2>/dev/null | head -1)
+  LT=$(sed -n 's/^task=//p' "$(spec_legacy_state_path)" 2>/dev/null | head -1)
+  echo "spec-driven: a task from a PREVIOUS VERSION is recorded here, and nothing reads it."
+  echo "  -> task:  ${LT:-unnamed}"
+  echo "  -> phase: $(phase_name "${LP:-?}")   (as recorded, unverified)"
+  echo "  -> the state moved from $STATE_DIR_REL/ to the git directory, so this"
+  echo "     repository would report itself inactive with a task still open."
+  echo "  -> carry it across: phase.sh migrate"
+  echo "  -> or end it:       phase.sh off"
+}
+
 FOREIGN=""
-if [ ! -f "$STATE" ] && command -v spec_foreign_state >/dev/null 2>&1; then
+if [ ! -f "$STATE" ] && [ "$LEGACY" = 0 ] && command -v spec_foreign_state >/dev/null 2>&1; then
   FOREIGN=$(spec_foreign_state "$PROJECT_DIR")
+fi
+
+# Everything except the three commands that report it or resolve it. Acting on a
+# phase this version never wrote would be acting on state nothing authenticated.
+if [ "$LEGACY" = 1 ]; then
+  case "${1:-status}" in
+    status|brief|migrate|off) ;;
+    *) legacy_report >&2
+       echo "spec-driven: REFUSED — resolve the above first." >&2
+       exit 1 ;;
+  esac
 fi
 
 # The same refusal the guard raises, in the script the user reaches for when the
@@ -608,6 +638,11 @@ fi
 
 case "${1:-status}" in
   status)
+    if [ "$LEGACY" = 1 ]; then
+      legacy_report
+      report_review_state
+      exit 0
+    fi
     if [ -n "$FOREIGN" ]; then
       echo "spec-driven: armed in ANOTHER WORKTREE, not here"
       echo "  -> gate state: $FOREIGN"
@@ -865,6 +900,17 @@ case "${1:-status}" in
     # come before the exit that quietly says "nothing is armed" — which is the
     # bug the ordering used to have: the branch below was unreachable, and the
     # one case it existed for exited 0 in silence.
+    # Said here above all. brief is the SessionStart hook, and a session that
+    # starts in a repo whose task went invisible is exactly the reader that
+    # cannot find out any other way — status would have to be asked, and nothing
+    # would prompt asking it.
+    if [ "$LEGACY" = 1 ]; then
+      legacy_report
+      echo "  -> until then the phase gate is NOT enforcing anything here."
+      echo "     Do not treat this repo as one with no workflow: there is a task"
+      echo "     open, and its approvals and receipts are still on disk."
+      exit 0
+    fi
     if [ -n "$FOREIGN" ]; then
       echo "spec-driven: a task is armed in ANOTHER WORKTREE ($FOREIGN), not this one."
       echo "  Run 'phase.sh status' before writing anything you expect the gate to see."
@@ -1114,7 +1160,97 @@ for line in sys.stdin:
     fi
     ;;
 
+  # Carry a task across the state relocation. Explicit and user-invoked, never
+  # automatic: migrating on sight would mean signing whatever was found on disk,
+  # and the whole argument for signing is that a file nobody verified does not
+  # get to clear a gate. What is on disk here was written by a version that had
+  # no signatures at all, so the honest framing is not "this is verified" but
+  # "you are choosing to carry it over" — which is why it prints exactly what it
+  # took and says the phase was never authenticated.
+  #
+  # It lives here rather than in the install skill because the move is a write to
+  # a state path, and the guard refuses those from every direction by design.
+  # Instructing the model to run `mv .claude/.spec-phase ...` would mean carving
+  # an exception into the one rule that has no exceptions. Trusted code does the
+  # write; the guard never has to look away.
+  migrate)
+    if [ -f "$STATE" ]; then
+      echo "spec-driven: nothing to migrate — this repository already has state in"
+      echo "  $GATE_DIR. The task here is the live one; anything left in"
+      echo "  $STATE_DIR_REL/ is debris from the previous version and is ignored."
+      echo "  Remove it by hand if you want it gone."
+      exit 1
+    fi
+    if [ "$LEGACY" = 0 ]; then
+      echo "spec-driven: nothing to migrate — no state from a previous version found."
+      exit 1
+    fi
+    LSRC="$(spec_legacy_state_path)"
+    LP=$(sed -n 's/^phase=//p' "$LSRC" | head -1)
+    case "$LP" in
+      1|2|3|4|5) ;;
+      *) echo "spec-driven: REFUSED — the recorded phase is '$LP', which is not a phase."
+         echo "  There is nothing coherent to carry across. Run 'phase.sh off' to clear it."
+         exit 1 ;;
+    esac
+    LT=$(sed -n 's/^task=//p'  "$LSRC" | head -1)
+    LSL=$(sed -n 's/^slice=//p' "$LSRC" | head -1)
+    case "$LSL" in
+      [1-9]*/[1-9]*) ;;
+      *) LSL=1/1 ;;
+    esac
+    mkdir -p "$GATE_DIR" 2>/dev/null
+    if ! write_state "$LP" "${LT:-unnamed}" "$LSL"; then
+      echo "spec-driven: the task was NOT migrated — see above." >&2
+      exit 1
+    fi
+    # Deliberately only the phase, the task and the slice. The receipts are not
+    # carried: .spec-red, .spec-approval and .spec-validation each say that
+    # something was checked or that the user answered, and re-signing an unsigned
+    # one would mint exactly the assertion this design refuses to take on trust.
+    # They are cheap to re-earn and expensive to fake, so they are dropped and
+    # said to be dropped.
+    # .spec-phase is carried and .spec-baseline is retaken below, so neither is a
+    # loss and neither is listed as one. What is listed is what a user would
+    # otherwise have to notice was missing.
+    DROPPED=""
+    while IFS= read -r l; do
+      [ -z "$l" ] && continue
+      f="${PROJECT_DIR%/}/$l"
+      case "$l" in
+        */.spec-phase|*/.spec-baseline) ;;
+        *) [ -f "$f" ] && DROPPED="$DROPPED ${l##*/}" ;;
+      esac
+      rm -f "$f" 2>/dev/null
+    done <<< "$(spec_legacy_state_list)"
+    snapshot_baseline
+    echo "spec-driven: migrated to $GATE_DIR"
+    echo "  -> task:  ${LT:-unnamed}"
+    echo "  -> phase: $(phase_name "$LP")"
+    [ "$LSL" != 1/1 ] && echo "  -> slice: ${LSL%%/*} of ${LSL#*/}"
+    echo "  The phase, task and slice were carried over from a file written before"
+    echo "  spec-gate signed anything, so they are what the previous version"
+    echo "  recorded, not something this one verified. Check 'phase.sh status'"
+    echo "  against what you remember before building on it."
+    if [ -n "$DROPPED" ]; then
+      echo "  NOT carried over:$DROPPED"
+      echo "  Those record that a check ran or that you answered a question, and an"
+      echo "  unsigned one proves neither. Re-run 'phase.sh red' or re-ask the gate;"
+      echo "  both are cheap, and neither is something to inherit on trust."
+    fi
+    echo "  A fresh baseline was taken, so anything already uncommitted counts as"
+    echo "  pre-existing rather than as this phase's work."
+    ;;
+
   off)
+    # Both layouts. `off` is the exit named by every refusal in this script, and
+    # one that left the previous version's files behind would leave the guard
+    # still refusing after the user had done what it asked.
+    if command -v spec_legacy_state_list >/dev/null 2>&1; then
+      while IFS= read -r l; do
+        [ -n "$l" ] && rm -f "${PROJECT_DIR%/}/$l"
+      done <<< "$(spec_legacy_state_list)"
+    fi
     rm -f "$STATE" "$BASELINE" "$RECEIPT" "$APPROVAL" "$SCAFFOLD" "$VALIDATION" "$JOURNAL"
     echo "spec-driven: phase gate off"
     echo "  This ends the phase workflow. It does not stop review — with no phase"
@@ -1132,7 +1268,7 @@ for line in sys.stdin:
 
   *)
     echo "usage: phase.sh [status | brief | start <task> | ask <gate> | red | scaffold |"
-    echo "                slices <n> | journal | validation | 1..5 | off]"
+    echo "                slices <n> | journal | validation | 1..5 | migrate | off]"
     # Derived, not retyped. This line said "spec | red | close-out" while
     # gate_list had grown to nine, and the `ask` command a few hundred lines up
     # already builds its own error from gate_list — so the usage was the only
@@ -1148,6 +1284,8 @@ for line in sys.stdin:
     echo "                            append a stamped entry to .claude/spec-journal.md"
     echo "       phase.sh validation < report"
     echo "                            record the Phase 4 validation report; 4 -> 5 needs it"
+    echo "       phase.sh migrate     carry a task across the state relocation, for a"
+    echo "                            repo that was mid-task when the plugin updated"
     echo "       phase.sh 4 --force   advance without the RED check"
     echo "       phase.sh 5 --force   advance without a recorded validation report"
     exit 1

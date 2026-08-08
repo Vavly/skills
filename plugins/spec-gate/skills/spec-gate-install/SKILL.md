@@ -39,6 +39,32 @@ silently, so **stop here and say so** rather than installing something inert.
 Then check for `jq` or `python3` — the hooks need one of them and fail closed
 without either — and report which was found.
 
+**Then check for a task left behind by the state relocation.** The phase state
+used to live in `.claude/` and now lives under the git directory, so a repo that
+was mid-task when the plugin updated has a task recorded where nothing reads it:
+
+```bash
+ls .claude/.spec-phase 2>/dev/null && echo "LEGACY STATE PRESENT"
+```
+
+If it is there, this is the **first** thing to deal with and it is the user's
+call, not yours. Every layer already refuses rather than pretending the task is
+over — `phase.sh status` reports it, the guard denies writes — so nothing is
+lost, but nothing works either until it is resolved. Show them the two options
+and let them pick:
+
+- `phase.sh migrate` — carries the phase, task and slice across and re-signs
+  them. The receipts (`.spec-red`, `.spec-approval`, `.spec-validation`) are
+  **not** carried: they record that a check ran or that the user answered, and
+  the previous version signed nothing, so re-signing one would mint an assertion
+  on trust. They are cheap to re-earn.
+- `phase.sh off` — ends the task and clears both layouts.
+
+Do not move the files yourself. `mv .claude/.spec-phase …` is a write to a state
+path and the guard refuses those from every direction, deliberately and without
+exceptions. `phase.sh migrate` is trusted code doing the same write, which is why
+it exists.
+
 ## 2. The shim
 
 Copy the plugin's `hooks/phase-shim.sh` to `.claude/hooks/phase.sh` in this repo.

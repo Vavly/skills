@@ -94,6 +94,44 @@ spec_gate_dir_rel() {
   esac
 }
 
+# --- The layout before the move ----------------------------------------------
+# A repository that was mid-task when the plugin updated has its state in the old
+# place, and nothing reads it any more. Left undetected that is the worst failure
+# this system has: not a refusal, but a SILENT DISARM. Observed on a repo sitting
+# at Phase 3 — status reported "inactive", brief said nothing at all, a Write to
+# production code was allowed, and `phase.sh 5` went through with no approval.
+# The user is told the gate is off; the model is told nothing; the task carries
+# on with every checkpoint gone.
+#
+# So the old location is still read — never to act on, only to notice. Every
+# layer that would otherwise conclude "nothing is armed here" asks this first and
+# fails closed instead, which is the same answer this file gives to a corrupt
+# state file and to a task armed in another worktree.
+spec_legacy_state_list() {
+  local d="${STATE_DIR_REL:-.claude}"
+  printf '%s\n' \
+    "$d/.spec-phase" \
+    "$d/.spec-baseline" \
+    "$d/.spec-red" \
+    "$d/.spec-approval" \
+    "$d/.spec-scaffold" \
+    "$d/.spec-validation"
+}
+
+spec_legacy_state_path() {
+  printf '%s/%s/.spec-phase' "${PROJECT_DIR%/}" "${STATE_DIR_REL:-.claude}"
+}
+
+# 0 = there is state from the previous layout and none from this one. Both halves
+# matter: once the gate is armed here, the old files are debris and the live
+# state is the only thing that decides anything.
+spec_legacy_armed() {
+  [ -f "$(spec_gate_dir)/.spec-phase" ] && return 1
+  [ -f "$(spec_legacy_state_path)" ]
+}
+
+SPEC_LEGACY_MSG="spec-gate's state moved out of the working tree, and this repository still has a task recorded in the old place. Nothing reads it now, so the gate would report itself inactive while a task is still open — production code unlocked, approvals gone, and no phase to advance from. Refusing rather than pretending the task is over. Run 'phase.sh migrate' to carry the task across, or 'phase.sh off' to end it and start again."
+
 # Every phase-state file, absolute. This is what the snapshot walks and what the
 # guard matches globs against — the question "what is the gate's own state",
 # which is is_phase_state's question, not the review gate's.
@@ -741,6 +779,14 @@ spec_state_list() {
 review_exclude_list() {
   gate_config_list
   spec_state_list
+  # The previous layout's files, which a repo mid-upgrade still has in the tree.
+  # They are excluded for exactly the reason the current ones are: a file the
+  # gate wrote is never work owed review, and which version wrote it does not
+  # change that. Leaving them out was a gate with no exit — the paths are meant
+  # to be gitignored, so there is no commit a human can make to satisfy it, and
+  # the new install's .gitignore no longer names them. Reproduced: three
+  # orphaned files, Stop blocked, nothing that would clear it.
+  spec_legacy_state_list
 
   f="${PROJECT_DIR%/}/$STATE_DIR_REL/spec-gate-review-exclude"
   if [ -r "$f" ]; then

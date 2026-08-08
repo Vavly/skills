@@ -5049,5 +5049,143 @@ expect_b "a repeated payload is decided the same way each time" DENY \
   'bash -c "rm -f .git/spec-gate/.spec-red" ; bash -c "rm -f .git/spec-gate/.spec-red"'
 
 ################################################################################
+# Moving the state was the right change and it shipped with the worst failure in
+# this system attached to it: not a refusal, a SILENT DISARM. A repo that was
+# mid-task when the plugin updated had its task in a place nothing reads, so
+# `status` said "inactive", `brief` — the hook that exists to hand a task back to
+# a session that lost it — said nothing at all, and a Write to production code at
+# what had been Phase 3 was allowed. The user is told the gate is off; the model
+# is told nothing; every checkpoint is gone.
+#
+# The old location is read now, never to act on, only to notice.
+group "a task from the previous layout is not a task that is over"
+
+legacy_repo() {   # a repo mid-task on the layout before the move
+  setup_repo
+  printf 'phase=%s\ntask=%s\nslice=%s\n' "${1:-3}" "${2:-auth}" "${3:-1/1}" \
+    > .claude/.spec-phase
+  : > .claude/.spec-baseline
+  printf 'x\n' > .claude/.spec-red
+}
+
+legacy_repo 3 auth
+SOUT=$(.claude/hooks/phase.sh status 2>&1)
+# The exact line status prints when nothing is armed. A bare grep for the word
+# matches this refusal's own explanation of what would otherwise have happened.
+printf '%s' "$SOUT" | grep -q '^spec-driven: inactive$' \
+  && bad "status reports a repo with an open task as inactive" \
+  || ok "status does not report an open task as inactive"
+printf '%s' "$SOUT" | grep -q 'PREVIOUS VERSION' \
+  && ok "and says the state is from a previous version" \
+  || bad "status does not explain what happened: $SOUT"
+printf '%s' "$SOUT" | grep -q 'phase.sh migrate' \
+  && ok "and names the command that fixes it" \
+  || bad "status does not name a recovery"
+
+BOUT=$(.claude/hooks/phase.sh brief 2>&1)
+[ -n "$BOUT" ] \
+  && ok "brief speaks up — it is the only thing a fresh session reads" \
+  || bad "brief said nothing about a task that is open and invisible"
+printf '%s' "$BOUT" | grep -q 'NOT enforcing' \
+  && ok "and says the gate is not enforcing, so the model does not assume it is" \
+  || bad "brief does not say the gate is inactive: $BOUT"
+
+# The write that started all this.
+expect_w "a production write is refused, not allowed" DENY src/auth.ts
+expect_b "and one through the shell"                  DENY 'echo pwned > src/auth.ts'
+expect_w "a test file is refused too — the phase is unknown, not permissive" DENY src/a.test.ts
+# Refusing the writes, not the tree: the recovery has to stay reachable.
+expect_b "reading is still allowed"          ALLOW 'cat src/x.ts'
+expect_b "and so is asking what happened"    ALLOW '.claude/hooks/phase.sh status'
+expect_b "and the command that fixes it"     ALLOW '.claude/hooks/phase.sh migrate'
+
+# phase.sh refuses to act on it, the way it refuses across a worktree split.
+.claude/hooks/phase.sh 5 >/dev/null 2>&1
+[ -f "$SPD/.spec-phase" ] \
+  && bad "phase.sh 5 acted on state from a previous version" \
+  || ok "phase.sh will not advance a phase it did not write"
+.claude/hooks/phase.sh red >/dev/null 2>&1; RC=$?
+[ "$RC" = 1 ] && ok "and will not verify RED against it" \
+  || bad "phase.sh red ran on legacy state (rc=$RC)"
+
+# The orphans must not arm the Stop gate. They are gitignored by intent, so there
+# is no commit that could ever clear it — reproduced as a hard block with no exit
+# once the install's .gitignore drops to the two entries it now writes.
+legacy_repo 3 auth
+printf '.claude/spec-journal.md\n.claude/review-log.jsonl\n' > .gitignore
+git add -A >/dev/null 2>&1; git commit -qm ni >/dev/null 2>&1
+PEND=$( . "$SRC/hooks/phase-policy.sh"; PROJECT_DIR="$PWD" review_pending_paths )
+printf '%s' "$PEND" | grep -q '.spec-' \
+  && bad "the orphaned state files are owed review: $PEND" \
+  || ok "orphaned state files do not arm the review gate"
+
+################################################################################
+group "migrate carries the task across, and says what it did not carry"
+legacy_repo 3 auth 2/4
+MOUT=$(.claude/hooks/phase.sh migrate 2>&1)
+[ -f "$SPD/.spec-phase" ] \
+  && ok "migrate writes the state where this version reads it" \
+  || bad "migrate left nothing at $SPD/.spec-phase"
+[ -e .claude/.spec-phase ] \
+  && bad "migrate left the old file behind, so the refusal would keep firing" \
+  || ok "and clears the old location"
+[ "$(sed -n 's/^phase=//p' "$SPD/.spec-phase" | head -1)" = 3 ] \
+  && ok "the phase is carried" || bad "the phase was not carried"
+[ "$(sed -n 's/^task=//p' "$SPD/.spec-phase" | head -1)" = auth ] \
+  && ok "the task name is carried" || bad "the task name was not carried"
+[ "$(sed -n 's/^slice=//p' "$SPD/.spec-phase" | head -1)" = 2/4 ] \
+  && ok "the slice position is carried" || bad "the slice position was not carried"
+[ -n "$(sed -n 's/^mac=//p' "$SPD/.spec-phase" | head -1)" ] \
+  && ok "and it is signed on the way in" || bad "migrate wrote an unsigned state file"
+
+# The receipts are deliberately NOT carried. Each says a check ran or the user
+# answered, and the previous version signed nothing — re-signing one would mint
+# exactly the assertion this design refuses to take on trust.
+[ -f "$SPD/.spec-red" ] \
+  && bad "migrate re-signed a RED receipt nothing had verified" \
+  || ok "the RED receipt is not carried across"
+printf '%s' "$MOUT" | grep -q 'NOT carried over' \
+  && ok "and migrate says so rather than leaving it to be discovered" \
+  || bad "migrate did not report the dropped receipts: $MOUT"
+printf '%s' "$MOUT" | grep -q 'not something this one verified' \
+  && ok "and does not claim the phase it carried was verified" \
+  || bad "migrate overstates what it knows"
+
+# The gate enforces the migrated phase, which is the whole point.
+expect_w "production is blocked at the migrated phase" DENY  src/auth.ts
+expect_w "and tests are writable"                      ALLOW src/a.test.ts
+
+# Refusals with no exit are not refusals.
+legacy_repo 3 auth
+.claude/hooks/phase.sh off >/dev/null 2>&1
+[ -e .claude/.spec-phase ] \
+  && bad "off left the previous version's state behind" \
+  || ok "off clears the old layout too"
+SOUT=$(.claude/hooks/phase.sh status 2>&1)
+printf '%s' "$SOUT" | grep -q '^spec-driven: inactive$' \
+  && ok "and the repo is genuinely inactive afterwards" \
+  || bad "off did not disarm: $SOUT"
+expect_w "writes are allowed again once the task is ended" ALLOW src/auth.ts
+
+# Nonsense in the old file is not something to carry.
+legacy_repo notaphase auth
+.claude/hooks/phase.sh migrate >/dev/null 2>&1; RC=$?
+[ "$RC" = 1 ] && ok "migrate refuses a phase that is not a phase" \
+  || bad "migrate carried a corrupt phase across (rc=$RC)"
+[ -f "$SPD/.spec-phase" ] \
+  && bad "and it wrote state anyway" || ok "and writes nothing"
+
+# Once this version is armed, the old files are debris and the live state wins.
+setup_repo; phase start live; phase 2; phase 3
+printf 'phase=5\ntask=stale\nslice=1/1\n' > .claude/.spec-phase
+[ "$(.claude/hooks/phase.sh status 2>&1 | head -1)" = "spec-driven: phase 3 Plan + failing tests  (task: live)" ] \
+  && ok "an armed repo ignores leftovers in the old location" \
+  || bad "leftover legacy state changed what an armed repo reports"
+expect_w "and the live phase is what is enforced" DENY src/x.ts
+.claude/hooks/phase.sh migrate >/dev/null 2>&1; RC=$?
+[ "$RC" = 1 ] && ok "migrate refuses when this version is already armed" \
+  || bad "migrate clobbered live state with leftovers (rc=$RC)"
+
+################################################################################
 printf '\n%s%d passed, %d failed%s\n' "$B" "$PASS" "$FAIL" "$N"
 [ "$FAIL" -eq 0 ] || exit 1

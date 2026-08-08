@@ -94,11 +94,21 @@ STATE="$GATE_DIR/.spec-phase"
 # in a worktree while the task is armed next door, and that used to exit 0 — the
 # gate silently absent in exactly the tree the work was happening in. Checked
 # before the early exit, because the early exit is the bug.
+#
+# "No state here" has a third meaning, and it is the one that cost the most: the
+# state moved, and this repository was mid-task when it did. That is not an
+# inactive workflow, it is an armed one nothing can see — and exiting 0 on it
+# hands back production writes at Phase 3 with the user still believing a gate is
+# up. Asked before the split, because it is a question about THIS tree.
 PHASE=""
 SPLIT=""
+LEGACY=0
 if [ ! -f "$STATE" ]; then
-  SPLIT=$(spec_foreign_state "$PROJECT_DIR")
-  [ -n "$SPLIT" ] || exit 0          # workflow not active anywhere: nothing to enforce
+  spec_legacy_armed && LEGACY=1
+  if [ "$LEGACY" = 0 ]; then
+    SPLIT=$(spec_foreign_state "$PROJECT_DIR")
+    [ -n "$SPLIT" ] || exit 0        # workflow not active anywhere: nothing to enforce
+  fi
 fi
 
 if [ -z "$PARSER" ]; then
@@ -122,7 +132,8 @@ fi
 PHASE=$(sed -n 's/^phase=//p' "$STATE" 2>/dev/null | head -1)
 case "$PHASE" in
   1|2|3|4|5) ;;
-  "") [ -n "$SPLIT" ] || deny "phase-guard: $STATE is unreadable. Failing closed." ;;
+  "") { [ -n "$SPLIT" ] || [ "$LEGACY" = 1 ]; } \
+        || deny "phase-guard: $STATE is unreadable. Failing closed." ;;
   *) deny "phase-guard: $STATE is corrupt (phase=$PHASE). Failing closed, because a broken state file must not silently disable the gate. Ask the user with 'phase.sh ask abandon', or repair the file." ;;
 esac
 
@@ -649,6 +660,31 @@ esac
 
 if [ -n "$CMD" ] && ! awk 'BEGIN{exit 0}' </dev/null >/dev/null 2>&1; then
   deny "phase-guard cannot read the command: awk is missing or not working, and the Bash write scan is written in it. Failing closed, because a scan that cannot run must not read as permission. Install awk, or ask the user to run phase.sh off to disable the phase gate."
+fi
+
+# --- A task recorded in the previous layout ----------------------------------
+# There is no phase here to enforce, because the file holding it is one this
+# version does not read. What there is, is evidence that a task was open when the
+# state moved — so the one thing this must not do is what it did before the check
+# existed, which is conclude "inactive" and hand back every write the phase was
+# refusing.
+#
+# Refusing the WRITES rather than the tree, for the same reason the split does:
+# `phase.sh status` has to report this, `phase.sh migrate` has to be able to fix
+# it, and `phase.sh off` has to be able to end it. A denial that also blocks its
+# own recovery is not a denial, it is a brick.
+if [ "$LEGACY" = 1 ]; then
+  case "$TOOL" in
+    Edit|Write|NotebookEdit) deny "$SPEC_LEGACY_MSG" ;;
+    Bash)
+      collect_write_targets "$CMD"
+      while IFS= read -r P; do
+        [ -z "$P" ] && continue
+        in_project "$P" && deny "$SPEC_LEGACY_MSG"
+      done <<< "$CAND"
+      ;;
+  esac
+  exit 0
 fi
 
 # --- A task armed in another worktree ----------------------------------------

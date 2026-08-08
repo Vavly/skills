@@ -146,10 +146,13 @@ Then, from the root of **each** repo you want gated:
 **The plugin installs once; that command runs per project.** Everything the gate
 keeps — the spec, the slice position, the phase, the approvals — is per repo, so
 a central install cannot carry any of it. `spec-gate-install` writes the shim,
-creates `docs/specs/`, adds the eight `.gitignore` entries, merges
+creates `docs/specs/`, adds the two `.gitignore` entries, merges
 `permissions.ask` into any existing `.claude/settings.json`, and works out the
 RED test command from what the repo already has rather than asking cold. It is
-idempotent, and it is also the repair step after a plugin update.
+idempotent, and it is also the repair step after a plugin update — including the
+one case that needs a decision rather than a rewrite: a repo that was mid-task
+when the phase state moved out of the working tree is offered `phase.sh migrate`
+or `phase.sh off` rather than being migrated behind the user's back.
 
 It replaces five copy-paste steps that could each be half-done — which is how a
 plugin install used to end up with phase state on disk and no `phase.sh` to read
