@@ -17,7 +17,7 @@
 
 set -uo pipefail
 
-HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 INPUT=$(cat)
 
 quiet() { printf '{}\n'; exit 0; }

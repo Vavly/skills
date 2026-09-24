@@ -19,7 +19,7 @@
 
 set -uo pipefail
 
-SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/$(basename "${BASH_SOURCE[0]:-$0}")"
 
 # The repo is two levels up from .claude/hooks/. Deriving it from the shim's own
 # location rather than $PWD is the point: run from a subdirectory, phase.sh would

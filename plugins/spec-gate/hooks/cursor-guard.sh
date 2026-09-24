@@ -30,7 +30,7 @@
 
 set -uo pipefail
 
-HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 INPUT=$(cat)
 
 if ! command -v python3 >/dev/null 2>&1; then

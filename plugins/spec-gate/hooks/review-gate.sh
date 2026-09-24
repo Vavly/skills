@@ -25,7 +25,7 @@
 set -uo pipefail
 
 INPUT=$(cat)
-HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 
 # --- JSON reading, without a hard jq dependency ------------------------------
 # Falls back to python3. If neither parser exists we cannot read
@@ -73,7 +73,7 @@ else
   . "$HOOK_DIR/phase-policy.sh"
 fi
 
-PHASE=$(sed -n 's/^phase=//p' .claude/.spec-phase 2>/dev/null | head -1)
+PHASE=$(sed -n 's/^phase=//p' "$(spec_gate_dir)/.spec-phase" 2>/dev/null | head -1)
 
 # --- 0. One tree per task ----------------------------------------------------
 # This scan compares PROJECT_DIR's tree against PROJECT_DIR's baseline. On a
@@ -105,7 +105,7 @@ fi
 if command -v tree_snapshot >/dev/null 2>&1; then
   case "$PHASE" in
     1|2|3)
-      BASESNAP=$(cat .claude/.spec-baseline 2>/dev/null)
+      BASESNAP=$(cat "$(spec_gate_dir)/.spec-baseline" 2>/dev/null)
       VIOLATIONS=""
       while IFS= read -r line; do
         [ -z "$line" ] && continue
