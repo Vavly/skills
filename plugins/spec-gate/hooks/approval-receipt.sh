@@ -29,7 +29,7 @@
 set -uo pipefail
 
 INPUT=$(cat)
-HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 
 PARSER=""
 command -v jq      >/dev/null 2>&1 && PARSER=jq
@@ -96,12 +96,18 @@ if r is not None: print(json.dumps(r))
 
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$(json_get cwd)}"
 PROJECT_DIR="${PROJECT_DIR:-$PWD}"
-STATE="$PROJECT_DIR/.claude/.spec-phase"
-[ -f "$STATE" ] || exit 0            # workflow not active: nothing to record
 
+# The policy is sourced BEFORE the "is anything armed" check, because where the
+# state lives is now something the policy answers: it is under the git dir, and
+# working that out from here would be a second copy of spec_gate_dir waiting to
+# disagree with the first.
 [ -r "$HOOK_DIR/phase-policy.sh" ] || exit 0
 # shellcheck source=phase-policy.sh
 . "$HOOK_DIR/phase-policy.sh"
+
+GATE_DIR="$(spec_gate_dir)"
+STATE="$GATE_DIR/.spec-phase"
+[ -f "$STATE" ] || exit 0            # workflow not active: nothing to record
 
 QS=$(questions)
 [ -n "$QS" ] || exit 0
@@ -141,7 +147,7 @@ done <<< "$(gate_options "$GATE")"
 # Written whole or not at all: a half-written receipt read by the guard between
 # two of these printfs would be a receipt with no subject, which reads as stale
 # rather than as approval — but relying on that is relying on luck.
-TMP="$PROJECT_DIR/.claude/.spec-approval.tmp.$$"
+TMP="$GATE_DIR/.spec-approval.tmp.$$"
 {
   printf '# spec-gate approval receipt — written by approval-receipt.sh from the\n'
   printf '# host answer to AskUserQuestion. Never by hand, and never by the model.\n'
@@ -151,7 +157,9 @@ TMP="$PROJECT_DIR/.claude/.spec-approval.tmp.$$"
   printf 'slice=%s\n' "$(sed -n 's/^slice=//p' "$STATE" | head -1)"
   printf 'subject:\n'
   (cd "$PROJECT_DIR" 2>/dev/null && gate_subject "$GATE")
-} > "$TMP" 2>/dev/null && mv -f "$TMP" "$(approval_path)" 2>/dev/null
+} > "$TMP" 2>/dev/null \
+  && spec_mac_write "$TMP" \
+  && mv -f "$TMP" "$(approval_path)" 2>/dev/null
 rm -f "$TMP" 2>/dev/null
 
 exit 0

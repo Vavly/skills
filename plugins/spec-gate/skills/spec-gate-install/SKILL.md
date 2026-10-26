@@ -39,6 +39,32 @@ silently, so **stop here and say so** rather than installing something inert.
 Then check for `jq` or `python3` — the hooks need one of them and fail closed
 without either — and report which was found.
 
+**Then check for a task left behind by the state relocation.** The phase state
+used to live in `.claude/` and now lives under the git directory, so a repo that
+was mid-task when the plugin updated has a task recorded where nothing reads it:
+
+```bash
+ls .claude/.spec-phase 2>/dev/null && echo "LEGACY STATE PRESENT"
+```
+
+If it is there, this is the **first** thing to deal with and it is the user's
+call, not yours. Every layer already refuses rather than pretending the task is
+over — `phase.sh status` reports it, the guard denies writes — so nothing is
+lost, but nothing works either until it is resolved. Show them the two options
+and let them pick:
+
+- `phase.sh migrate` — carries the phase, task and slice across and re-signs
+  them. The receipts (`.spec-red`, `.spec-approval`, `.spec-validation`) are
+  **not** carried: they record that a check ran or that the user answered, and
+  the previous version signed nothing, so re-signing one would mint an assertion
+  on trust. They are cheap to re-earn.
+- `phase.sh off` — ends the task and clears both layouts.
+
+Do not move the files yourself. `mv .claude/.spec-phase …` is a write to a state
+path and the guard refuses those from every direction, deliberately and without
+exceptions. `phase.sh migrate` is trusted code doing the same write, which is why
+it exists.
+
 ## 2. The shim
 
 Copy the plugin's `hooks/phase-shim.sh` to `.claude/hooks/phase.sh` in this repo.
@@ -87,20 +113,27 @@ to verify anything, and 3 → 4 then rests on an assertion instead of on output.
 
 ## 5. `.gitignore`
 
-Six entries, and each one is state the gate writes about itself:
+Two entries:
 
 ```
-.claude/.spec-phase
-.claude/.spec-baseline
-.claude/.spec-red
-.claude/.spec-approval*
-.claude/.spec-scaffold
+.claude/spec-journal.md
 .claude/review-log.jsonl
 ```
 
-**Append only what is missing.** An untracked state file is work the review gate
-considers owed, so a name absent here is a gate that arms itself every time it
-writes its own bookkeeping.
+**Append only what is missing.** An untracked file the gate writes is work the
+review gate considers owed, so a name absent here is a gate that arms itself
+every time it records its own bookkeeping.
+
+There used to be eight. The other six — `.spec-phase`, `.spec-baseline`,
+`.spec-red`, `.spec-approval`, `.spec-scaffold`, `.spec-validation` — are no
+longer in the working tree at all: they live under `.git/spec-gate/`, which git
+never reports and no pathspec reaches. Nothing to ignore, and nothing an install
+can forget. That was not a tidiness change: being gitignored was exactly what put
+them in reach of `git clean -fdx` and `git stash --all`, and being under
+`.claude/` put them in a directory the model legitimately writes.
+
+If a repo still has the old six lines, they are harmless and can stay. The two
+above are the ones that matter.
 
 ## 6. `permissions.ask`
 
@@ -108,18 +141,24 @@ writes its own bookkeeping.
 {
   "permissions": {
     "ask": [
+      "Bash(.claude/hooks/phase.sh scaffold*)",
       "Bash(.claude/hooks/phase.sh 3*)",
       "Bash(.claude/hooks/phase.sh 4*)",
+      "Bash(.claude/hooks/phase.sh 5 --force*)",
       "Bash(.claude/hooks/phase.sh off*)"
     ]
   }
 }
 ```
 
+`5 --force` is listed and a bare `5` is not, on purpose: advancing into review is
+the model's own transition and prompting on it would be noise, but the `--force`
+spelling skips the validation report the reviewer is about to be handed.
+
 **Merge into any existing `.claude/settings.json`; never replace it.** The `ask`
 array goes inside whatever `permissions` object is already there, and everything
-else in the file stays untouched. Read it first, and if it already has these
-three, say so and skip.
+else in the file stays untouched. Read it first, and if it already has these,
+say so and skip.
 
 These are a backstop, not the main gate. `phase-guard.sh` matches `phase.sh` with
 no path anchor, so it asks in every normal permission mode wherever the script
@@ -129,8 +168,8 @@ shim gives every project the same one.
 
 **Do not copy the plugin's `hooks` block into settings.** The plugin registers
 its own hooks through `hooks/hooks.json`; a second copy pointing at
-`$CLAUDE_PROJECT_DIR/.claude/hooks/*.sh` would name five scripts a plugin install
-does not have.
+`$CLAUDE_PROJECT_DIR/.claude/hooks/*.sh` would name scripts a plugin install does
+not have.
 
 ## 7. Report
 
