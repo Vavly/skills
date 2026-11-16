@@ -16,7 +16,8 @@ contain (for example step H, hard rule 6 or "Implementer tiers"), that step or s
   when it starts. Run `git fetch origin` before each step A, and give the implementer that SHA.
 - **No stack.** No stack line, no GitHub stack, no restack, no merge-order line.
 - **No merge.** The orchestrator never merges a PR and never asks about a merge. The user merges.
-- **No auto finish.** When every PR is open, the run is `paused`, not `finished`. The user marks it
+- **No auto finish.** When every PR is open, the run is `paused`, not `finished`. The one
+  exception is a run in which every task is a delivered report (Phase 2, step 2). The user marks it
   as finished in the admin page, asks for more changes, or says that a PR is merged.
 - **Every question about one task parks only that task.** The other tasks are independent, so
   `L next` gives the next task. A question is run-level only when no task can move.
@@ -47,7 +48,8 @@ contain (for example step H, hard rule 6 or "Implementer tiers"), that step or s
    made in step 2 is one of them.
 6. Make the run. Write two files in your session scratchpad: `request.txt` with the user's request
    word for word, and `layers.json`, a JSON array in work order with one object for each task:
-   `{"task", "source", "outcome", "tier", "tierReason", "dependsOn": []}`. `outcome` is `pr` or
+   `{"task", "source", "outcome", "tier", "tierReason", "dependsOn": []}`. For a task with no
+   other source, write `the user's request` as its `source`. `outcome` is `pr` or
    `report` ("Outcomes" in `SKILL.md`). `dependsOn` can name only earlier report tasks, by their
    1-based index: a task that needs the result of a report waits for it. Then run:
    `L init --kind tasks --title "<short title>" --checkout <absolute path of this checkout>
@@ -120,6 +122,9 @@ Then:
    - the three next actions of the user (below).
 2. Run `L run --set stage=finish --set state=paused --set nextStep="waits for the user: more
    changes, merged, or finished"`. Do not ask about a merge. Do not record a merge question.
+   Exception: if every task of the run is `delivered`, nothing waits for a merge. Then run
+   `L run --set stage=finish --set state=finished --set nextStep=null`, after the follow-up
+   question has its answer. If you asked no follow-up question, run it now.
 
 The user can then do one of these three actions, for each task, at any time:
 
@@ -187,17 +192,19 @@ The user can then do one of these three actions, for each task, at any time:
 7. Delete the session scratchpad files of that task, and the implementer's scratch outputs that name the
    task, in the scratch folder of the profile.
 8. Keep the run folder. It holds the plans, the findings and the tier data.
-9. If every task of the run is `merged` or `delivered`, and the run is not `finished` yet, run
+9. If every task of the run is `merged` or `delivered`, no question is open, and the run is not
+   `finished` yet, run
    `L run --set state=finished --set nextStep=null`. Otherwise keep the run as it is.
 10. Tell the user what you deleted, what you kept, and what waits, one line each.
 
 ## Resume
 
 `/task-manager resume [<run-id>]` follows "Resume" in `core.md`. With no run id, the list gives
-`active` and `paused` runs; ignore the stack runs. Then:
+`active` and `paused` runs of both kinds. For a tasks run:
 
-- A task is parked and its question has an answer: continue. Resume the parked task ("Questions
-  and parked layers" in `core.md`).
+- A task is parked and its question has an answer, from either source: continue. Resume the
+  parked task ("Questions and parked layers" in `core.md`).
 - A task is still `queued`, or in progress: continue the loop.
 - Every task is `pr_open`, `merged` or `delivered`, and no question waits: the run waits for the user. Give the
-  user its report again (Phase 2, step 1), and stop.
+  user its report again (Phase 2, step 1), set `state=paused` again, and stop. Exception: if every
+  task is `delivered`, finish the run as Phase 2 step 2 says.

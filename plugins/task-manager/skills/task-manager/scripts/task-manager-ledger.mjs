@@ -134,7 +134,7 @@ const COMMANDS = {
   ask: (v, root) => ask(root, need(v, 'run'), { layer: v.layer, question: need(v, 'question'), options: v.option, sessionOnly: v['session-only'] }),
   answer: (v, root) => answer(root, need(v, 'run'), need(v, 'id'), need(v, 'answer'), v.via),
   park: (v, root) =>
-    park(root, need(v, 'run'), need(v, 'layer'), { question: v.question, questionId: v.id, options: v.option, tip: need(v, 'tip') }),
+    park(root, need(v, 'run'), need(v, 'layer'), { question: v.question, questionId: v.id, options: v.option, tip: need(v, 'tip'), sessionOnly: v['session-only'] }),
   unpark: (v, root) =>
     unpark(root, need(v, 'run'), need(v, 'layer'), {
       base: need(v, 'base'),

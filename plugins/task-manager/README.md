@@ -109,8 +109,8 @@ port.
 options and an "Answer" button. You choose an option, write a comment, or do both: the comment
 field is always there. The page records the answer in the ledger. The session has a background
 `wait` command on the ledger, so it gets the answer and continues. If the session is closed, it
-gets the answer at the next `/task-manager resume`. The merge question and the unstack question
-take an answer in the session only.
+gets the answer at the next `/task-manager resume`. Some questions take an answer in the session only: a merge, an unstack, a dropped commit, a
+force-push, and an outward action of a report task (a deploy, a write to a database, a comment).
 
 The page never writes a run file. It asks for three changes, and each one runs the ledger script
 in the project's checkout: "Mark as finished", an answer to a question, and the record of a PR

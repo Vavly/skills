@@ -62,6 +62,7 @@ Write only a command that works in this repository. Delete these comments when t
 ## CI
 
 - PR CI starts: <"on each push" | "on the label `<label>`" | "none: the project has no PR CI">
+- A second run on the same PR: <how to start CI again after new commits, for example "CI removes the label, so add it again", or "each push starts it">
 - Workflow file: <for example `main.yml`, or "none">
 - Jobs of the slow suite: <the prefix of their job names, for example `e2e`, or "none">
 - Paths that skip the slow suite: <globs, or "none">

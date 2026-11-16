@@ -161,6 +161,8 @@ test('R6. readBoard gives every run with its layers, open questions and parked q
   assert.deepEqual(main.layers.map((l) => [l.id, l.column]), readRun(root, IDS.main, { at: end }).layers.map((l) => [l.id, l.column]));
   assert.equal(main.next, 'l6');
   assert.equal(main.run.checkout, '/Users/dev/projects/app-alpha');
+  // The Tasks view reads `plans` from each board entry to decide if a report link is safe.
+  for (const entry of runs) assert.deepEqual(entry.plans, readRun(root, entry.run.id, { at: end }).plans);
   // q1 (parked l2) and q2 (run) are open; q3 is answered and belongs to no parked layer.
   assert.deepEqual(main.questions.map((q) => q.id), ['q1', 'q2']);
   assert.deepEqual(main.openQuestions.map((q) => q.id), ['q1', 'q2']);
@@ -742,4 +744,56 @@ test('Q1. the page answers an open question through the real helper; the session
   } finally {
     s.close();
   }
+});
+
+// ── Findings of the code review ─────────────────────────────────────────────────────────────────
+
+test('V1. [review] a delivered report adds no time after its delivery, and a report file cannot lead out of the run', async () => {
+  const core = await import('../../skills/task-manager/scripts/lib/task-manager-core.mjs');
+  const { symlinkSync } = await import('node:fs');
+  const own = mkdtempSync(path.join(tmpdir(), 'task-manager-admin-final-'));
+  const ownRoot = path.join(own, 'runs');
+  const entry = (task, extra = {}) => ({ task, source: 'request', tier: 'M', tierReason: 'r', dependsOn: [], ...extra });
+  const { id } = core.initRun(ownRoot, { title: 'Final', checkout: own, request: 'r', kind: 'tasks', layers: [entry('find', { outcome: 'report' })] });
+  writeFileSync(path.join(ownRoot, id, 'reports', 'report-find.md'), '# found\n');
+  core.setLayer(ownRoot, id, 'l1', [['phase', 'implementing']]);
+  core.setLayer(ownRoot, id, 'l1', [['report', 'reports/report-find.md'], ['phase', 'delivered']]);
+  // One hour later, the run is still active: the delivered phase has no time that grows.
+  const later = readRun(ownRoot, id, { at: Date.now() + 60 * 60_000 });
+  assert.equal(later.phaseTimes.l1.delivered, undefined);
+  assert.ok(later.phaseTimes.l1.implementing < 60_000);
+
+  const secret = path.join(own, 'secret.md');
+  writeFileSync(secret, 'outside');
+  symlinkSync(secret, path.join(ownRoot, id, 'reports', 'report-outside.md'));
+  const s = await startAdminServer({ root: ownRoot, port: 0 });
+  try {
+    assert.equal((await request(s, `/api/runs/${id}/plans/report-find.md`)).status, 200);
+    const res = await request(s, `/api/runs/${id}/plans/report-outside.md`);
+    assert.equal(res.status, 404);
+    assert.doesNotMatch(res.body, /outside$/);
+  } finally {
+    s.close();
+  }
+});
+
+test('V2. [review] a body over the limit gets 413 and records nothing; a relative runs root is refused', async () => {
+  const core = await import('../../skills/task-manager/scripts/lib/task-manager-core.mjs');
+  const { defaultRoot } = await import('../server.mjs');
+  const own = mkdtempSync(path.join(tmpdir(), 'task-manager-admin-413-'));
+  const ownRoot = path.join(own, 'runs');
+  const { id } = core.initRun(ownRoot, { title: 'Big', checkout: own, request: 'r', layers: [{ task: 't', source: 's', tier: 'S', tierReason: 'r' }] });
+  const q1 = core.ask(ownRoot, id, { question: 'A or B?' }).id;
+  const s = await startAdminServer({ root: ownRoot, port: 0 });
+  try {
+    const origin = `http://127.0.0.1:${s.address().port}`;
+    const res = await post(s, `/api/runs/${id}/questions/${q1}/answer`, { answer: 'x'.repeat(200_000) }, { origin, 'x-task-manager-admin': 'answer' });
+    assert.equal(res.status, 413);
+    assert.equal(readRun(ownRoot, id).openQuestions.length, 1);
+    // The server still answers after it.
+    assert.equal((await request(s, '/api/runs')).status, 200);
+  } finally {
+    s.close();
+  }
+  assert.throws(() => defaultRoot({ TASK_MANAGER_RUNS: 'runs' }), /must be an absolute path/);
 });

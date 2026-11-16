@@ -119,7 +119,13 @@ export function now() {
 
 /** The folder that holds every run folder: `$TASK_MANAGER_RUNS`, or `~/.task-manager/runs`. */
 export function resolveRoot(env = process.env) {
-  return env.TASK_MANAGER_RUNS || path.join(homedir(), '.task-manager', 'runs');
+  const given = env.TASK_MANAGER_RUNS;
+  if (!given) return path.join(homedir(), '.task-manager', 'runs');
+  // A settings file gives the value with no shell, so `~` is not expanded there.
+  const value = given === '~' || given.startsWith('~/') ? path.join(homedir(), given.slice(1)) : given;
+  // A relative root would land in the current directory: the checkout, where a commit can carry it.
+  if (!path.isAbsolute(value)) fail(`TASK_MANAGER_RUNS must be an absolute path; got ${JSON.stringify(given)}`);
+  return value;
 }
 
 export function assertRunId(id) {
@@ -676,7 +682,13 @@ function setLayerUnlocked(root, runId, layerId, pairs, summary) {
       if (blockedByCycle(run, layer.id)) fail('dependsOn would make a cycle');
     } else if (key === 'outcome') {
       if (layer.phase !== 'queued') fail('the outcome of a layer can change only while it is queued');
-      layer.outcome = oneOf('outcome', raw, OUTCOMES);
+      const outcome = oneOf('outcome', raw, OUTCOMES);
+      // In a tasks run, a task can wait only for a report. Keep that true for the tasks that wait for this one.
+      const waiting = run.layers.filter((l) => l.dependsOn.includes(layer.id)).map((l) => l.id);
+      if (outcome === 'pr' && kindOf(run) === 'tasks' && waiting.length) {
+        fail(`${waiting.join(', ')} depend${waiting.length === 1 ? 's' : ''} on ${layer.id}: in a tasks run, a task can wait only for a report task`);
+      }
+      layer.outcome = outcome;
     } else if (key === 'pr') {
       if (outcomeOf(layer) === 'report') fail(`layer ${layer.id} is a report layer: it has no PR`);
       const number = nullableText(raw);
@@ -851,7 +863,7 @@ function answerUnlocked(root, runId, questionId, answerText, via = 'session') {
  * Park a layer on a question. Give `question` to ask a new one, or `questionId` to park on a
  * question that was already asked for this layer and has no answer yet.
  */
-function parkUnlocked(root, runId, layerId, { question, questionId, options, tip }) {
+function parkUnlocked(root, runId, layerId, { question, questionId, options, tip, sessionOnly }) {
   const { dir, run } = load(root, runId);
   const layer = layerOf(run, layerId);
   if (layer.parked) fail(`layer ${layerId} is already parked`);
@@ -863,7 +875,7 @@ function parkUnlocked(root, runId, layerId, { question, questionId, options, tip
   if (question !== undefined) text('question', question);
   let id = questionId;
   if (id === undefined) {
-    id = writeQuestion(dir, run, { layer: layerId, question, options });
+    id = writeQuestion(dir, run, { layer: layerId, question, options, sessionOnly });
   } else {
     const existing = foldLatest(readJsonl(path.join(dir, 'questions.jsonl'))).find((q) => q.id === id);
     if (!existing) fail(`no question ${id}`);
@@ -1157,24 +1169,56 @@ export function showLayer(root, runId, layerId) {
 
 // ── Wait for an answer ───────────────────────────────────────────────────────────────────────────
 
+const isAnswered = (q) => q.answer !== null && q.answer !== undefined;
+
 /**
- * Resolve when a question of the run that is open now gets an answer, from the session or from the
- * admin page. The orchestrator runs this in the background: the harness starts the session again
- * when the command ends. It also ends when the run is finished, when no question is open, or after
- * `timeoutMs`. It only reads: it takes no lock and writes nothing.
+ * Resolve when a question of the run gets an answer, from the session or from the admin page. The
+ * orchestrator runs this in the background: the harness starts the session again when the command
+ * ends. It gives:
+ *   - an answer to a question that was open at some time during this wait, also a question that
+ *     was asked after the wait started;
+ *   - an answer from the admin page that no earlier wait gave to the session. This covers an
+ *     answer that came between `ask` and the start of this wait, or while no wait ran.
+ * It marks each admin-page answer that it gives as `delivered`, so the next wait does not give it
+ * again. That mark is its only write. It reads the marks again under the run lock before it
+ * writes, so two waits on one run never give the same admin-page answer. It also ends when the run
+ * is finished, when no question is open, or after `timeoutMs`.
  */
 export async function waitForAnswer(root, runId, { timeoutMs = 0, pollMs = 2000 } = {}) {
   const dir = runDir(root, runId);
-  const read = () => foldLatest(readJsonl(path.join(dir, 'questions.jsonl')));
+  const file = path.join(dir, 'questions.jsonl');
   readRunJson(dir);
-  const waiting = new Set(openQuestions(read()).map((q) => q.id));
+  const watched = new Set();
   const started = Date.now();
+  const fromPage = (q) => q.via === 'dashboard';
   for (;;) {
-    const answered = read()
-      .filter((q) => waiting.has(q.id) && q.answer !== null && q.answer !== undefined)
-      .map((q) => ({ id: q.id, layer: q.layer ?? null, answer: q.answer, via: q.via ?? 'session' }));
-    if (answered.length) return { answered, reason: 'answered' };
-    if (waiting.size === 0) return { answered: [], reason: 'no_open_question' };
+    const questions = foldLatest(readJsonl(file));
+    // A session answer is news only for a wait that saw the question open. An admin-page answer
+    // is news until one wait takes it.
+    const give = questions.filter((q) => isAnswered(q) && !fromPage(q) && watched.has(q.id));
+    const candidates = questions.filter((q) => isAnswered(q) && fromPage(q) && !q.delivered);
+    if (candidates.length) {
+      // A busy lock or a write error must not end the watcher, and must not drop an answer that
+      // already has its mark: `give` keeps it, and the next poll tries the other answers again.
+      try {
+        withLock(dir, () => {
+          const taken = new Set(foldLatest(readJsonl(file)).filter((q) => q.delivered).map((q) => q.id));
+          for (const q of candidates) {
+            if (taken.has(q.id)) continue;
+            appendLine(file, { ts: now(), id: q.id, delivered: true });
+            give.push(q);
+          }
+        });
+      } catch (error) {
+        if (!(error instanceof LedgerError) && give.length === 0) throw error;
+      }
+    }
+    if (give.length) {
+      return { answered: give.map((q) => ({ id: q.id, layer: q.layer ?? null, answer: q.answer, via: q.via ?? 'session' })), reason: 'answered' };
+    }
+    const open = questions.filter((q) => !isAnswered(q));
+    for (const q of open) watched.add(q.id);
+    if (open.length === 0) return { answered: [], reason: 'no_open_question' };
     if (readRunJson(dir).state === 'finished') return { answered: [], reason: 'run_finished' };
     if (timeoutMs > 0 && Date.now() - started >= timeoutMs) return { answered: [], reason: 'timeout' };
     await new Promise((done) => setTimeout(done, pollMs));

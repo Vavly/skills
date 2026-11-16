@@ -58,7 +58,8 @@ and two or more PRs are open:
    made in step 2 is one of them.
 6. Make the run. Write two files in your session scratchpad: `request.txt` with the user's request
    word for word, and `layers.json`, a JSON array in stack order with one object for each layer:
-   `{"task", "source", "outcome", "tier", "tierReason", "dependsOn"}`. `outcome` is `pr` or
+   `{"task", "source", "outcome", "tier", "tierReason", "dependsOn"}`. For a task with no other
+   source, write `the user's request` as its `source`. `outcome` is `pr` or
    `report` ("Outcomes" in `SKILL.md`). `dependsOn` lists the 1-based indexes
    of earlier layers in this array. Then run:
    `L init --title "<short title>" --checkout <absolute path of this checkout>
@@ -104,7 +105,9 @@ and two or more PRs are open:
    - the items of "Report the follow-ups and the checkout" in `core.md`.
 
    Then run `L run --set stage=finish --set state=finished --set nextStep=null`, unless merges
-   and restacks are still to come. In that case run `L run --set state=paused --set stage=finish
+   and restacks are still to come, or the follow-up question is open. With only the follow-up
+   question open, run `L run --set state=paused --set stage=finish --set nextStep="waits for the
+   follow-up answer"`, and finish the run after the answer. With merges still to come, run `L run --set state=paused --set stage=finish
    --set nextStep="<the next step>"`, and record the merge question that waits:
    `L ask --session-only --question "Merge the stack? Which PR is the top?" --option "<top PR>"`.
    The admin page cannot answer a session-only question: the merge yes comes in the session. It stays open
@@ -131,6 +134,8 @@ and two or more PRs are open:
    (above), then a restack of the layers above it ("Restack"), then the next PR.
 
    When every merge is recorded, end the run: `L run --set state=finished --set nextStep=null`.
+   If the follow-up question is still open, set `state=paused` in its place, and finish the run
+   after that answer.
 
 ## GitHub stack
 
@@ -237,11 +242,73 @@ Record the restack: `L run --set stage=restack` before it, and `L event --type r
 `L layer --layer <layer> --set head=<SHA> --set base=<branch> --set baseTip=<SHA>`. Then set the
 stage back (`layers`, `ci` or `finish`).
 
+## More changes on a layer of the stack
+
+`/task-manager changes <run-id> <layer> <what>` on a `pr` layer of a stack run. Do not follow the
+tasks-run procedure of `independent.md`: it has no restack.
+
+1. Run `L show --run <id>`. Wait for a stop point. Note the run's state and stage now: step 8
+   sets them back. Run `L list --checkout <checkout> --state active`: if another run is active,
+   tell the user, and stop. If the run is `finished`, run `L run --set state=paused`. Then run
+   `L run --set state=active`.
+2. `git fetch origin` and `git status -sb`. The tree must be clean: if it is not, set the state
+   back (step 8), ask the user about the work in it, and stop. Record the request:
+   `L event --layer <layer> --type note --summary "changes: <what>"`, and
+   `L layer --layer <layer> --set phase=fixing`.
+3. Launch an implementer with the layer's tier, or send a message to the layer's implementer in
+   the same session. Tell it `kind: stack`, that the branch exists, the PR head, and the change.
+   It checks out the branch, and makes the change in new commits only, with no push.
+4. The layer's reviewer checks the new commits (`git diff <old head>..HEAD`). In a new session,
+   the agents of steps 3 and 4 are new ones ("Resume" step 5 in `core.md`): one implementer and
+   one reviewer. Record their ids with `L layer --set implementer=<id>` and `--set reviewer=<id>`. This check is not
+   a review round, unless the change touches a file that the first review did not cover: then it
+   is a full round, as step C of `core.md`.
+5. After APPROVE, the implementer runs the final checks for the changed code, and pushes with no
+   force. Verify as in step H. Run `L layer --layer <layer> --set phase=pr_open --set head=<SHA>
+   --set lastReviewed=<SHA>`.
+6. Restack the layers above this layer ("Restack"). Then check the GitHub stack.
+7. If CI ran for the stack, its result is for the old heads. Run Phase 2 step 2 again.
+8. Give the user the new heads. Then set the run back to what step 1 noted:
+   - It was `active` with layers still to do: keep `active`, set the stage back, and continue the
+     loop.
+   - It was `paused`, or it was `finished` and a PR or a question now waits:
+     `L run --set state=paused --set stage=finish --set nextStep="<what waits>"`.
+   - It was `finished` and nothing waits: `L run --set state=finished --set nextStep=null`.
+
+   An `active` run blocks a new run in this checkout. The merge question stays open: do not ask
+   it again.
+
+## The user merged a PR of the stack
+
+`/task-manager merged <run-id> <layer>`, or the user says it in the session. Do not follow
+"Cleanup after a merge" of `independent.md`: it deletes the branch, and that branch can be the
+base of the PR above.
+
+1. Run `gh pr view <N> --json state,headRefOid`. Continue only if `state` is `MERGED`. Wait for a
+   stop point.
+2. If `L show` does not give `merged` for the layer yet (the admin PR sync can record it first),
+   record the merge: `L layer --layer <layer> --set phase=merged`, and `L event --layer <layer>
+   --type merge --summary "#<N>"`. A finished run accepts this record, but no other write: if the
+   run is `finished` and a layer is still open, run `L run --set state=paused` now. Then record the
+   new SHAs of the open layers, as Phase 2 step 4 says.
+3. Without a GitHub stack, restack the layers above ("Restack"). With a GitHub stack, GitHub
+   rebased them: check the stack.
+4. Delete the local branch and the remote branch of the merged layer only when no open PR has
+   that branch as its base (`gh pr list --base <branch> --state open` gives nothing), and by the
+   rules of steps 4 to 6 of "Cleanup after a merge" in `independent.md`: the switch away from the
+   branch, the local delete, the remote delete.
+5. Set the final state. If every `pr` layer is `merged`, the merge question has nothing left to
+   ask: if it is open, close it with `L answer --id <id> --answer "merged by the user"`. Then, if
+   no question is open and the run is not `finished` yet, run
+   `L run --set state=finished --set nextStep=null`. If the run is `finished` already, do nothing.
+   Otherwise run `L run --set state=paused --set
+   nextStep="<what waits>"`.
+
 ## Events of a stack run
 
 These rows add to the table of "Events" in `core.md`.
 
 | Event | Action |
 |---|---|
-| A commit becomes empty after a rebase | The restacker stops before the push. Ask the user whether to drop it. |
+| A commit becomes empty after a rebase | The restacker stops before the push. Ask the user whether to drop it, with `L ask --session-only`. |
 | The full CI run fails | Find the layer that owns the failure. Its implementer fixes it, its reviewer checks the fix, then restack the layers above. Start CI again on the new head, and run `L run --set ciPr=<N>` again (Phase 2, step 2). For a flaky test, follow step 5 of "Run CI on a PR and check it" in `core.md`, with `L run --set ciResult=pending`. |

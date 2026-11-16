@@ -38,7 +38,13 @@ approves it. The agent that does the task is the **worker**. The ledger records 
 2. **Nothing goes out.** The worker only reads from systems outside this machine. It files no
    issue, posts no comment, sends no message, starts no deploy, and writes to no database or
    service. If the task needs one of these actions, that is a question for the user (hard
-   rule 6): ask in text, and park the layer.
+   rule 6): ask in text, and park the layer with `L park --session-only`. The yes comes in the
+   session, not from the admin page.
+
+**With no git repository.** A report task can run in a folder that is not a git repository. Then
+skip rule 1 and every git check of this file and of the resume in `core.md`. Where a ledger
+command needs a branch or a SHA, give the word `none`: `base=none`, `baseTip=none`, `--tip none`,
+`--base none`, `--base-tip none`, `--head none`. Tell each agent that the folder has no git.
 
 ## The loop
 
@@ -53,6 +59,11 @@ with the `model` and `effort` of the layer's tier. Its prompt contains:
 - The plan path `<run folder>/plans/plan-<slug>.md` and the report path
   `<run folder>/reports/report-<slug>.md`, as absolute paths.
 - The results of the report layers that this layer depends on: the paths of their reports.
+- Stack run only, when this layer depends on a `pr` layer: the branch of that layer and its
+  recorded head. The worker needs that code, and its brief permits no checkout. So before you
+  launch it, at a stop point and with a clean tree, run `git switch <that branch>` yourself.
+  `git rev-parse HEAD` must be the recorded head: if not, stop and ask the user. Record that
+  branch as `base` and that head as `baseTip`.
 
 Record the start: `L layer --layer <layer> --set phase=implementing --set implementer=<agent id>
 --set base=<current branch> --set baseTip=<HEAD SHA> --set plan=plans/plan-<slug>.md --set
@@ -76,7 +87,7 @@ and `effort: "high"` for every tier. Its prompt contains:
 Record it: `L layer --layer <layer> --set phase=review --set round=1 --set reviewer=<agent id>`.
 
 **R-D. Rule on the findings, then relay them.** Record each finding, your ruling and the verdict
-as step D of `core.md` says. For `--file`, give the report path, or the code file that the
+as step D of `core.md` says, but set no `lastReviewed`, in this step and in R-E: a report layer has no commit to record, and `L unpark` refuses a report layer that has one. For `--file`, give the report path, or the code file that the
 finding is about. Use these severities:
 
 - **blocker:** a conclusion is wrong, or the report does not answer the question;
@@ -110,11 +121,14 @@ Then run `L layer --layer <layer> --set phase=delivered`. Give the user:
 - the next tasks that the report proposes. Record each one with `L followup`. Do not start them:
   the user decides.
 
-Then start the next layer that `L next` gives. A layer that depends on this one can start now.
+If an answer to a parked layer came, resume that layer now ("Questions and parked layers" in
+`core.md`). Otherwise start the next layer that `L next` gives. A layer that depends on this one
+can start now.
 When `L next` gives `null` and no layer is parked, go to the finish of your kind file. In its
 final report, a report layer shows the path of its report in place of a PR. A tasks run in which
-every task is `delivered` has nothing that waits for a merge: after the final report, run
-`L run --set stage=finish --set state=finished --set nextStep=null`.
+every task is `delivered` has nothing that waits for a merge. After the final report, set it to
+`paused` while the follow-up question is open. When that question has its answer and its action, or when you asked no
+follow-up question, run `L run --set stage=finish --set state=finished --set nextStep=null`.
 
 ## Park and resume
 
@@ -124,7 +138,9 @@ notes in the report file, and it leaves the tree clean. Give the current `HEAD` 
 
 After the answer, at a stop point, record it with `L answer`, unless it came from the admin page. Then run `L unpark --layer <layer>
 --base <current branch> --base-tip <HEAD SHA> --head <HEAD SHA>`. No rebase and no range-diff are
-necessary. Continue at the recorded phase and round, with the user's answer.
+necessary. Exception: a layer that depends on a `pr` layer of a stack run. First put the checkout
+back on its recorded `base` branch, as R-A says, and give the recorded `base` and the current
+head of that branch to `L unpark`. Continue at the recorded phase and round, with the user's answer.
 
 ## More changes on a delivered report
 

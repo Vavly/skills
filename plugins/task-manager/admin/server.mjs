@@ -40,7 +40,11 @@ const HOST = '127.0.0.1';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 /** The same rule as `resolveRoot` of the helper's core module. */
 export function defaultRoot(env = process.env) {
-  return env.TASK_MANAGER_RUNS || path.join(homedir(), '.task-manager', 'runs');
+  const given = env.TASK_MANAGER_RUNS;
+  if (!given) return path.join(homedir(), '.task-manager', 'runs');
+  const value = given === '~' || given.startsWith('~/') ? path.join(homedir(), given.slice(1)) : given;
+  if (!path.isAbsolute(value)) throw new Error(`TASK_MANAGER_RUNS must be an absolute path; got ${JSON.stringify(given)}`);
+  return value;
 }
 const PAGE_DIR = path.join(HERE, 'page');
 /** The header that a write needs. Its value names the action. */
@@ -167,13 +171,21 @@ const MAX_ANSWER = 2000;
 function readJsonBody(req) {
   return new Promise((resolvePromise, reject) => {
     let raw = '';
+    let tooLarge = false;
     req.setEncoding('utf8');
     req.on('data', (chunk) => {
+      // After the limit, read and drop the rest: keep nothing in memory.
+      if (tooLarge) return;
       raw += chunk;
-      if (raw.length > 4 * MAX_ANSWER) reject(new HttpError(413, 'the request body is too large'));
+      if (raw.length > 4 * MAX_ANSWER) {
+        tooLarge = true;
+        raw = '';
+        reject(new HttpError(413, 'the request body is too large'));
+      }
     });
     req.on('error', reject);
     req.on('end', () => {
+      if (tooLarge) return;
       try {
         const body = JSON.parse(raw);
         if (body === null || typeof body !== 'object' || Array.isArray(body)) throw new Error('not an object');
@@ -445,8 +457,9 @@ export function startAdminServer({ root = defaultRoot(), port = DEFAULT_PORT, he
   server.prSync = sync;
   const stop = () => {
     server.close();
-    // The page keeps a connection open for its polls. Without this, close() waits for it.
-    server.closeAllConnections();
+    // The page keeps a connection open for its polls. Without this, close() waits for it. A request
+    // that still runs (an answer that waits for the helper) gets its response first.
+    server.closeIdleConnections();
   };
   server.on('request', createHandler(root, () => server.address().port, { helperFor, sync, stop }));
   return new Promise((resolvePromise, reject) => {

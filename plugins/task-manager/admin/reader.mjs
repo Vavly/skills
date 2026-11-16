@@ -27,6 +27,8 @@ export const STALE_MS = 60 * 60 * 1000;
 const IN_PROGRESS = new Set(['implementing', 'review', 'fixing', 'final_checks', 'opening_pr']);
 /** Phases of a layer whose branch can be the base of another layer, or whose work is finished. */
 const ANCHOR = new Set(['pr_open', 'merged', 'delivered']);
+/** Phases in which a layer's work is over: no time adds up in them. */
+export const FINAL = new Set(['merged', 'delivered']);
 /** The default summary of a `layer_phase` event, written by the helper: `<from> -> <to>`. */
 const PHASE_SUMMARY = /^([a-z_]+) -> ([a-z_]+)$/;
 
@@ -167,7 +169,7 @@ export function phaseTimes(events, until) {
     current.set(e.layer, { phase: match[2], since: ts });
   }
   for (const [layer, open] of current) {
-    if (open.phase !== 'merged' && !Number.isNaN(end)) add(layer, open.phase, end - open.since);
+    if (!FINAL.has(open.phase) && !Number.isNaN(end)) add(layer, open.phase, end - open.since);
   }
   return times;
 }
@@ -304,9 +306,11 @@ export function listRuns(root, { at = Date.now() } = {}) {
  * does not show.
  */
 export function readBoard(root, { at = Date.now() } = {}) {
-  return scanRuns(root, at, ({ run, layers, questions, openQuestions: open, next, lastEvent, stale }) => ({
+  return scanRuns(root, at, ({ run, layers, questions, openQuestions: open, next, lastEvent, stale, plans }) => ({
     run: { id: run.id, title: run.title, kind: run.kind, state: run.state, stage: run.stage, checkout: run.checkout, nextStep: run.nextStep },
     layers,
+    // The Tasks view links a report only when its file is there, so it needs the file names.
+    plans,
     // Only the questions that a card shows: the open ones and the question of each parked layer.
     questions: questions.filter((q) => q.answer === null || q.answer === undefined || layers.some((l) => l.parked?.question === q.id)),
     openQuestions: open,

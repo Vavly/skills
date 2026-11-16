@@ -16,11 +16,11 @@ a reviewed report file in the run folder. This file gives the loop of a `pr` lay
 this file apply to it. Every rule here applies to both kinds, unless the rule says
 "stack run only" or "tasks run only".
 
-Three placeholders occur in all files of these skills:
+Three placeholders occur in all files of this skill:
 
 - `<skill>` is the absolute path of the folder that holds this file: the folder of the
   `task-manager` skill. `SKILL.md` says how to find it.
-- `<default>` is the default branch of the repository, from the profile. It is `<default>` in most
+- `<default>` is the default branch of the repository, from the profile. It is `main` in most
   repositories.
 - `<checkout>` is the absolute path of the checkout that this session works in.
 
@@ -142,7 +142,8 @@ The reviewer does not change with the tier: it is always `model: "opus"`, `effor
   `L layer --layer <layer> --set tier=M --set escalated=true --set
   implementer=<new id>`, then `L event --layer <layer> --type escalation --summary "<phase>:
   <cause>"`. Then, in a review round, run `L layer --layer <layer> --set phase=fixing` as in
-  step D. Use another model only when the user asks for it.
+  step D. A report layer escalates in the same way: the new worker continues
+  from the plan and the report file, not from a branch. Use another model only when the user asks for it.
 
 ## Questions and parked layers
 
@@ -151,11 +152,12 @@ the whole session until the user answers, and the admin page cannot answer its d
 the run exists, ask in text and record the question in the ledger. Use `AskUserQuestion` only
 before the run exists.
 
-**Two kinds of question.**
+**Three kinds of question.**
 
 | Kind | Examples | How to ask |
 |---|---|---|
-| Run-level: nothing can move without the answer | Intake decisions, a dirty tree, an empty commit after a rebase (stack run), which follow-ups to file, the merge yes (stack run), which run to resume | `L ask` (no `--layer`). Ask in text, start the answer watcher (below), and stop your turn. The answer comes as a message, or from the admin page. A question before the run exists has no ledger yet: ask it with `AskUserQuestion`. |
+| Before the run exists | The intake decisions, a dirty tree at intake, "resume it, or start a new run", which run to resume | `AskUserQuestion`. No `L ask`: no run exists for it yet. Record the intake decisions after `L init` with `L decision`. |
+| Run-level: nothing can move without the answer | A dirty tree at a resume, an empty commit after a rebase (stack run), which follow-ups to file, the merge yes (stack run) | `L ask` (no `--layer`). Ask in text, start the answer watcher (below), and stop your turn. The answer comes as a message, or from the admin page. The empty commit and the merge yes are session-only (below): their answer comes as a message only. |
 | Layer-level: only this layer must wait | A scope widening for this layer, a decision that its source gives to the user, an open data-loss finding at the round limit, a refused command with no safe alternative | Ask in text, park the layer, and continue with another layer. |
 
 **Ask a layer-level question in text.** Put it in your progress line to the user. Give the run id,
@@ -167,11 +169,15 @@ answer watcher starts you again.
 
 **The user can answer in two places.** One is a message in the session. The other is the admin
 page, which records the answer in the ledger for you (`via: dashboard`). Both are the user's
-answer, and both count as the user's yes for hard rule 6. The exceptions are a merge and an
-unstack: ask these with `L ask --session-only`, and the admin page then refuses an answer.
+answer, and both count as the user's yes for hard rule 6. The exceptions are the actions that cannot be undone or that go out of this machine: a merge, an
+unstack, a dropped commit, a force-push outside the restack procedure, and each outward action of
+a report layer (a deploy, a write to a database or a service, a comment or a message). Ask these
+with `--session-only` (`L ask --session-only`, or `L park --session-only` for a layer that parks):
+the admin page then refuses an answer, and the yes comes in the session. The choice of the
+follow-ups to file is not session-only.
 
 **The answer watcher.** After each `L ask`, and after each `L park` that asks a question, start
-`L wait --run <id>` as a background command, unless one runs already for this run. It only reads.
+`L wait --run <id> --timeout 900` as a background command, unless one runs already for this run. Its only write is a delivery mark on an admin-page answer.
 It does not block you: continue with the next layer. It ends when an open question gets an
 answer, and the harness then starts you again with its output: the question id, the layer, the
 answer and its source. Do not poll it. When it ends:
@@ -182,18 +188,39 @@ answer and its source. Do not poll it. When it ends:
 - `via: session`: you recorded this answer yourself with `L answer`. No more action is necessary.
 - If a question is still open, start a new watcher.
 
-The user can also answer on the admin page while no session runs. A resume finds that answer in
-`L show`.
+The output also gives a `reason`. `answered`: act as above. `no_open_question`: nothing waits, so
+start no watcher. `run_finished`: the run is closed, so start no watcher: an answer comes in the
+session, or a resume finds it. `timeout`: read `L show` for an answer that still needs its action (below), because a watcher of
+an earlier session can take an admin-page answer. Then start a new watcher if a question is still
+open. The time limit can pass up to one poll (2 seconds) late. One
+watcher is sufficient for a run: it also sees a question that you ask after it started, and an
+answer that the admin page recorded before it started.
+
+**The ledger shows if an answer still needs its action.** The watcher gives each admin-page
+answer one time, and a session can end between that moment and the stop point. So do not use the
+delivery to decide. Use the state:
+
+- A layer is parked on a question that has an answer (`L show` says "ready to unpark"): the
+  action is not done. Resume the layer, from either source of the answer.
+- The layer is not parked any more: the action is done. An answer that comes again needs nothing.
+- A run-level question: after you act on its answer, record
+  `L event --type note --summary "acted on <question id>"`. An answered run-level question with
+  no such note still needs its action.
+
+The user can also answer on the admin page while no session runs. A resume finds that answer by
+these rules ("Resume", step 6).
 
 **A layer with an open PR is never parked.** The layers above it already use its pushed tip.
 Record the question with `L ask --layer <layer>` and continue. Act on the answer at the next stop
 point (below). If the answer
 needs new commits on that layer, a restack of the layers above follows (stack run only). An answer that needs no
-change (for example, the code already does what the user chose) needs only `L answer`.
+change (for example, the code already does what the user chose) needs only its record: `L answer`
+for a session answer, nothing for an answer from the admin page.
 
 **A stop point** needs both of these conditions:
 
-- the current layer's PR is open and verified (step H), or the current layer is parked; **and**
+- the current layer's PR is open and verified (step H), or its report is delivered (step R-F of
+  `report-tasks.md`), or the current layer is parked; **and**
 - no agent runs: no implementer, reviewer, restacker or stack verifier.
 
 A pause inside a round is not a stop point, also when no agent runs (for example between step D
@@ -223,11 +250,12 @@ the answer watcher starts you again. Record nothing more: the
 
 **Resume a parked layer after the answer.**
 
-1. Record the answer with `L answer --id <question id> --answer "<text>"`. Wait for a stop
+1. Record the answer with `L answer --id <question id> --answer "<text>"`, unless it came from
+   the admin page: that answer is in the ledger already, and `L answer` refuses it. Wait for a stop
    point. Read the recorded SHAs of the parked layer from `L show`.
    **Tasks run only:** the base is `origin/<default>`, and the task's branch is not pushed. No rebase
    is necessary. Skip steps 2 to 4. The checkout is on another branch now, so the layer's
-   implementer must get its branch back first. Tell it: "Run `git status -sb`; the tree must be
+   implementer (a new one in a new session, "Resume" step 5) must get its branch back first. Tell it: "Run `git status -sb`; the tree must be
    clean. Check out `<branch>`. `git rev-parse HEAD` must be `<recorded tip>`. If not, stop and
    report." Then run `L unpark --layer <layer> --base <default> --base-tip <recorded base tip> --head
    <recorded tip>`, and add `--last-reviewed <recorded last reviewed SHA>` when `L show` gives one.
@@ -318,8 +346,8 @@ mixing their writes, but a command that waits more than 10 seconds for it stops 
 - **Write the ledger after every event, before the next action.** It is the only state that a new
   session can see. Before a stop, set the next step: `L run --run <id> --set nextStep="<step>"`.
 - **Record every question that waits for the user.** Run `L ask` before you ask (with `--layer`
-  for a layer question), and `L answer` when the answer comes. This applies to both kinds of
-  question. The user can then answer on the admin page too. The admin board shows an open question as
+  for a layer question), and `L answer` when the answer comes. This applies to every question after
+  `L init`. The user can then answer on the admin page too. The admin board shows an open question as
   "needs input". A question before `L init`, or before the run is chosen, gets no `L ask`,
   because no run exists for it yet. These are: the intake decisions (record them after `L init`
   with `L decision`), a dirty tree at intake, "resume it, or start a new run", and which run to
@@ -350,9 +378,9 @@ steps below leave it out. In each command, `--layer` takes the layer id.
 | A decision of the user at intake | `L decision --question --answer` |
 | A layer field changes: phase, round, branch, SHAs, agent ids, tier, escalation, PR | `L layer --layer <layer> --set key=value ...` |
 | A run field changes: state, stage, next step, CI | `L run --set key=value ...` |
-| A question to the user, and its answer | `L ask [--layer] [--session-only] --question --option ...`, `L answer --id --answer`. `--session-only` is for the merge yes and the unstack yes: the admin page cannot answer it. |
+| A question to the user, and its answer | `L ask [--layer] [--session-only] --question --option ...`, `L answer --id --answer`. `--session-only` is for the questions that "The user can answer in two places" lists: the admin page cannot answer it. |
 | Wait for an answer, in the background | `L wait --run <id> [--timeout <seconds>]`. It prints `{"answered": [{id, layer, answer, via}], "reason"}` and ends. `reason` is `answered`, `no_open_question`, `run_finished` or `timeout`. |
-| Park a layer, and resume it | `L park --layer (--question --option ... \| --id) --tip`, `L unpark --layer --base --base-tip --head [--last-reviewed]` |
+| Park a layer, and resume it | `L park --layer (--question --option ... [--session-only] \| --id) --tip`, `L unpark --layer --base --base-tip --head [--last-reviewed]` |
 | A finding, your ruling, its state after a fix | `L finding`, `L rule`, `L resolve` |
 | A plan document that the user gave as a source (the intake of your kind file) | `L main-plan --file <path>`. It copies the file to `plans/main-<slug>.md` and prints the path. The same text is copied one time only. |
 | An out-of-scope item, and its issue when filed | `L followup [--layer] --title --body [--data-loss]`, `L followup-filed --id --issue` |
@@ -423,14 +451,23 @@ the run: read its kind file before you continue.
    - Implementer, when fixes or final checks are pending: launch a new one. Tell it that the
      branch exists (see the escalation in "Implementer tiers"), and give it the findings to fix or
      the check to run.
+   - A report layer: use the R-A and R-C prompts of `report-tasks.md`, not the prompts above. Give
+     the new worker the report path and the plan path: it continues from the report file. Give a
+     new reviewer the output of `L show --run <id> --layer <layer>` as its history.
    - Record each new agent: `L layer --layer <layer> --set implementer=<id>` or
      `--set reviewer=<id>`.
 6. **Report.** Tell the user the run id, the current layer and its position of *n*, the round,
    and the next step. Give every open question again, with its layer, because the user cannot
    see the earlier session.
    Run `L run --run <id> --set state=active` and `L event --run <id> --type resume --summary
-   "<what you found>"`. If a question is open, start the answer watcher. A question that got its
-   answer on the admin page, while no session ran, shows in `L show` as answered: act on it. Then continue the loop. A parked layer stays parked until its answer
+   "<what you found>"`. Then run `L wait --run <id> --timeout 1` in the
+   foreground: it marks the admin-page answers that came while no session ran as given. Then find
+   every answer that still needs its action ("The ledger shows if an answer still needs its
+   action"), from `L show`, and act on each one. If a question is still open, start the answer
+   watcher in the background. Then continue the loop. If the run then only waits for the user (every
+   layer has its outcome, and every answer has its action), set `state=paused` again before you stop,
+   and do not ask an open question a second time: an `active` run blocks a new run in
+   this checkout. A parked layer stays parked until its answer
    comes.
 
 When the user stops a run, or the session ends before the run finishes, run
@@ -454,6 +491,8 @@ When the user stops a run, or the session ends before the run finishes, run
 - The plan path: `<run folder>/plans/plan-<slug>.md`, as an absolute path.
 - The skills that the profile names for the area of this task.
 - Stack run only: what the lower layers changed, if this task touches the same code.
+- The absolute paths of the reports of the report layers that this layer depends on. The
+  implementer reads them before it writes the plan.
 
 Record the start: `L layer --layer <layer> --set phase=implementing --set implementer=<agent id>
 --set base=<base branch> --set baseTip=<SHA> --set branch=<suggested branch> --set
@@ -575,7 +614,7 @@ the new tip: `L layer --layer <layer> --set head=<SHA>`. When you send the fixes
 record the round: `L layer --layer <layer> --set phase=review --set round=<n>`. After the report,
 record each finding's state
 (`L resolve --layer <layer> --id <finding id> --state fixed|not_fixed [--sha]`),
-new findings and the verdict as in step D, and the new `lastReviewed`. Tell it: "Do not run
+new findings and the verdict as in step D, and the new `lastReviewed` (none for a report layer). Tell it: "Do not run
 a review skill again. Verify each fix directly. Run only the checks for the changed code."
 Ask for CONFIRMED FIXED or NOT FIXED on each finding, any new defect, and a verdict. If the
 report shows a new run of a review skill or a new agent, reject it, and ask again for a direct
@@ -625,7 +664,8 @@ pr=<N> --set prUrl=<url> --set head=<SHA>`, then `L event --layer <layer> --type
 the GitHub stack and check the stack; in a tasks run, start the task's CI. Then tell the user how
 many of the *n* PRs are open, for example "3 of 5 PRs are open".
 If an answer to a parked layer came, resume that layer now ("Questions and parked layers").
-Otherwise start the next layer that `L next` gives, at step A. When `L next` gives `null` and no
+Otherwise start the next layer that `L next` gives, at step A (a report layer: at step R-A of
+`report-tasks.md`). When `L next` gives `null` and no
 layer is parked, go to the finish of your kind file. Before each step, set the next
 step: `L run --set nextStep="<step>"`.
 
@@ -671,7 +711,9 @@ this procedure. Record `L event --type note --summary "no PR CI"`, and say so in
    `gh run list --workflow <workflow file> --event pull_request --commit <head SHA> --json databaseId,url`.
    Leave out `--workflow` when the profile names no workflow file.
    The run can take some seconds to appear. With no match the command prints `[]` and exits 0, so
-   repeat it in a background loop until the JSON array is not empty. A new head SHA has no earlier
+   repeat it in a background loop until the JSON array is not empty, for at most 5 minutes. If no
+   run appears, tell the user: CI did not start (with a label start, the label can still be on
+   the PR from an earlier run; the profile says how to start a second run). A new head SHA has no earlier
    run, so the run found is the new one. Then run `gh run watch <id> --exit-status` in the
    background. Do not poll it.
 4. **Decide the result.** First read the run's conclusion:
@@ -693,12 +735,16 @@ this procedure. Record `L event --type note --summary "no PR CI"`, and say so in
 Both final reports contain these items:
 
 - what no agent could verify, for example a screen reader or a real Windows desktop;
-- the follow-ups, one line each, data loss first, from `L show`. Ask which ones to file, and record
+- the follow-ups, one line each, data loss first, from `L show`. While this question is open, do
+  not set the run to `finished`: a finished run ends the answer watcher. Set it to `paused`, and
+  finish it after the answer. Ask which ones to file, and record
   the question: `L ask --question "Which follow-ups to file?" --option <id> ...`. Record the choice
-  with `L answer`, and name both the filed and the declined ones. File only the ones the user
-  chooses, with `gh issue create`, by hard rule 5. Record each one:
+  with `L answer` (an answer from the admin page is recorded already), and name both the filed and the declined ones. File only the ones the user
+  chooses, with `gh issue create`, and with the attribution rule of hard rule 5. Record each one:
   `L followup-filed --id <follow-up id> --issue <N>`;
-- the checkout state: the branch, clean or not, and how far behind `origin/<default>`;
+- the checkout state: the branch, clean or not, and how far behind `origin/<default>`. With no
+  git repository, give no checkout state, list the follow-ups only, and do not ask which ones to
+  file: no issue tracker is known. No question waits then, so the run can finish;
 - the run id.
 
 ## Events
@@ -708,6 +754,6 @@ Both final reports contain these items:
 | The permission system refuses an agent's command | The agent stops and reports. Do not repeat the command in any form. Choose a safe alternative and continue (hard rule 6). Ask the user only when no safe alternative exists. |
 | The implementer finds that the task is already done, or that its premise is false | The reviewer verifies it. If the scope changes, ask the user in text and park the layer. |
 | A layer needs the user's answer | Ask in text, park the layer, and continue with the next layer that does not depend on it ("Questions and parked layers"). |
-| The user answers an open question, in the session or on the admin page | Record a session answer with `L answer`. An answer from the admin page is in the ledger already. At the next stop point (the current layer's PR is open or it is parked, and no agent runs), resume the parked layer ("Questions and parked layers"). |
+| The user answers an open question, in the session or on the admin page | Record a session answer with `L answer`. An answer from the admin page is in the ledger already. At the next stop point ("Questions and parked layers"), resume the parked layer ("Questions and parked layers"). |
 | The reviewer finds a defect in `<default>` that is out of scope by the test in step D | Record it with `L followup`. If it is data loss, report it to the user now, and record that: `L event --layer <layer> --type note --summary "data loss reported: <follow-up id>"`. `L finding` takes `--expected-fix` only when the reviewer gives one. A defect in `<default>` that the layer widens, or whose code the layer changes, is in scope: relay it. |
 | The implementer says a proposed fix would block a legitimate path | Send the reason to the reviewer. A known limitation goes into the PR body, and a follow-up issue needs the user's yes. |

@@ -14,6 +14,8 @@ tells you to read first. Run every command as its "Commands" section says.
   test that reproduces a defect, a patch to try), work in a copy outside the checkout, for
   example `git archive HEAD | tar -x -C <scratch folder>`. If a tool writes into the checkout,
   remove what it wrote before you report. At the end, `git status -sb` must show a clean tree.
+  If the orchestrator says that the folder has no git, skip the git commands of this brief, and
+  change no file except the plan, the report and your scratch files.
 - **Nothing goes out.** Only read from systems outside this machine. File no issue, post no
   comment, send no message, start no deploy, and write to no database or service. If the task
   needs such an action, stop and report it as an open point.

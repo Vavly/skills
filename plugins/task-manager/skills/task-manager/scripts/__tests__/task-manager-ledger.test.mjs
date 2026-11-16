@@ -1158,12 +1158,135 @@ test('A3. the wait command of the CLI prints the answer and exits 0; a bad run i
   const child = spawn(process.execPath, [CLI, 'wait', '--run', id, '--timeout', '20'], { env: { ...process.env, TASK_MANAGER_RUNS: root } });
   let out = '';
   child.stdout.on('data', (chunk) => (out += chunk));
-  setTimeout(() => cli(root, 'answer', '--run', id, '--id', q1, '--answer', 'A'), 100);
+  // An answer from the admin page reaches the wait also when it comes before the child reads the
+  // questions, so a slow start of the child cannot make this test fail.
+  setTimeout(() => cli(root, 'answer', '--run', id, '--id', q1, '--answer', 'A', '--via', 'dashboard'), 100);
   const code = await new Promise((done) => child.on('close', done));
   assert.equal(code, 0);
-  assert.deepEqual(JSON.parse(out), { answered: [{ id: q1, layer: null, answer: 'A', via: 'session' }], reason: 'answered' });
+  assert.deepEqual(JSON.parse(out), { answered: [{ id: q1, layer: null, answer: 'A', via: 'dashboard' }], reason: 'answered' });
 
   const bad = spawnSync(process.execPath, [CLI, 'wait', '--run', '../x'], { env: { ...process.env, TASK_MANAGER_RUNS: root }, encoding: 'utf8' });
   assert.equal(bad.status, 1);
   assert.match(bad.stderr, /invalid run id/);
+});
+
+test('A4. [review] wait also sees a question that was asked after the wait started', async () => {
+  const { waitForAnswer } = await import('../lib/task-manager-core.mjs');
+  const root = tempRoot();
+  const id = newRun(root);
+  const ask = (...args) => JSON.parse(cli(root, 'ask', '--run', id, ...args).stdout).id;
+  const q1 = ask('--layer', 'l1', '--question', 'first?');
+  const waiting = waitForAnswer(root, id, { pollMs: 5, timeoutMs: 5000 });
+  // Two layers park one after the other: the second question comes while the watcher runs.
+  await new Promise((done) => setTimeout(done, 30));
+  const q2 = ask('--layer', 'l2', '--question', 'second?');
+  await new Promise((done) => setTimeout(done, 30));
+  cli(root, 'answer', '--run', id, '--id', q2, '--answer', 'yes', '--via', 'dashboard');
+  assert.deepEqual(await waiting, { answered: [{ id: q2, layer: 'l2', answer: 'yes', via: 'dashboard' }], reason: 'answered' });
+  assert.equal(readRun(root, id).openQuestions.map((q) => q.id).join(), q1);
+});
+
+test('A7. [review] a session answer to a question that was asked after the wait started ends the wait', async () => {
+  const { waitForAnswer } = await import('../lib/task-manager-core.mjs');
+  const root = tempRoot();
+  const id = newRun(root);
+  const ask = (...args) => JSON.parse(cli(root, 'ask', '--run', id, ...args).stdout).id;
+  ask('--layer', 'l1', '--question', 'first?');
+  const waiting = waitForAnswer(root, id, { pollMs: 5, timeoutMs: 5000 });
+  await new Promise((done) => setTimeout(done, 30));
+  const q2 = ask('--layer', 'l2', '--question', 'second?');
+  await new Promise((done) => setTimeout(done, 30));
+  // Only a wait that reads the open questions again knows q2: a session answer has no other path.
+  cli(root, 'answer', '--run', id, '--id', q2, '--answer', 'yes');
+  assert.deepEqual(await waiting, { answered: [{ id: q2, layer: 'l2', answer: 'yes', via: 'session' }], reason: 'answered' });
+});
+
+test('A8. [review] two waits on one run give an admin-page answer one time in total', async () => {
+  const { waitForAnswer } = await import('../lib/task-manager-core.mjs');
+  const root = tempRoot();
+  const id = newRun(root);
+  const q1 = JSON.parse(cli(root, 'ask', '--run', id, '--question', 'A or B?').stdout).id;
+  const waits = [waitForAnswer(root, id, { pollMs: 5, timeoutMs: 5000 }), waitForAnswer(root, id, { pollMs: 7, timeoutMs: 5000 })];
+  await new Promise((done) => setTimeout(done, 30));
+  cli(root, 'answer', '--run', id, '--id', q1, '--answer', 'A', '--via', 'dashboard');
+  const results = await Promise.all(waits);
+  assert.deepEqual(results.map((r) => r.answered.length).sort(), [0, 1]);
+  assert.equal(results.find((r) => r.answered.length === 0).reason, 'no_open_question');
+});
+
+test('A9. [review] wait processes that start together give an admin-page answer one time in total', async () => {
+  const root = tempRoot();
+  const id = newRun(root);
+  const q1 = JSON.parse(cli(root, 'ask', '--run', id, '--question', 'A or B?').stdout).id;
+  cli(root, 'answer', '--run', id, '--id', q1, '--answer', 'A', '--via', 'dashboard');
+  // Separate processes, so the read and the mark of one can come between those of another. Only
+  // the run lock, with a second read inside it, keeps the answer to one process.
+  const outputs = await Promise.all(
+    Array.from({ length: 12 }, () => {
+      const child = spawn(process.execPath, [CLI, 'wait', '--run', id, '--timeout', '20'], { env: { ...process.env, TASK_MANAGER_RUNS: root } });
+      let out = '';
+      child.stdout.on('data', (chunk) => (out += chunk));
+      return new Promise((done) => child.on('close', () => done(JSON.parse(out))));
+    }),
+  );
+  assert.equal(outputs.filter((o) => o.answered.length === 1).length, 1);
+  assert.equal(outputs.filter((o) => o.reason === 'no_open_question').length, 11);
+});
+
+test('A5. [review] an admin-page answer that came before the wait started is given one time, not lost and not repeated', async () => {
+  const { waitForAnswer } = await import('../lib/task-manager-core.mjs');
+  const root = tempRoot();
+  const id = newRun(root);
+  const q1 = JSON.parse(cli(root, 'ask', '--run', id, '--question', 'A or B?').stdout).id;
+  // The user is faster than the session: the answer is there before `wait` starts.
+  cli(root, 'answer', '--run', id, '--id', q1, '--answer', 'B', '--via', 'dashboard');
+  assert.deepEqual(await waitForAnswer(root, id, { pollMs: 5, timeoutMs: 5000 }), { answered: [{ id: q1, layer: null, answer: 'B', via: 'dashboard' }], reason: 'answered' });
+  // The next wait does not give it again, and the answer itself is unchanged.
+  assert.deepEqual(await waitForAnswer(root, id, { pollMs: 5, timeoutMs: 5000 }), { answered: [], reason: 'no_open_question' });
+  const saved = readRun(root, id).questions.find((q) => q.id === q1);
+  assert.deepEqual([saved.answer, saved.via, saved.delivered], ['B', 'dashboard', true]);
+  // A session answer that came before the wait is not news to the session: nothing to give.
+  const q2 = JSON.parse(cli(root, 'ask', '--run', id, '--question', 'C or D?').stdout).id;
+  cli(root, 'answer', '--run', id, '--id', q2, '--answer', 'C');
+  assert.deepEqual(await waitForAnswer(root, id, { pollMs: 5, timeoutMs: 5000 }), { answered: [], reason: 'no_open_question' });
+});
+
+test('O5. [review] in a tasks run, a report task that another task waits for cannot become a pr task', () => {
+  const root = tempRoot();
+  const id = mixedRun(root);
+  const file = path.join(root, id, 'run.json');
+  const before = readFileSync(file, 'utf8');
+  const out = cli(root, 'layer', '--run', id, '--layer', 'l1', '--set', 'outcome=pr');
+  assert.equal(out.code, 1);
+  assert.match(out.stderr, /l2 depends on l1: in a tasks run, a task can wait only for a report task/);
+  assert.equal(readFileSync(file, 'utf8'), before);
+  // With no task that waits for it, the change is permitted. In a stack run it is always permitted.
+  assert.equal(cli(root, 'layer', '--run', id, '--layer', 'l2', '--set', 'dependsOn=').code, 0);
+  assert.equal(cli(root, 'layer', '--run', id, '--layer', 'l1', '--set', 'outcome=pr').code, 0);
+  const stackRoot = tempRoot();
+  const stack = mixedRun(stackRoot, 'stack');
+  assert.equal(cli(stackRoot, 'layer', '--run', stack, '--layer', 'l1', '--set', 'outcome=pr').code, 0);
+});
+
+test('[review] the runs root must be absolute: a relative value is refused, and ~ is expanded', async () => {
+  const { resolveRoot } = await import('../lib/task-manager-core.mjs');
+  const { homedir } = await import('node:os');
+  assert.equal(resolveRoot({ TASK_MANAGER_RUNS: '~/my-runs' }), path.join(homedir(), 'my-runs'));
+  assert.throws(() => resolveRoot({ TASK_MANAGER_RUNS: 'runs' }), /TASK_MANAGER_RUNS must be an absolute path/);
+  // The CLI reports it as an input error.
+  const out = main(['list'], { TASK_MANAGER_RUNS: 'runs' });
+  assert.equal(out.code, 1);
+  assert.match(out.stderr, /must be an absolute path/);
+});
+
+test('A6. [review] a layer can park on a session-only question, and the admin page cannot answer it', () => {
+  const root = tempRoot();
+  const id = newRun(root);
+  cli(root, 'layer', '--run', id, '--layer', 'l1', '--set', 'phase=implementing');
+  const out = cli(root, 'park', '--run', id, '--layer', 'l1', '--question', 'Deploy the fix to staging?', '--session-only', '--tip', 'a'.repeat(40));
+  assert.equal(out.code, 0, out.stderr);
+  const q = readRun(root, id).openQuestions[0];
+  assert.equal(q.sessionOnly, true);
+  assert.match(cli(root, 'answer', '--run', id, '--id', q.id, '--answer', 'yes', '--via', 'dashboard').stderr, /in the session only/);
+  assert.equal(cli(root, 'answer', '--run', id, '--id', q.id, '--answer', 'yes').code, 0);
 });

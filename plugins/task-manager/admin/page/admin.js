@@ -616,8 +616,10 @@ function layerCard(state, l, showRun = false) {
  * `items` are `{state, l}`: a layer and the run it belongs to.
  */
 function doneGroups(items, keepKey, showRun) {
-  const open = items.filter(({ l }) => l.phase !== 'merged');
-  const merged = items.filter(({ l }) => l.phase === 'merged');
+  // A delivered report is over, like a merged PR: it does not wait for a merge.
+  const over = ({ l }) => l.phase === 'merged' || l.phase === 'delivered';
+  const open = items.filter((item) => !over(item));
+  const merged = items.filter(over);
   const cards = (list) => list.map(({ state, l }) => layerCard(state, l, showRun));
   return [
     open.length ? h('div', { class: 'group' }, h('h4', null, 'PR open, waiting for merge', h('span', { class: 'count' }, String(open.length))), cards(open)) : null,
@@ -625,7 +627,7 @@ function doneGroups(items, keepKey, showRun) {
       ? h(
         'details',
         { class: 'group', open: open.length === 0, 'data-keep': `merged:${keepKey}` },
-        h('summary', null, h('h4', null, 'Merged', h('span', { class: 'count' }, String(merged.length)))),
+        h('summary', null, h('h4', null, 'Merged or delivered', h('span', { class: 'count' }, String(merged.length)))),
         cards(merged),
       )
       : null,
@@ -821,7 +823,7 @@ function phaseTable(state) {
           used.map((p) => {
             const ms = state.phaseTimes[l.id][p];
             if (ms === undefined) return h('td', null, '');
-            const open = p === l.phase && p !== 'merged' && state.run.state === 'active';
+            const open = p === l.phase && p !== 'merged' && p !== 'delivered' && state.run.state === 'active';
             return h('td', { class: p === l.phase ? 'current' : null, 'data-ms': open ? ms : null, 'data-at': open ? fetchedAt : null }, duration(ms));
           }),
         ),
@@ -917,7 +919,7 @@ function layerDetail(state, l) {
       field('Tier reason', l.tierReason),
       // Runs from before the skill's `plan` field have no link from a layer to its plan.
       field('Plan', l.plan ? h('a', { href: planHref(l.plan.replace(/^plans\//, '')) }, l.plan.replace(/^plans\//, '')) : '-'),
-      field('Outcome', l.outcome === 'report' ? (l.report ? h('a', { href: planHref(l.report.replace(/^reports\//, '')) }, l.report.replace(/^reports\//, '')) : 'report, not delivered yet') : 'pull request'),
+      field('Outcome', l.outcome === 'report' ? (l.report && state.plans.includes(l.report.replace(/^reports\//, '')) ? h('a', { href: planHref(l.report.replace(/^reports\//, '')) }, l.report.replace(/^reports\//, '')) : 'report, not delivered yet') : 'pull request'),
     ),
     l.parked ? h('div', { class: 'parked' }, h('strong', null, `Parked at ${l.parked.phase}, round ${l.parked.round}, on ${l.parked.question}`)) : null,
     questions.length
@@ -1178,7 +1180,7 @@ function renderTasks({ runs, broken }) {
       h('td', null, l.tier, l.escalated ? [' ', badge('escalated', 'warn')] : null),
       h('td', null, l.phase.replace('_', ' '), question ? h('div', { class: 'small warn-text' }, question.question) : null),
       h('td', { class: 'nowrap' }, l.round ? `${l.round}/3` : '-'),
-      h('td', { class: 'nowrap' }, l.outcome === 'report' ? (l.report ? h('a', { href: `${layerHref(state, l)}/plan/${enc(l.report.replace(/^reports\//, ''))}` }, 'report') : 'report') : l.pr ? (l.pr.url ? extLink(l.pr.url, `#${l.pr.number}`) : `#${l.pr.number}`) : '-'),
+      h('td', { class: 'nowrap' }, l.outcome === 'report' ? (l.report && state.plans.includes(l.report.replace(/^reports\//, '')) ? h('a', { href: `${layerHref(state, l)}/plan/${enc(l.report.replace(/^reports\//, ''))}` }, 'report') : 'report') : l.pr ? (l.pr.url ? extLink(l.pr.url, `#${l.pr.number}`) : `#${l.pr.number}`) : '-'),
       h('td', { class: 'nowrap' }, l.ci ? (l.ci.runUrl ? [ciBadge(l.ci), ' ', extLink(l.ci.runUrl, 'run')] : ciBadge(l.ci)) : '-'),
       l.lastEvent ? agoEl('td', { title: time(l.lastEvent), class: 'nowrap' }, l.lastEvent) : h('td', null, '-'),
     );

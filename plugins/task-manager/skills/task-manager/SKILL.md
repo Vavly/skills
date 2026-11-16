@@ -24,9 +24,9 @@ The arguments select the mode. Read only the files of your mode, each one in ful
 | Arguments | Mode | Read |
 |---|---|---|
 | `<tasks>` | Start a run | [core.md](core.md), then "Start a run" below |
-| `resume [<run-id>]` | Continue a run in a new session | [core.md](core.md) ("Resume"), then the kind file of the run |
-| `changes <run-id> <task> <what>` | More changes on a task that has its outcome | [core.md](core.md). A `pr` task: [independent.md](independent.md), "More changes on an open PR". A report task: [report-tasks.md](report-tasks.md), "More changes on a delivered report". |
-| `merged <run-id> <task>` | Cleanup after the user merged a PR | [core.md](core.md), then [independent.md](independent.md), "Cleanup after a merge" |
+| `resume [<run-id>]` | Continue a run in a new session | [core.md](core.md) ("Resume"), then the kind file of the run, and [report-tasks.md](report-tasks.md) if the run has a report layer |
+| `changes <run-id> <task> <what>` | More changes on a task that has its outcome | [core.md](core.md). Then, by the task: a report task: [report-tasks.md](report-tasks.md), "More changes on a delivered report". A `pr` task of a tasks run: [independent.md](independent.md), "More changes on an open PR". A `pr` layer of a stack run: [stack.md](stack.md), "More changes on a layer of the stack". |
+| `merged <run-id> <task>` | The user merged a PR | [core.md](core.md). A tasks run: [independent.md](independent.md), "Cleanup after a merge". A stack run: [stack.md](stack.md), "The user merged a PR of the stack". |
 | `setup [update]` | Write the profile of this repository | [setup.md](setup.md) only |
 | `admin [stop] [--port <n>] [--root <dir>]` | Start the dashboard of all runs and open it in the browser, or stop it | [admin.md](admin.md) only |
 
@@ -50,8 +50,8 @@ The outcome depends on the task. Give each task one of two outcomes.
 1. Read `core.md` in full.
 2. Divide the request into tasks, and give each task its outcome.
 3. Choose the run kind:
-   - a **stack run**, when two or more `pr` tasks use each other's code, or when the user asks
-     for a stack. Its kind file is [stack.md](stack.md);
+   - a **stack run**, when two or more `pr` tasks use each other's code, when a report task needs
+     the code of a `pr` task ("implement X, then measure it"), or when the user asks for a stack. Its kind file is [stack.md](stack.md);
    - a **tasks run** in all other cases. Its kind file is [independent.md](independent.md). A run
      that has only report tasks is a tasks run.
 4. Read the kind file in full. If the run has a report task, read `report-tasks.md` in full.
@@ -61,3 +61,4 @@ The outcome depends on the task. Give each task one of two outcomes.
 A `pr` task needs a git repository with a GitHub remote and the `gh` CLI. A report task does not.
 If the working directory is not such a repository, the run can have report tasks only: tell the
 user this before Phase 0, and in Phase 0 skip the git steps and the GitHub steps.
+`report-tasks.md` ("With no git repository") gives the other steps to skip.
