@@ -202,15 +202,26 @@ function sessionControl(state) {
   if (session.watching) return h('span', { class: 'badge session', title: 'A session waits for answers to this run' }, 'a session watches');
   // An active run belongs to the session that works on it. Only a long silence shows that it is gone.
   const idle = run.state === 'paused' || !state.lastEvent || Date.now() - Date.parse(state.lastEvent) >= 60 * 60 * 1000;
-  if (!idle) return h('span', { class: 'badge session', title: 'The run is active: a session works on it' }, 'a session works');
+  if (!idle) {
+    const badgeEl = h('span', { class: 'badge session', title: 'The run is active: a session works on it, or a session ended and left it active' }, 'active');
+    // A session can end and leave its run active. Only the user knows if their own session still works.
+    return settings.startSessions ? [badgeEl, h('button', { type: 'button', class: 'btn', onclick: () => confirmStartSession(state, true) }, 'Start a session…')] : badgeEl;
+  }
   if (!settings.startSessions) return h('span', { class: 'badge', title: 'An answer waits until you run /task-manager resume. To start a session from this page, set "resume.enabled" in config.json of the runs folder.' }, 'no session');
   return h('button', { type: 'button', class: 'btn', onclick: () => confirmStartSession(state) }, 'Start a session');
 }
 
 /** Ask before starting a session: it runs with no terminal, in the clone of the run. */
-function confirmStartSession(state) {
+function confirmStartSession(state, active = false) {
   const { run } = state;
+  const sure = h('input', { type: 'checkbox' });
   openConfirm({
+    getBody: active
+      ? () => {
+        if (!sure.checked) throw new Error('Confirm that no session of yours works on this run.');
+        return { evenIfActive: true };
+      }
+      : null,
     title: 'Start a session for this run?',
     confirmLabel: 'Start a session',
     confirmClass: 'btn',
@@ -219,6 +230,8 @@ function confirmStartSession(state) {
     content: h(
       'div',
       null,
+      active ? h('p', { class: 'warn-text' }, 'This run is active. A session works on it, or a session ended and left it active. Two sessions in one clone damage the work of each other.') : null,
+      active ? h('label', { class: 'answer-option' }, sure, ' No session of mine works on this run') : null,
       h('p', null, 'This starts a session with no terminal that runs ', h('code', null, `/task-manager resume ${run.id}`), ' in this folder:'),
       h('p', null, h('code', null, run.checkout)),
       h('ul', null, h('li', null, 'Start it only if you know this folder: the session uses the settings that are in it.'), h('li', null, 'It acts on the answers that wait, and it continues the run.'), h('li', null, 'It changes files in that clone. Do not work in the clone at the same time.'), h('li', null, 'It cannot ask you in a terminal. A session-only question still needs your own session.'), h('li', null, 'Its output goes to ', h('code', null, 'session.log'), ' in the run folder.')),

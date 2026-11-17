@@ -78,6 +78,7 @@ const OPTIONS = {
   'data-loss': { type: 'boolean' },
   'session-only': { type: 'boolean' },
   'dry-run': { type: 'boolean' },
+  'even-if-active': { type: 'boolean' },
   via: { type: 'string' },
   confirm: { type: 'string' },
   timeout: { type: 'string' },
@@ -158,7 +159,7 @@ const COMMANDS = {
   'main-plan': (v, root) => addMainPlan(root, need(v, 'run'), need(v, 'file')),
   next: (v, root) => {
     const state = readRun(root, need(v, 'run'));
-    return { next: state.next, ready: state.ready, working: state.working, parallel: state.run.parallel ?? 1 };
+    return { next: state.next, ready: state.ready, held: state.held, working: state.working, parallel: state.run.parallel ?? 1 };
   },
   finding: (v, root) =>
     addFinding(root, need(v, 'run'), need(v, 'layer'), {
@@ -178,7 +179,7 @@ const COMMANDS = {
   usage: (v, root) =>
     addUsage(root, need(v, 'run'), { layer: v.layer, role: need(v, 'role'), agent: v.agent, model: v.model, tokens: v.tokens, toolUses: v['tool-uses'], durationMs: v['duration-ms'], cost: v.cost }),
   'notify-test': (v, root) => notifyTest(root),
-  'start-session': (v, root) => startSession(root, need(v, 'run')),
+  'start-session': (v, root) => startSession(root, need(v, 'run'), { evenIfActive: v['even-if-active'] }),
   show: (v, root) => (v.layer ? showLayer(root, need(v, 'run'), v.layer) : show(root, need(v, 'run'))),
 };
 

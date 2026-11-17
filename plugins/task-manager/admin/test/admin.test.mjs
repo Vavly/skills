@@ -1031,3 +1031,48 @@ test('H1. the page archives a finished project through the real helper and bring
     s.close();
   }
 });
+
+// ── Corrections from the first real runs ────────────────────────────────────────────────────────
+
+test('RR1. [real run] the page starts a session for an active run only with the user word in the body; a queued task with a question is not next', async () => {
+  const core = await import('../../skills/task-manager/scripts/lib/task-manager-core.mjs');
+  const own = mkdtempSync(path.join(tmpdir(), 'task-manager-admin-realrun-'));
+  const ownRoot = path.join(own, 'runs');
+  const checkout = path.join(own, 'clone');
+  mkdirSync(checkout);
+  const fake = path.join(own, 'fake-session.mjs');
+  writeFileSync(fake, '#!/usr/bin/env node\nsetTimeout(() => {}, 4000);\n');
+  chmodSync(fake, 0o755);
+  const entry = (task) => ({ task, source: 'request', tier: 'S', tierReason: 'r', dependsOn: [] });
+  const { id } = core.initRun(ownRoot, { title: 'Left active', checkout, request: 'r', kind: 'tasks', layers: [entry('a'), entry('b')] });
+  core.ask(ownRoot, id, { layer: 'l1', question: 'A or B?' });
+  writeFileSync(path.join(ownRoot, 'config.json'), JSON.stringify({ resume: { enabled: true, command: fake } }));
+  const s = await startAdminServer({ root: ownRoot, port: 0 });
+  const origin = `http://127.0.0.1:${s.address().port}`;
+  const ok = { origin, 'x-task-manager-admin': 'session' };
+  const url = `/api/runs/${id}/session`;
+  let pid = null;
+  try {
+    // l1 waits for the user, so the page marks l2 as the next task, in the run view and on the board.
+    assert.equal(json(await request(s, `/api/runs/${id}`)).next, 'l2');
+    assert.equal(json(await request(s, '/api/board')).runs[0].next, 'l2');
+    // The run is active, with a new event: no session without the user word.
+    const refused = await post(s, url, {}, ok);
+    assert.equal(refused.status, 409);
+    assert.match(json(refused).error, /is active: a session works on it/);
+    assert.equal((await post(s, url, { evenIfActive: 'yes' }, ok)).status, 409);
+    const res = await post(s, url, { evenIfActive: true }, ok);
+    assert.equal(res.status, 200, res.body);
+    pid = json(res).pid;
+    assert.equal(json(await request(s, `/api/runs/${id}`)).session.started.pid, pid);
+  } finally {
+    if (pid) {
+      try {
+        process.kill(pid);
+      } catch {
+        // It ended already.
+      }
+    }
+    s.close();
+  }
+});

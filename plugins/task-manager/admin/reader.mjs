@@ -139,10 +139,14 @@ export const blockedBy = (run, layerId) => dependencies(run, layerId, (dep) => B
 /** The layers that a layer depends on with no PR open or merged yet. */
 export const waitsFor = (run, layerId) => dependencies(run, layerId, (dep) => !ANCHOR.has(dep.phase));
 
-/** The lowest-position `queued` layer whose dependencies all have an open or merged PR, or null. */
-export function nextLayer(run) {
+/**
+ * The lowest-position `queued` layer that can start, or null: its dependencies all have their
+ * outcome, and no question of its own is open (a layer cannot park before it starts, so the
+ * question is its only mark). The rule of `nextLayer` in the helper's core module.
+ */
+export function nextLayer(run, open = []) {
   for (const layer of byPosition(run.layers)) {
-    if (layer.phase === 'queued' && waitsFor(run, layer.id).length === 0) return layer.id;
+    if (layer.phase === 'queued' && waitsFor(run, layer.id).length === 0 && !open.some((q) => q.layer === layer.id)) return layer.id;
   }
   return null;
 }
@@ -345,7 +349,7 @@ export function readRun(root, id, { at = Date.now() } = {}) {
     openQuestions: open,
     followups,
     findings,
-    next: nextLayer(run),
+    next: nextLayer(run, open),
     lastEvent,
     stale: isStale(run, events, open, at),
     phaseTimes: phaseTimes(events, until),

@@ -232,6 +232,9 @@ delivery to decide. Use the state:
 - A layer is parked on a question that has an answer (`L show` says "ready to unpark"): the
   action is not done. Resume the layer, from either source of the answer.
 - The layer is not parked any more: the action is done. An answer that comes again needs nothing.
+- A layer that did not start, with an answered question of its own: the action is to start it,
+  with the answer in the prompt of its agent. It is done when the phase of the layer is not
+  `queued` any more.
 - A run-level question: after you act on its answer, record
   `L event --type note --summary "acted on <question id>"`. An answered run-level question with
   no such note still needs its action.
@@ -267,6 +270,12 @@ Only one writer works at a time.
    not change until the layer's own rebase, also when a restack moves other layers.
 3. Switch to the base of the next layer that can move.
 
+**A question about a layer that did not start.** A layer cannot park before it starts. Record
+the question with `L ask --layer <layer>`, and do not start that layer. `L next` and its `ready`
+list leave out a queued layer with an open question of its own, so the next layer is another
+one. After the answer, the layer is in `ready` again: start it as usual, with the answer in the
+prompt of its agent.
+
 **Choose the next layer.** Run `L next`. It gives the lowest layer in stack order that has not
 started and whose dependencies all have an open or merged PR, directly or through another layer
 (the "depends on" lists of the intake; a delivered report counts as an open PR here. In a
@@ -275,7 +284,7 @@ below the parked layers. A layer that depends on a parked layer waits too, but i
 it has not started, and it has no branch. If `L next` gives `null`, no layer can move, and the
 question becomes run-level. Tell the user that the run waits for the answer, and stop your turn:
 the answer watcher starts you again. Record nothing more: the
-`L park` record already shows the question.
+`L park` record, or the `L ask` record of a layer that did not start, already shows the question.
 
 **Resume a parked layer after the answer.**
 
@@ -346,6 +355,11 @@ JSON. On bad input it prints `error: <reason>` and exits 1: correct the input an
 Run `L` commands one at a time, never in parallel. A lock file keeps two commands on one run from
 mixing their writes, but a command that waits more than 10 seconds for it stops with an error.
 
+**The run folder.** `L init` prints it as `dir`, and `L show` prints it in the line `run folder`.
+Use that path, word for word, for every plan, report and profile file, and in every prompt of an
+agent. Never build the path yourself from the layout below: the runs root of this machine can be
+another folder.
+
 ```
 ~/.task-manager/runs/           ($TASK_MANAGER_RUNS changes it)
   <run-id>/                   <run-id> = <YYYY-MM-DD>-<slug>, for example 2026-11-06-undo-timeline
@@ -413,7 +427,7 @@ steps below leave it out. In each command, `--layer` takes the layer id.
 | A layer field changes: phase, round, branch, SHAs, agent ids, tier, escalation, PR | `L layer --layer <layer> --set key=value ...` |
 | A run field changes: state, stage, next step, CI | `L run --set key=value ...` |
 | A question to the user, and its answer | `L ask [--layer] [--session-only] --question --option ...`, `L answer --id --answer`. `--session-only` is for the questions that "The user can answer in two places" lists: the admin page cannot answer it, or only with a typed confirmation when the user's setting permits that. |
-| Start a session with no terminal, for the admin page | `L start-session --run <id>`. Only the admin page runs it, and only with the user's setting. Do not run it yourself. |
+| Start a session with no terminal, for the admin page | `L start-session --run <id> [--even-if-active]`. Only the admin page runs it, and only with the user's setting. Do not run it yourself. |
 | What one agent used, when it returns | `L usage [--layer <layer>] --role --agent --model --tokens --tool-uses --duration-ms [--cost]`. `--layer` is required for an implementer and a reviewer. With no `--layer`, the record is for the run: a restacker or a verifier. A finished run accepts it. |
 | Test the user's notification settings | `L notify-test`. It sends one test notification in place, and prints what each sender did. `L` sends the real notifications itself, after `ask`, `park` and a change to `paused` or `finished`: you run no command for them. |
 | Wait for an answer, in the background | `L wait --run <id> [--timeout <seconds>]`. It prints `{"answered": [{id, layer, answer, via}], "reason"}` and ends. `reason` is `answered`, `no_open_question`, `run_finished` or `timeout`. |
@@ -422,7 +436,7 @@ steps below leave it out. In each command, `--layer` takes the layer id.
 | A plan document that the user gave as a source (the intake of your kind file) | `L main-plan --file <path>`. It copies the file to `plans/main-<slug>.md` and prints the path. The same text is copied one time only. |
 | An out-of-scope item, and its issue when filed | `L followup [--layer] --title --body [--data-loss]`, `L followup-filed --id --issue` |
 | Anything else worth a line in the history | `L event --type <type> --summary` |
-| Read the state | `L show` (the run), `L show --layer <layer>` (one layer's findings, rulings, review rounds and questions), `L next` (it prints `next`, and also `ready`: every layer that can start, with `alone: true` for a layer that is never in a group, `working`: the layers in work, and `parallel`: the limit of the run), `L list [--checkout] [--state]` |
+| Read the state | `L show` (the run), `L show --layer <layer>` (one layer's findings, rulings, review rounds and questions), `L next` (it prints `next`, and also `held`: the layers that did not start and wait for an answer, `ready`: every layer that can start, with `alone: true` for a layer that is never in a group, `working`: the layers in work, and `parallel`: the limit of the run), `L list [--checkout] [--state]` |
 
 Layer keys for `--set`: `phase` (`queued`, `implementing`, `review`, `fixing`, `final_checks`,
 `opening_pr`, `pr_open`, `merged`; a report layer: `queued`, `implementing`, `review`, `fixing`,
@@ -454,6 +468,9 @@ session. In that session:
   answer" in "Questions and parked layers"). With no confirmed answer, leave the question open.
 - When no layer can move, set `state=paused` with the next step, and end. Start no answer watcher
   before you end: the page then shows that no session watches, and the user can start one again.
+- **`L run --set state=paused` is the last command of your turn, each time.** The session ends
+  when your text ends, also while a task waits for the user. A run that stays `active` blocks a
+  new run in the checkout, and the page then refuses a new session for it.
 - If a step needs a permission that you do not get, record it with `L event --type note`, set
   `state=paused`, and end.
 
@@ -728,8 +745,11 @@ the GitHub stack and check the stack; in a tasks run, start the task's CI. Then 
 many of the *n* PRs are open, for example "3 of 5 PRs are open".
 If an answer to a parked layer came, resume that layer now ("Questions and parked layers").
 Otherwise start the next layer that `L next` gives, at step A (a report layer: at step R-A of
-`report-tasks.md`). When `L next` gives `null` and no
-layer is parked, go to the finish of your kind file. Before each step, set the next
+`report-tasks.md`). When `L next` gives `null`, no layer is
+parked, and its `held` list is empty, go to the finish of your kind file. `held` gives the layers
+that did not start and that wait for an answer. When `L next` gives `null` and a layer waits for
+an answer (parked, or in `held`), follow "Choose the next layer": tell the user that the run
+waits for the answer, and stop your turn. Never finish a run while a layer waits. Before each step, set the next
 step: `L run --set nextStep="<step>"`.
 
 ## Shared procedures
