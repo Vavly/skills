@@ -396,6 +396,7 @@ steps below leave it out. In each command, `--layer` takes the layer id.
 | Event | Command |
 |---|---|
 | Start a run (the intake of your kind file) | `L init [--kind tasks] --title --checkout --request-file --layers-file` |
+| Check the plan of a run, and write nothing (`/task-manager preview`) | `L init --dry-run` with the same options. It prints the run that `init` would make, `activeRun` and `pausedRuns` for the checkout, and a token estimate from earlier runs. Only `init` takes `--dry-run`. |
 | A decision of the user at intake | `L decision --question --answer` |
 | A layer field changes: phase, round, branch, SHAs, agent ids, tier, escalation, PR | `L layer --layer <layer> --set key=value ...` |
 | A run field changes: state, stage, next step, CI | `L run --set key=value ...` |
