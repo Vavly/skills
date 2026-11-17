@@ -14,8 +14,13 @@ The outcome depends on the task:
 |---|---|---|
 | `pr` | A change to the repository: code, tests, configuration, docs in the repository | A reviewed pull request, in a stack or on the default branch |
 | `report` | An investigation, the cause of a defect, a plan, a code execution, a search for information | A reviewed report file in the run folder |
+| `issue` | A triage, an audit, a list of defects to record for later | GitHub issues, filed from a reviewed draft after your yes |
+| `comment` | A review of a pull request that exists | One review comment on that pull request, posted from a reviewed draft after your yes |
 
-One run can mix the two. A `pr` task can wait for a report task: "find the cause, then fix it".
+One run can mix them. A `pr` task can wait for a task of the other three kinds: "find the cause,
+then fix it". An `issue` task and a `comment` task send nothing before a separate reviewer
+approved the draft and you said yes. The comment gives findings only: it never approves a pull
+request, and it never requests changes.
 
 ## Install
 

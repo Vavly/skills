@@ -962,3 +962,20 @@ test('C1. the page answers a session-only question only with the user setting an
     s.close();
   }
 });
+
+// ── The outcomes issue and comment ───────────────────────────────────────────────────────────────
+
+test('E1. the reader gives the outcome and the delivery of an issue layer and a comment layer, and counts them as done', async () => {
+  const core = await import('../../skills/task-manager/scripts/lib/task-manager-core.mjs');
+  const own = mkdtempSync(path.join(tmpdir(), 'task-manager-admin-outcomes-'));
+  const ownRoot = path.join(own, 'runs');
+  const entry = (task, outcome) => ({ task, source: 'request', tier: 'S', tierReason: 'r', outcome });
+  const { id } = core.initRun(ownRoot, { title: 'Triage', checkout: own, request: 'r', kind: 'tasks', layers: [entry('triage', 'issue'), entry('review', 'comment')] });
+  writeFileSync(path.join(ownRoot, id, 'reports', 'report-triage.md'), 'draft');
+  core.setLayer(ownRoot, id, 'l1', [['phase', 'implementing']]);
+  core.setLayer(ownRoot, id, 'l1', [['report', 'reports/report-triage.md'], ['delivery', '#101'], ['phase', 'delivered']]);
+  const state = readRun(ownRoot, id);
+  assert.deepEqual(state.layers.map((l) => [l.outcome, l.delivery, l.column]), [['issue', '#101', 'done'], ['comment', null, 'todo']]);
+  assert.deepEqual(state.plans, ['report-triage.md']);
+  assert.deepEqual(readBoard(ownRoot).runs[0].layers.map((l) => l.delivery), ['#101', null]);
+});

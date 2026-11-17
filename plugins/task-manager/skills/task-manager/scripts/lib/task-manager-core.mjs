@@ -55,10 +55,26 @@ const ANCHOR = new Set(['pr_open', 'merged', 'delivered']);
 /**
  * The outcome of a layer. A `pr` layer changes the repository and ends as a pull request. A
  * `report` layer (an investigation, a plan, a debug session, a code execution) changes nothing in
- * the repository: it ends as a reviewed report file in the run folder, at phase `delivered`. A
- * layer with no `outcome` key is a `pr` layer: runs made before the key existed stay valid.
+ * the repository: it ends as a reviewed report file in the run folder, at phase `delivered`. An
+ * `issue` layer and a `comment` layer are report layers with one more step: after the review of
+ * their draft file, and after the user's yes, the orchestrator files the issues, or posts the
+ * comment on a pull request. Their `delivery` field records what went out. A layer with no
+ * `outcome` key is a `pr` layer: runs made before the key existed stay valid.
  */
-export const OUTCOMES = ['pr', 'report'];
+export const OUTCOMES = ['pr', 'report', 'issue', 'comment'];
+/** Outcomes whose reviewed draft goes out of this machine: `delivered` needs a `delivery` record. */
+const SENT_OUTCOMES = new Set(['issue', 'comment']);
+
+/** The outcome of a layer with its article, for a message: "an issue", "a report". */
+function aLayer(layer) {
+  const outcome = outcomeOf(layer);
+  return `${outcome === 'issue' ? 'an' : 'a'} ${outcome} layer`;
+}
+
+/** True for every layer that changes nothing in the repository: it follows the report loop. */
+export function isReportLike(layer) {
+  return outcomeOf(layer) !== 'pr';
+}
 /** Phases that only a `pr` layer has. */
 const PR_PHASES = new Set(['final_checks', 'opening_pr', 'pr_open', 'merged']);
 
@@ -631,7 +647,7 @@ export function initRun(root, { title, checkout, request, layers, kind = 'stack'
       }
     }
     // In a tasks run, no PR is on another PR. A task can wait only for a report.
-    if (kind === 'tasks' && deps.some((dep) => (layers[dep - 1].outcome ?? 'pr') !== 'report')) {
+    if (kind === 'tasks' && deps.some((dep) => (layers[dep - 1].outcome ?? 'pr') === 'pr')) {
       fail(`task ${number}: in a tasks run, dependsOn may name only report tasks; use a stack run for a task that uses the code of another task`);
     }
     return {
@@ -737,6 +753,14 @@ const LAYER_SETTERS = {
     if (value !== null && !PLAN_PATH.test(value)) fail(`plan must match plans/<slug>.md with [a-z0-9-] only; got ${JSON.stringify(v)}`);
     return value;
   },
+  // What an issue layer or a comment layer sent: the issue numbers or the comment URL, or "not sent: <reason>".
+  delivery: (v) => {
+    if (v === 'null') return null;
+    const value = text('delivery', v).trim();
+    if (/[\r\n]/.test(value)) fail('delivery must be one line');
+    if (value.length > 1000) fail('delivery is longer than 1000 characters');
+    return value;
+  },
   report: (v) => {
     const value = nullableText(v);
     if (value !== null && !REPORT_PATH.test(value)) fail(`report must match reports/report-<slug>.md with [a-z0-9-] only; got ${JSON.stringify(v)}`);
@@ -760,7 +784,7 @@ function setLayerUnlocked(root, runId, layerId, pairs, summary) {
       const deps = raw === '' ? [] : raw.split(',').map((d) => assertLayerId(d.trim()));
       for (const dep of deps) {
         if (dep === layer.id) fail('a layer cannot depend on itself');
-        if (kindOf(run) === 'tasks' && outcomeOf(layerOf(run, dep)) !== 'report') {
+        if (kindOf(run) === 'tasks' && !isReportLike(layerOf(run, dep))) {
           fail(`run ${run.id} is a tasks run: dependsOn may name only report tasks`);
         }
         layerOf(run, dep);
@@ -776,8 +800,10 @@ function setLayerUnlocked(root, runId, layerId, pairs, summary) {
         fail(`${waiting.join(', ')} depend${waiting.length === 1 ? 's' : ''} on ${layer.id}: in a tasks run, a task can wait only for a report task`);
       }
       layer.outcome = outcome;
+      // A draft and a delivery belong to the outcome that made them.
+      if (!SENT_OUTCOMES.has(outcome)) layer.delivery = null;
     } else if (key === 'pr') {
-      if (outcomeOf(layer) === 'report') fail(`layer ${layer.id} is a report layer: it has no PR`);
+      if (isReportLike(layer)) fail(`layer ${layer.id} is ${aLayer(layer)}: it has no PR`);
       const number = nullableText(raw);
       layer.pr = number === null ? null : { number: intIn('pr', number, 1, Number.MAX_SAFE_INTEGER), url: layer.pr?.url ?? null };
     } else if (key === 'prUrl') {
@@ -800,13 +826,20 @@ function setLayerUnlocked(root, runId, layerId, pairs, summary) {
     }
     changes.push(`${key}=${raw}`);
   }
-  if (outcomeOf(layer) === 'report') {
-    if (PR_PHASES.has(layer.phase)) fail(`layer ${layer.id} is a report layer: it has no phase ${layer.phase}; it ends at delivered`);
+  const sent = SENT_OUTCOMES.has(outcomeOf(layer));
+  if (isReportLike(layer)) {
+    if (PR_PHASES.has(layer.phase)) fail(`layer ${layer.id} is ${aLayer(layer)}: it has no phase ${layer.phase}; it ends at delivered`);
+    // A parked layer waits for an answer. Its work is not complete, whatever the answer is.
+    if (layer.phase === 'delivered' && layer.parked) fail(`layer ${layer.id} is parked: unpark it before phase=delivered`);
     if (layer.phase === 'delivered' && !layer.report) fail('set report=reports/report-<slug>.md before phase=delivered');
     if (layer.phase === 'delivered' && !existsSync(path.join(dir, layer.report))) fail(`the report file ${layer.report} does not exist in the run folder`);
+    // What went out, or why nothing did: the record of the outward step.
+    if (layer.phase === 'delivered' && sent && !layer.delivery) fail(`layer ${layer.id} is ${aLayer(layer)}: set delivery=<what went out, or "not sent: <reason>"> before phase=delivered`);
+    if (layer.delivery && !sent) fail(`layer ${layer.id} is a report layer: nothing of it goes out, so it has no delivery`);
   } else {
     if (layer.phase === 'delivered') fail(`layer ${layer.id} is a pr layer: it ends at merged, not at delivered`);
     if (layer.report) fail(`layer ${layer.id} is a pr layer: it has no report`);
+    if (layer.delivery) fail(`layer ${layer.id} is a pr layer: it has no delivery`);
   }
   if (before === 'queued' && layer.phase !== 'queued') placeAboveBase(run, layer.id);
   saveRun(dir, run);
@@ -1290,7 +1323,7 @@ export function show(root, runId) {
   lines.push(tasks ? 'tasks (work order):' : 'layers (bottom to top):');
   for (const l of layers) {
     const parts = [`  ${l.position}. ${l.id} [${l.column}] ${l.phase} r${l.round}/3 tier ${l.tier}${l.escalated ? ' (escalated)' : ''}`];
-    if (outcomeOf(l) === 'report') parts.push(`report ${l.report ?? '-'}`);
+    if (isReportLike(l)) parts.push(`${outcomeOf(l)} ${l.report ?? '-'}${l.delivery ? ` (${l.delivery})` : ''}`);
     if (l.pr) parts.push(`PR #${l.pr.number}`);
     if (l.ci) parts.push(`ci ${l.ci.result} ${l.ci.runUrl}`);
     if (l.openFindings) parts.push(`${l.openFindings} open finding${l.openFindings === 1 ? '' : 's'}`);
@@ -1356,6 +1389,7 @@ export function showLayer(root, runId, layerId) {
   const lines = [];
   lines.push(`layer ${l.id} (position ${l.position}) [${l.column}] ${l.phase} r${l.round}/3 tier ${l.tier}${l.escalated ? ' (escalated)' : ''} - ${l.task}`);
   lines.push(`source ${l.source}; depends on ${l.dependsOn.join(', ') || '-'}`);
+  if (isReportLike(l)) lines.push(`outcome ${outcomeOf(l)}; report ${l.report ?? '-'}${SENT_OUTCOMES.has(outcomeOf(l)) ? `; delivery ${l.delivery ?? '-'}` : ''}`);
   lines.push(`branch ${l.branch ?? '-'}; base ${l.base ?? '-'}@${l.baseTip ?? '-'}; head ${l.head ?? '-'}; last reviewed ${l.lastReviewed ?? '-'}`);
   lines.push(`implementer ${l.implementer ?? '-'}; reviewer ${l.reviewer ?? '-'}${l.pr ? `; PR #${l.pr.number} ${l.pr.url ?? ''}` : ''}; plan ${l.plan ?? '-'}`);
   if (l.ci) lines.push(`ci ${l.ci.result} ${l.ci.runUrl}`);

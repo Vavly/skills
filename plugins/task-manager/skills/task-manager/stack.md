@@ -59,8 +59,8 @@ and two or more PRs are open:
 6. Make the run. Write two files in your session scratchpad: `request.txt` with the user's request
    word for word, and `layers.json`, a JSON array in stack order with one object for each layer:
    `{"task", "source", "outcome", "tier", "tierReason", "dependsOn"}`. For a task with no other
-   source, write `the user's request` as its `source`. `outcome` is `pr` or
-   `report` ("Outcomes" in `SKILL.md`). `dependsOn` lists the 1-based indexes
+   source, write `the user's request` as its `source`. `outcome` is `pr`,
+   `report`, `issue` or `comment` ("Outcomes" in `SKILL.md`). `dependsOn` lists the 1-based indexes
    of earlier layers in this array. Then run:
    `L init --title "<short title>" --checkout <absolute path of this checkout>
    --request-file <request.txt> --layers-file <layers.json>`. It prints the run id. Then run

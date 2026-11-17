@@ -1859,7 +1859,7 @@ test('D2. [review] a dry run and a real init refuse the same input; --dry-run is
     [[entry({ tier: 'XL' })], 'stack', /tier/],
     [[entry({ task: '  ' })], 'stack', /task is required/],
     [[entry({ dependsOn: [2] }), entry()], 'stack', /dependsOn may name only earlier layers/],
-    [[entry({ outcome: 'issue' })], 'tasks', /outcome/],
+    [[entry({ outcome: 'email' })], 'tasks', /outcome/],
     [[], 'stack', /non-empty JSON array/],
   ];
   for (const [layerList, kind, message] of cases) {
@@ -1926,4 +1926,93 @@ test('D3. the dry run estimates the tokens from the complete tasks of earlier ru
   const partial = plan([['S', 'pr'], ['M', 'pr'], ['L', 'pr']]);
   assert.equal(partial.estimate.tokens, null);
   assert.deepEqual(partial.layers.map((l) => l.tokens), [null, 5000, null]);
+});
+
+// ── The outcomes issue and comment ───────────────────────────────────────────────────────────────
+
+test('E1. an issue layer and a comment layer follow the report phases, and they are delivered only with a record of what went out', () => {
+  const root = tempRoot();
+  const id = initRun(root, { title: 'Triage', checkout: CHECKOUT, request: 'r', kind: 'tasks', date: '2026-11-06', layers: [
+    { task: 'Triage the crash reports', source: 'request', tier: 'M', tierReason: 'r', outcome: 'issue' },
+    { task: 'Review PR 41', source: '#41', tier: 'S', tierReason: 'r', outcome: 'comment' },
+    { task: 'Fix the top crash', source: 'request', tier: 'M', tierReason: 'r', dependsOn: [1] },
+    { task: 'Find the cause', source: 'request', tier: 'S', tierReason: 'r', outcome: 'report' },
+  ] }).id;
+  const set = (layer, ...pairs) => cli(root, 'layer', '--run', id, '--layer', layer, ...pairs.flatMap((p) => ['--set', p]));
+  // A pr task can wait for an issue task: it changes no code. It still waits until that task is delivered.
+  assert.equal(readRun(root, id).next, 'l1');
+  assert.deepEqual(readRun(root, id).layers.find((l) => l.id === 'l3').waitsFor, ['l1']);
+
+  assert.equal(set('l1', 'phase=implementing').code, 0);
+  // No PR phase, and no PR.
+  assert.match(set('l1', 'phase=opening_pr').stderr, /l1 is an issue layer: it has no phase opening_pr/);
+  assert.match(set('l1', 'pr=7').stderr, /is an issue layer: it has no PR/);
+  assert.equal(set('l1', 'phase=review', 'round=1').code, 0);
+  // Delivered needs the draft file, and the record of what went out.
+  assert.match(set('l1', 'phase=delivered').stderr, /set report=reports\/report-<slug>.md before phase=delivered/);
+  writeFileSync(path.join(root, id, 'reports', 'report-triage.md'), '## Issue: crash on save');
+  assert.match(set('l1', 'report=reports/report-triage.md', 'phase=delivered').stderr, /is an issue layer: set delivery=/);
+  assert.equal(readRun(root, id).layers[0].phase, 'review');
+  assert.equal(set('l1', 'report=reports/report-triage.md', 'delivery=#101, #102', 'phase=delivered').code, 0);
+  assert.match(cli(root, 'show', '--run', id).stdout, /issue reports\/report-triage.md \(#101, #102\)/);
+  // The task that waited can start now.
+  assert.deepEqual(readRun(root, id).layers.find((l) => l.id === 'l3').waitsFor, []);
+
+  // A comment that the user declined is delivered too, with the reason.
+  writeFileSync(path.join(root, id, 'reports', 'report-review-41.md'), 'draft');
+  assert.equal(set('l2', 'phase=implementing').code, 0);
+  assert.match(set('l2', 'report=reports/report-review-41.md', 'phase=delivered').stderr, /is a comment layer: set delivery=/);
+  assert.equal(set('l2', 'report=reports/report-review-41.md', 'delivery=not sent: the user declined', 'phase=delivered').code, 0);
+
+  // A report layer and a pr layer send nothing, so they have no delivery.
+  assert.match(set('l4', 'delivery=#5').stderr, /is a report layer: nothing of it goes out/);
+  assert.match(set('l3', 'delivery=#5').stderr, /is a pr layer: it has no delivery/);
+  assert.match(set('l4', `delivery=${'x'.repeat(1001)}`).stderr, /longer than 1000 characters/);
+  // What went out is one line of text, not a blank.
+  assert.match(set('l2', 'delivery=   ').stderr, /delivery is required/);
+  assert.match(set('l2', 'delivery=a\nb').stderr, /delivery must be one line/);
+  assert.match(cli(root, 'show', '--run', id, '--layer', 'l1').stdout, /outcome issue; report reports\/report-triage.md; delivery #101, #102/);
+  assert.match(cli(root, 'show', '--run', id, '--layer', 'l4').stdout, /outcome report; report -\n/);
+  assert.equal(readRun(root, id).layers.find((l) => l.id === 'l4').delivery ?? null, null);
+});
+
+test('E2. the outcome of a queued layer can change to issue or comment, and a change away from them drops the delivery', () => {
+  const root = tempRoot();
+  const id = newRun(root, 2, {}, { kind: 'tasks' });
+  const set = (layer, ...pairs) => cli(root, 'layer', '--run', id, '--layer', layer, ...pairs.flatMap((p) => ['--set', p]));
+  assert.equal(set('l1', 'outcome=comment', 'delivery=https://github.com/o/r/pull/4#pullrequestreview-9').code, 0);
+  assert.equal(set('l2', 'dependsOn=l1').code, 0);
+  // A task waits for l1, so l1 cannot become a pr task in a tasks run.
+  assert.match(set('l1', 'outcome=pr').stderr, /in a tasks run, a task can wait only for a report task/);
+  assert.equal(set('l1', 'outcome=report').code, 0);
+  assert.equal(readRun(root, id).layers[0].delivery, null);
+  assert.match(set('l1', 'outcome=email').stderr, /outcome must be one of/);
+});
+
+test('E3. [review] the send step of an issue layer: park on a session-only question, answer, unpark, record each item, deliver', () => {
+  for (const kind of ['tasks', 'stack']) {
+    const root = tempRoot();
+    const id = initRun(root, { title: 'Triage', checkout: CHECKOUT, request: 'r', kind, date: '2026-11-06', layers: [{ task: 'Triage', source: 'request', tier: 'S', tierReason: 'r', outcome: 'issue' }, { task: 'Fix', source: 'request', tier: 'S', tierReason: 'r', dependsOn: [1] }] }).id;
+    const set = (...pairs) => cli(root, 'layer', '--run', id, '--layer', 'l1', ...pairs.flatMap((p) => ['--set', p]));
+    const tip = 'a'.repeat(40);
+    writeFileSync(path.join(root, id, 'reports', 'report-triage.md'), 'report');
+    assert.equal(set('phase=implementing').code, 0);
+    assert.equal(set('phase=review', 'round=1', 'report=reports/report-triage.md').code, 0);
+    const q1 = JSON.parse(cli(root, 'park', '--run', id, '--layer', 'l1', '--session-only', '--question', 'File 2 issues in o/r?', '--option', 'send', '--option', 'do not send', '--tip', tip).stdout).id;
+    // The page cannot answer it with no setting, and a parked layer cannot be delivered.
+    assert.equal(cli(root, 'answer', '--run', id, '--id', q1, '--answer', 'send', '--via', 'dashboard').code, 1);
+    assert.match(set('delivery=#1', 'phase=delivered').stderr, /l1 is parked: unpark it before phase=delivered/);
+    assert.equal(readRun(root, id).layers[0].delivery ?? null, null);
+    assert.equal(cli(root, 'answer', '--run', id, '--id', q1, '--answer', 'send').code, 0);
+    assert.equal(cli(root, 'unpark', '--run', id, '--layer', 'l1', '--base', 'main', '--base-tip', tip, '--head', tip).code, 0, kind);
+    // One record after each item, so a resume knows what went out.
+    assert.equal(set('delivery=https://github.com/o/r/issues/1').code, 0);
+    assert.equal(readRun(root, id).layers[0].phase, 'review');
+    assert.equal(set('delivery=https://github.com/o/r/issues/1, https://github.com/o/r/issues/2').code, 0);
+    assert.equal(set('phase=delivered').code, 0);
+    assert.equal(readRun(root, id).next, 'l2');
+    // More changes later: the old record stays until the new one replaces it.
+    assert.equal(set('phase=fixing').code, 0);
+    assert.equal(readRun(root, id).layers[0].delivery, 'https://github.com/o/r/issues/1, https://github.com/o/r/issues/2');
+  }
 });

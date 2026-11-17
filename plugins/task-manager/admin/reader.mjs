@@ -325,6 +325,7 @@ export function readRun(root, id, { at = Date.now() } = {}) {
     // A layer of a run from before the outcome key is a pr layer.
     outcome: layer.outcome ?? 'pr',
     report: layer.report ?? null,
+    delivery: layer.delivery ?? null,
     lastEvent: layerTimes[layer.id] ?? null,
     column: columnOf(layer, open),
     blockedBy: blockedBy(run, layer.id),
