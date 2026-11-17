@@ -258,6 +258,49 @@ export function sessionOf(dir, alive = processAlive) {
   return { watching, started };
 }
 
+const USAGE_KEYS = ['tokens', 'toolUses', 'durationMs', 'cost'];
+
+/** The sum of usage records. `cost` stays null when no record has one. The rule of `sumUsage` in the helper's core module. */
+export function sumUsage(records) {
+  const total = { agents: records.length, tokens: 0, toolUses: 0, durationMs: 0, cost: null };
+  for (const record of records) {
+    for (const key of USAGE_KEYS) {
+      if (typeof record[key] !== 'number') continue;
+      total[key] = (total[key] ?? 0) + record[key];
+    }
+  }
+  return total;
+}
+
+/**
+ * What the agents of a run used, from `usage.jsonl`:
+ *   total        every record;
+ *   layers       one sum for each layer that has a record, with a sum for each role;
+ *   tiers        one sum for each tier, with the number of layers and the mean tokens for a layer;
+ *   runLevel     one sum for each role, from the records with no layer: the restacker and the
+ *                stack verifier work on several layers.
+ */
+export function usageOf(run, records) {
+  const layers = {};
+  for (const layer of run.layers) {
+    const own = records.filter((r) => r.layer === layer.id);
+    if (!own.length) continue;
+    const roles = {};
+    for (const role of new Set(own.map((r) => r.role))) roles[role] = sumUsage(own.filter((r) => r.role === role));
+    layers[layer.id] = { ...sumUsage(own), roles };
+  }
+  const tiers = {};
+  for (const tier of new Set(run.layers.filter((l) => layers[l.id]).map((l) => l.tier))) {
+    const ids = run.layers.filter((l) => l.tier === tier && layers[l.id]).map((l) => l.id);
+    const sum = sumUsage(records.filter((r) => ids.includes(r.layer)));
+    tiers[tier] = { ...sum, layers: ids.length, tokensPerLayer: Math.round(sum.tokens / ids.length) };
+  }
+  const loose = records.filter((r) => !run.layers.some((l) => l.id === r.layer));
+  const runLevel = {};
+  for (const role of new Set(loose.map((r) => String(r.role)))) runLevel[role] = sumUsage(loose.filter((r) => String(r.role) === role));
+  return { total: sumUsage(records), layers, tiers, runLevel };
+}
+
 // ── Runs ─────────────────────────────────────────────────────────────────────────────────────────
 
 /** Read one run with every derived value. `at` (milliseconds) is "now", for tests. */
@@ -288,6 +331,8 @@ export function readRun(root, id, { at = Date.now() } = {}) {
     waitsFor: waitsFor(run, layer.id),
     openFindings: findings[layer.id].filter((f) => f.state === 'open' || f.state === 'not_fixed').length,
   }));
+  // Only records: a line such as `null` is valid JSON, and it must not break the page.
+  const usageRecords = readJsonl(path.join(dir, 'usage.jsonl'), errors).filter((r) => r !== null && typeof r === 'object' && !Array.isArray(r));
   const lastEvent = lastEventTime(run, events);
   // The current phase of a run that no longer works ends at its last event, not now.
   const until = run.state === 'active' ? new Date(at).toISOString() : lastEvent;
@@ -305,6 +350,7 @@ export function readRun(root, id, { at = Date.now() } = {}) {
     phaseTimes: phaseTimes(events, until),
     plans: listPlans(dir),
     session: sessionOf(dir),
+    usage: usageOf(run, usageRecords),
     errors,
   };
 }
@@ -356,12 +402,14 @@ export function listRuns(root, { at = Date.now() } = {}) {
  * does not show.
  */
 export function readBoard(root, { at = Date.now() } = {}) {
-  return scanRuns(root, at, ({ run, layers, questions, openQuestions: open, next, lastEvent, stale, plans, session }) => ({
+  return scanRuns(root, at, ({ run, layers, questions, openQuestions: open, next, lastEvent, stale, plans, session, usage }) => ({
     run: { id: run.id, title: run.title, kind: run.kind, state: run.state, stage: run.stage, checkout: run.checkout, nextStep: run.nextStep },
     layers,
     // The Tasks view links a report only when its file is there, so it needs the file names.
     plans,
     session,
+    // The Tasks view shows the tokens of each task.
+    usage: { total: usage.total, layers: usage.layers },
     // Only the questions that a card shows: the open ones and the question of each parked layer.
     questions: questions.filter((q) => q.answer === null || q.answer === undefined || layers.some((l) => l.parked?.question === q.id)),
     openQuestions: open,

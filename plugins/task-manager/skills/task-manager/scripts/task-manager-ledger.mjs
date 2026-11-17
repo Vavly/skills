@@ -21,6 +21,7 @@ import {
   addFinding,
   addMainPlan,
   addFollowup,
+  addUsage,
   answer,
   ask,
   followupFiled,
@@ -79,6 +80,13 @@ const OPTIONS = {
   via: { type: 'string' },
   timeout: { type: 'string' },
   issue: { type: 'string' },
+  role: { type: 'string' },
+  agent: { type: 'string' },
+  model: { type: 'string' },
+  tokens: { type: 'string' },
+  'tool-uses': { type: 'string' },
+  'duration-ms': { type: 'string' },
+  cost: { type: 'string' },
 };
 
 function need(values, name) {
@@ -161,6 +169,8 @@ const COMMANDS = {
     addFollowup(root, need(v, 'run'), { layer: v.layer, title: need(v, 'title'), body: need(v, 'body'), dataLoss: v['data-loss'] }),
   'followup-filed': (v, root) => followupFiled(root, need(v, 'run'), need(v, 'id'), need(v, 'issue')),
   list: (v, root) => listRuns(root, { checkout: v.checkout, states: v.state ? v.state.split(',') : undefined }),
+  usage: (v, root) =>
+    addUsage(root, need(v, 'run'), { layer: v.layer, role: need(v, 'role'), agent: v.agent, model: v.model, tokens: v.tokens, toolUses: v['tool-uses'], durationMs: v['duration-ms'], cost: v.cost }),
   'notify-test': (v, root) => notifyTest(root),
   'start-session': (v, root) => startSession(root, need(v, 'run')),
   show: (v, root) => (v.layer ? showLayer(root, need(v, 'run'), v.layer) : show(root, need(v, 'run'))),

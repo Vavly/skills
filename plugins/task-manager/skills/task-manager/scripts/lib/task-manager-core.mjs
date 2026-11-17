@@ -428,7 +428,9 @@ export function readRun(root, id) {
     waitsFor: waitsFor(run, layer.id),
     openFindings: findings[layer.id].filter((f) => f.state === 'open' || f.state === 'not_fixed').length,
   }));
-  return { run: { ...run, kind: kindOf(run), mainPlans: run.mainPlans ?? [] }, layers, events, questions, openQuestions: open, followups, findings, next: nextLayer(run), errors };
+  // Only records: a line such as `null` is valid JSON, and it must not break `show`.
+  const usage = readJsonl(path.join(dir, 'usage.jsonl'), errors).filter((r) => r !== null && typeof r === 'object' && !Array.isArray(r));
+  return { run: { ...run, kind: kindOf(run), mainPlans: run.mainPlans ?? [] }, layers, events, questions, openQuestions: open, followups, findings, usage, next: nextLayer(run), errors };
 }
 
 // ── Writes ───────────────────────────────────────────────────────────────────────────────────────
@@ -1057,6 +1059,68 @@ function addFollowupUnlocked(root, runId, { layer, title, body, dataLoss }) {
   return { id };
 }
 
+/**
+ * Who used the tokens. An implementer and a reviewer work on one layer. A restacker and a stack
+ * verifier work on several layers, so their record can have no layer. The harness gives no numbers
+ * for the orchestrator itself, so it has no role here.
+ */
+export const USAGE_ROLES = ['implementer', 'reviewer', 'restacker', 'verifier'];
+const LAYER_ROLES = new Set(['implementer', 'reviewer']);
+
+/**
+ * Record what one agent used, from the numbers that the harness gives when the agent returns:
+ * its tokens, its tool calls and its time. The cost is optional: record it only when a source
+ * gives it. A usage record is a measurement, not run state, so a finished run accepts it and no
+ * event is written.
+ */
+function addUsageUnlocked(root, runId, { layer, role, agent, tokens, toolUses, durationMs, model, cost }) {
+  const { dir, run } = load(root, runId, { finishedOk: true });
+  if (layer) layerOf(run, layer);
+  oneOf('role', role, USAGE_ROLES);
+  if (!layer && LAYER_ROLES.has(role)) fail(`--layer is required for the role ${role}`);
+  // Only plain digits: an empty value, a space or "1e3" is not a number that the harness gave.
+  const count = (name, value) => {
+    if (value === undefined) return null;
+    if (!/^\d+$/.test(value)) fail(`${name} must be a whole number, 0 or more; got ${JSON.stringify(value)}`);
+    return intIn(name, value, 0, Number.MAX_SAFE_INTEGER);
+  };
+  let costValue = null;
+  if (cost !== undefined) {
+    if (!/^\d+(\.\d+)?$/.test(cost)) fail(`cost must be a number of dollars, 0 or more; got ${JSON.stringify(cost)}`);
+    costValue = Number(cost);
+  }
+  const record = {
+    ts: now(),
+    layer: layer ?? null,
+    role: oneOf('role', role, USAGE_ROLES),
+    agent: optionalText('agent', agent) ?? null,
+    model: optionalText('model', model) ?? null,
+    tokens: count('tokens', tokens),
+    toolUses: count('tool-uses', toolUses),
+    durationMs: count('duration-ms', durationMs),
+    cost: costValue,
+  };
+  if (record.tokens === null && record.toolUses === null && record.durationMs === null && record.cost === null) {
+    fail('give at least one of --tokens, --tool-uses, --duration-ms, --cost');
+  }
+  appendLine(path.join(dir, 'usage.jsonl'), record);
+  return { ok: true };
+}
+
+const USAGE_KEYS = ['tokens', 'toolUses', 'durationMs', 'cost'];
+
+/** The sum of usage records: `{ agents, tokens, toolUses, durationMs, cost }`. `cost` is null when no record has one. */
+export function sumUsage(records) {
+  const total = { agents: records.length, tokens: 0, toolUses: 0, durationMs: 0, cost: null };
+  for (const record of records) {
+    for (const key of USAGE_KEYS) {
+      if (typeof record[key] !== 'number') continue;
+      total[key] = (total[key] ?? 0) + record[key];
+    }
+  }
+  return total;
+}
+
 function followupFiledUnlocked(root, runId, followupId, issue) {
   const { dir, run } = load(root, runId, { finishedOk: true });
   const file = path.join(dir, 'followups.jsonl');
@@ -1082,6 +1146,7 @@ export const rule = locked(ruleUnlocked);
 export const resolve = locked(resolveUnlocked);
 export const addFollowup = locked(addFollowupUnlocked);
 export const followupFiled = locked(followupFiledUnlocked);
+export const addUsage = locked(addUsageUnlocked);
 
 /** A short text summary for the orchestrator. Cheaper to read than the files. */
 export function show(root, runId) {
@@ -1121,6 +1186,10 @@ export function show(root, runId) {
           (a ? `; answer: ${a.answer} - ready to unpark` : '; no answer yet'),
       );
     }
+  }
+  if (state.usage.length) {
+    const used = sumUsage(state.usage);
+    lines.push(`usage: ${used.agents} agents, ${used.tokens} tokens, ${used.toolUses} tool uses, ${Math.round(used.durationMs / 60_000)} min of agent time${used.cost === null ? '' : `, $${used.cost.toFixed(2)}`}`);
   }
   lines.push(`next ${tasks ? 'task' : 'layer'} that can move: ${state.next ?? 'none'}`);
   if (state.openQuestions.length) {
