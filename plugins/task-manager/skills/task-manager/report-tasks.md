@@ -11,7 +11,7 @@ approves it. The agent that does the task is the **worker**. The ledger records 
 | Rule of `core.md` | For a report layer |
 |---|---|
 | The profile | Applies: "Project", "Commands", "Skills" (by area), "User data", "Sources of record". With no repository, the profile is "none": skip it. |
-| Hard rule 1 (one writer) | Applies. A worker can run code in the checkout, so it counts as the writer. Do not run a worker while an implementer works. |
+| Hard rule 1 (one writer) | Applies. A worker can run code in the checkout, so it counts as the writer. Do not run a worker while an implementer works. Several workers at the same time: only as "Report layers in parallel" says. |
 | Hard rule 2 (the base) | Does not apply: a report layer has no branch. It is never a base. |
 | Hard rule 3 (no PR before APPROVE) | Becomes: **no delivery before APPROVE**. The exceptions are the same: the round limit, and findings that you all closed with `L rule`. |
 | Hard rules 4, 6, 7, 9 | Apply. |
@@ -66,6 +66,8 @@ with the `model` and `effort` of the layer's tier. Its prompt contains:
   launch it, at a stop point and with a clean tree, run `git switch <that branch>` yourself.
   `git rev-parse HEAD` must be the recorded head: if not, stop and ask the user. Record that
   branch as `base` and that head as `baseTip`.
+
+If `L` refuses the record below, another layer is in work: stop the new worker at once.
 
 Record the start: `L layer --layer <layer> --set phase=implementing --set implementer=<agent id>
 --set base=<current branch> --set baseTip=<HEAD SHA> --set plan=plans/plan-<slug>.md --set
@@ -131,6 +133,50 @@ final report, a report layer shows the path of its report in place of a PR. A ta
 every task is `delivered` has nothing that waits for a merge. After the final report, set it to
 `paused` while the follow-up question is open. When that question has its answer and its action, or when you asked no
 follow-up question, run `L run --set stage=finish --set state=finished --set nextStep=null`.
+
+## Report layers in parallel
+
+Report layers change nothing in the checkout, so a group of them can work at the same time. This
+is off unless the profile gives a number above 1 in "Parallel report tasks". A derived profile
+has 1. With a number above 1:
+
+- **Record the limit** after `L init`: `L run --set parallel=<n>` (at most 4). `L` enforces it.
+  Use the number of the profile, and do not change it during the run.
+- **Which layers.** Run `L next`. Its `ready` list gives every layer that can start, and
+  `working` the layers in work. A group has only layers of `ready` with `alone: false`: report,
+  issue and comment layers that depend on no `pr` layer. A layer with `alone: true` is a `pr`
+  layer, or a report layer of a stack run that reads the code of a `pr` layer: it works alone.
+- **Keep the work order.** Start the layers of `ready` from the first one. Stop at the first
+  layer with `alone: true`, and never start a layer that comes after it in `ready`. That layer
+  starts when `working` is empty, and the group continues after it.
+- **Never with a `pr` layer.** Start no report layer while an implementer works or a restack
+  runs. Start a `pr` layer only when `working` is empty. `L` refuses these starts. It cannot see
+  an implementer that rebases a parked layer, so the rule is yours too.
+- **A step that needs the checkout waits for the group.** The resume of a parked `pr` layer, more
+  changes on a PR, a CI fix, a restack and the cleanup after a merge all change the checkout.
+  For such a step, start no new report layer, wait until `working` is empty, and then do the
+  step. Do not do step 3 of "Park a layer" in `core.md` (the switch to another base) while a
+  group works.
+- **A step of one report layer needs only that layer.** Its unpark, and its send step, need only
+  its own worker and reviewer to be stopped. Do not make the user's answer wait for the group.
+- **Check the tree one time for the group** (rule 1): clean, and record the branch and `HEAD`,
+  before the first worker of the group starts.
+- **Tell each worker and each reviewer that other agents use the same checkout.** Then the agent
+  writes nothing into the checkout, also no cache and no build output: it runs every command
+  that writes (a build, a test run, an experiment) in its own copy outside the checkout. Give
+  each agent its own folder for that copy, outside the checkout: a new folder in your session
+  scratchpad. The scratch folder of the profile is inside the checkout, so it is not the place.
+  A reviewer of a group does not report a tree that is not clean as a finding: it tells you.
+- **Each layer has its own loop** (R-A to R-F), its own worker and its own reviewer. A reviewer
+  can work while the workers of other layers work: it only reads. Run the `L` commands one at a
+  time, as always.
+- **A layer that parks, or that waits for the yes of its send step, leaves the group.** Another
+  ready report layer can start in its place.
+- **At each delivery, check the tree.** If it is not clean, or `HEAD` moved, you cannot know
+  which worker did it. Start no new layer. Let the workers in work reach their next report, ask
+  each one what it wrote into the checkout, and ask the user. Never clean the tree yourself.
+- **A resume.** `working` of `L next` gives the layers of the group. Continue each one as
+  "Resume" in `core.md` says, with a new worker or a new reviewer for each.
 
 ## Issue tasks and comment tasks
 
@@ -244,7 +290,8 @@ head of that branch to `L unpark`. Continue at the recorded phase and round, wit
 
 The user can ask for more after the delivery: `/task-manager changes <run-id> <task> <what>`.
 
-1. Run `L show --run <id>`. If the run is `finished`, run `L run --set state=paused` first. Then
+1. Run `L show --run <id>`. If an agent of this session works, wait for a stop point. If the run
+   is `finished`, run `L run --set state=paused` first. Then
    run `L run --set state=active`. If `L` refuses because another run is active for this
    checkout, tell the user, and stop.
 2. Record the request: `L event --layer <layer> --type note --summary "changes #<k>: <what>"`.

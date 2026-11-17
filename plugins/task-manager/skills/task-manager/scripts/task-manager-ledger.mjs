@@ -156,7 +156,10 @@ const COMMANDS = {
       lastReviewed: v['last-reviewed'],
     }),
   'main-plan': (v, root) => addMainPlan(root, need(v, 'run'), need(v, 'file')),
-  next: (v, root) => ({ next: readRun(root, need(v, 'run')).next }),
+  next: (v, root) => {
+    const state = readRun(root, need(v, 'run'));
+    return { next: state.next, ready: state.ready, working: state.working, parallel: state.run.parallel ?? 1 };
+  },
   finding: (v, root) =>
     addFinding(root, need(v, 'run'), need(v, 'layer'), {
       round: need(v, 'round'),

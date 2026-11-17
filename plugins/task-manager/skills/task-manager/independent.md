@@ -3,7 +3,8 @@
 `SKILL.md` sends you to this file for a **tasks run**: 1 to n tasks that do not use each other's
 code. Each task is one layer in the ledger. A `pr` task has its own branch and its own PR on
 `origin/<default>`. A `report` task ends as a report file ([report-tasks.md](report-tasks.md)).
-The tasks run one at a time, in the user's order, because the checkout has one writer.
+The tasks run one at a time, in the user's order, because the checkout has one writer. Report tasks can
+work in a group when the profile permits it ("Report layers in parallel" in `report-tasks.md`).
 
 You read `core.md` before this file. This file adds only what a tasks run needs, and it wins
 where it disagrees with `core.md`. When this file names a step or a section that it does not
@@ -56,9 +57,11 @@ contain (for example step H, hard rule 6 or "Implementer tiers"), that step or s
    --request-file <request.txt> --layers-file <layers.json>`. It prints the run id. Then run
    `L run --run <id> --set stage=layers --set nextStep="Phase 1 step A for l1"`. Then record the
    decisions of step 5, write a profile that you made to `<run folder>/profile.md`, and copy the
-   plan documents ("Copy the plan documents" in `core.md`).
+   plan documents ("Copy the plan documents" in `core.md`). If the profile permits report tasks
+   in parallel, record the limit ("Report layers in parallel" in `report-tasks.md`).
 7. Tell the user the run id, the order and the tier of each task, the result of the shared-code
-   check, the decisions you recorded, and that the tasks run one at a time. Say that
+   check, the decisions you recorded, and that the tasks run one at a time, or which report tasks
+   can work in a group. Say that
    `/task-manager resume <run-id>` continues the run in a new session.
 
 ## Phase 1 — The loop for each task

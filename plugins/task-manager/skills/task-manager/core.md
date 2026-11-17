@@ -69,7 +69,13 @@ these files.
 1. **One checkout, one writer.** No agent creates or enters a git worktree. Only one agent may change the
    tree at a time. Work on one layer at a time, in stack order. The order changes only when a
    layer is parked (see "Questions and parked layers"). Start a reviewer only while its
-   implementer is stopped. Never run two implementers at the same time.
+   implementer is stopped. Never run two implementers at the same time. `L` refuses the start
+   of a layer, and the resume of a parked layer, while another layer is in work or a restack
+   runs. If the layer in work has no agent (its agent ended with no result), launch a new agent
+   for it ("Resume", step 5). If its work must wait, set it back with
+   `L layer --layer <layer> --set phase=queued`. Do not change the limit to get past a refusal.
+   One exception: report layers change nothing in the checkout, so a group of them can work at
+   the same time when the profile permits it ("Report layers in parallel" in `report-tasks.md`).
 2. **The base comes from the kind file.** Your kind file sets the base of each `pr` layer. A stack
    run: the branch of the highest layer below it that has an open PR, else `origin/<default>`
    ("Stack from the start" in `stack.md`). A tasks run: always `origin/<default>`. A
@@ -413,7 +419,7 @@ steps below leave it out. In each command, `--layer` takes the layer id.
 | A plan document that the user gave as a source (the intake of your kind file) | `L main-plan --file <path>`. It copies the file to `plans/main-<slug>.md` and prints the path. The same text is copied one time only. |
 | An out-of-scope item, and its issue when filed | `L followup [--layer] --title --body [--data-loss]`, `L followup-filed --id --issue` |
 | Anything else worth a line in the history | `L event --type <type> --summary` |
-| Read the state | `L show` (the run), `L show --layer <layer>` (one layer's findings, rulings, review rounds and questions), `L next`, `L list [--checkout] [--state]` |
+| Read the state | `L show` (the run), `L show --layer <layer>` (one layer's findings, rulings, review rounds and questions), `L next` (it prints `next`, and also `ready`: every layer that can start, with `alone: true` for a layer that is never in a group, `working`: the layers in work, and `parallel`: the limit of the run), `L list [--checkout] [--state]` |
 
 Layer keys for `--set`: `phase` (`queued`, `implementing`, `review`, `fixing`, `final_checks`,
 `opening_pr`, `pr_open`, `merged`; a report layer: `queued`, `implementing`, `review`, `fixing`,
@@ -534,6 +540,9 @@ When the user stops a run, or the session ends before the run finishes, run
 - Stack run only: what the lower layers changed, if this task touches the same code.
 - The absolute paths of the reports of the report layers that this layer depends on. The
   implementer reads them before it writes the plan.
+
+If `L` refuses the record below, another layer is in work: stop the new agent at once, and wait
+for a stop point.
 
 Record the start: `L layer --layer <layer> --set phase=implementing --set implementer=<agent id>
 --set base=<base branch> --set baseTip=<SHA> --set branch=<suggested branch> --set

@@ -68,9 +68,10 @@ and two or more PRs are open:
    run folder is your memory after a context summary, and the only state that a new session can
    see. Then record the decisions of step 5, write a profile that you made to
    `<run folder>/profile.md`, and copy the plan documents ("Copy the plan documents" in
-   `core.md`).
+   `core.md`). If the profile permits report tasks in parallel, record the limit ("Report layers
+   in parallel" in `report-tasks.md`).
 7. Tell the user the run id, the stack order, the tier of each layer, the decisions you recorded,
-   and that the layers run one at a time. Say that `/task-manager resume <run-id>` continues the
+   and that the layers run one at a time, or which report layers can work in a group. Say that `/task-manager resume <run-id>` continues the
    run in a new session.
 
 ## Phase 2 — Finish
