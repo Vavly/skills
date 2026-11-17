@@ -4,7 +4,7 @@
  */
 import { strict as assert } from 'node:assert';
 import { spawn } from 'node:child_process';
-import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
@@ -978,4 +978,56 @@ test('E1. the reader gives the outcome and the delivery of an issue layer and a 
   assert.deepEqual(state.layers.map((l) => [l.outcome, l.delivery, l.column]), [['issue', '#101', 'done'], ['comment', null, 'todo']]);
   assert.deepEqual(state.plans, ['report-triage.md']);
   assert.deepEqual(readBoard(ownRoot).runs[0].layers.map((l) => l.delivery), ['#101', null]);
+});
+
+// ── Archive ──────────────────────────────────────────────────────────────────────────────────────
+
+test('H1. the page archives a finished project through the real helper and brings it back; the lists carry the mark', async () => {
+  const core = await import('../../skills/task-manager/scripts/lib/task-manager-core.mjs');
+  const own = mkdtempSync(path.join(tmpdir(), 'task-manager-admin-archive-'));
+  const ownRoot = path.join(own, 'runs');
+  const checkout = path.join(own, 'clone');
+  mkdirSync(checkout);
+  const { id } = core.initRun(ownRoot, { title: 'Old work', checkout, request: 'r', layers: [{ task: 'a', source: 's', tier: 'S', tierReason: 'r' }] });
+  const s = await startAdminServer({ root: ownRoot, port: 0 });
+  const origin = `http://127.0.0.1:${s.address().port}`;
+  const ok = { origin, 'x-task-manager-admin': 'archive' };
+  const url = `/api/runs/${id}/archive`;
+  const marks = async () => [json(await request(s, '/api/runs')).runs[0].archived, json(await request(s, '/api/board')).runs[0].run.archived, json(await request(s, `/api/runs/${id}`)).run.archived ?? false];
+  try {
+    assert.deepEqual(await marks(), [false, false, false]);
+    // A run that is not finished, a bad body, a wrong header and a GET are refused.
+    assert.equal((await post(s, url, { archived: true }, ok)).status, 409);
+    core.setRun(ownRoot, id, [['state', 'finished']]);
+    assert.equal((await post(s, url, { archived: 'yes' }, ok)).status, 400);
+    assert.equal((await post(s, url, {}, ok)).status, 400);
+    assert.equal((await post(s, url, { archived: true }, { origin, 'x-task-manager-admin': 'finish' })).status, 403);
+    assert.equal((await post(s, url, { archived: true }, { origin: 'http://evil.example', 'x-task-manager-admin': 'archive' })).status, 403);
+    assert.equal((await request(s, url)).status, 405);
+    assert.equal((await post(s, '/api/runs/2026-01-01-no-run/archive', { archived: true }, ok)).status, 404);
+    assert.deepEqual(await marks(), [false, false, false]);
+
+    const res = await post(s, url, { archived: true }, ok);
+    assert.equal(res.status, 200, res.body);
+    assert.deepEqual(json(res), { id, archived: true });
+    assert.deepEqual(await marks(), [true, true, true]);
+    assert.deepEqual(json(await post(s, url, { archived: false }, ok)), { id, archived: false });
+    assert.deepEqual(await marks(), [false, false, false]);
+
+    // An old project whose clone is gone can still be archived: that is what the archive is for.
+    rmSync(checkout, { recursive: true });
+    const gone = await post(s, url, { archived: true }, ok);
+    assert.equal(gone.status, 200, gone.body);
+    assert.deepEqual(await marks(), [true, true, true]);
+
+    // A tasks run with an open question: the question must not go out of view.
+    const tasks = core.initRun(ownRoot, { title: 'Tasks', checkout: own, request: 'r', kind: 'tasks', layers: [{ task: 'a', source: 's', tier: 'S', tierReason: 'r' }] }).id;
+    core.ask(ownRoot, tasks, { question: 'A or B?' });
+    core.setRun(ownRoot, tasks, [['state', 'finished']]);
+    const blocked = await post(s, `/api/runs/${tasks}/archive`, { archived: true }, ok);
+    assert.equal(blocked.status, 409);
+    assert.match(json(blocked).error, /has an open question/);
+  } finally {
+    s.close();
+  }
 });

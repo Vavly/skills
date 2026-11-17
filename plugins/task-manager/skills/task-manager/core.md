@@ -381,7 +381,10 @@ mixing their writes, but a command that waits more than 10 seconds for it stops 
   because no run exists for it yet. These are: the intake decisions (record them after `L init`
   with `L decision`), a dirty tree at intake, "resume it, or start a new run", and which run to
   resume.
-- **A finished run is closed.** `L` refuses its writes, except a reopen
+- **An archived run.** The user can archive a finished run on the admin page. The page then
+  hides it. The mark changes nothing for you: `L list` and `L show` still give the run, and a
+  reopen removes the mark. Do not set it yourself.
+- **A finished run is closed.** `L` refuses its writes, except the archive mark, a reopen
   (`L run --set state=paused`), a merge record of a layer whose PR is open
   (`L layer --set phase=merged` and `L event --type merge`), a filed follow-up
   (`L followup-filed`), and an answer to a question that was still open (`L answer`).

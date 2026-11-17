@@ -2145,3 +2145,46 @@ test('W3. [review] the resume of a parked layer, a restack and a report that rea
   cli(stackRoot, 'run', '--run', stack, '--set', 'state=paused');
   assert.equal(JSON.parse(cli(stackRoot, 'next', '--run', stack).stdout).parallel, 4);
 });
+
+// ── Archive ──────────────────────────────────────────────────────────────────────────────────────
+
+test('H1. only a finished run can be archived; the mark is the one write that a finished run takes, and a reopen removes it', () => {
+  const root = tempRoot();
+  const id = newRun(root);
+  const run = (...pairs) => cli(root, 'run', '--run', id, ...pairs.flatMap((p) => ['--set', p]));
+  assert.match(run('archived=true').stderr, /only a finished run can be archived; run .* is active/);
+  // The mark is for a finished run only, also the value false: an active run gets no such key.
+  assert.match(run('archived=false').stderr, /only a finished run can be archived/);
+  assert.equal('archived' in readRun(root, id).run, false);
+  // A finish and an archive in one command is permitted: the run is finished when the mark is checked.
+  assert.equal(run('state=finished', 'archived=true').code, 0);
+  assert.equal(readRun(root, id).run.archived, true);
+  assert.match(cli(root, 'show', '--run', id).stdout, /\[stack, finished, archived, stage/);
+  assert.equal(listRuns(root).runs[0].archived, true);
+  // The closed run still refuses every other write, also together with the mark.
+  assert.match(run('archived=false', 'nextStep=x').stderr, /is finished; reopen it first/);
+  assert.match(run('nextStep=x').stderr, /is finished; reopen it first/);
+  assert.match(run('archived=maybe').stderr, /archived must be one of/);
+  assert.equal(readRun(root, id).run.archived, true);
+  assert.equal(run('archived=false').code, 0);
+  assert.equal(readRun(root, id).run.archived, false);
+  // An open question must not go out of view with its run.
+  const q1 = JSON.parse(cli(root, 'run', '--run', id, '--set', 'state=paused').code === 0 ? cli(root, 'ask', '--run', id, '--question', 'A or B?').stdout : '{}').id;
+  assert.equal(run('state=finished').code, 0);
+  assert.match(run('archived=true').stderr, new RegExp(`has an open question \\(${q1}\\): answer it before you archive`));
+  assert.equal(readRun(root, id).run.archived, false);
+  assert.equal(cli(root, 'answer', '--run', id, '--id', q1, '--answer', 'A').code, 0);
+  // The writes that a finished run still takes do not remove the mark.
+  assert.equal(run('archived=true').code, 0);
+  assert.equal(cli(root, 'usage', '--run', id, '--layer', 'l1', '--role', 'reviewer', '--tokens', '5').code, 0);
+  assert.equal(readRun(root, id).run.archived, true);
+  // A reopen brings an archived run back into view, and the event says so.
+  assert.equal(run('state=paused').code, 0);
+  assert.match(readRun(root, id).events.at(-1).summary, /state=paused, archived=false/);
+  assert.deepEqual([readRun(root, id).run.state, readRun(root, id).run.archived], ['paused', false]);
+  assert.match(run('archived=true').stderr, /only a finished run can be archived; run .* is paused/);
+  // An archived run does not block a new run, and `list` still gives it.
+  assert.equal(run('state=finished', 'archived=true').code, 0);
+  const next = newRun(root, 1, {}, { title: 'Next' });
+  assert.deepEqual(listRuns(root).runs.map((r) => [r.id, r.archived]).sort(), [[id, true], [next, false]].sort());
+});

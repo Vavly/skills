@@ -21,8 +21,8 @@ repository.
    (`/task-manager admin stop [--port <n>]`), and do not start a server then. Tell the user the
    one line that the command prints.
 
-The page never writes a run file. Its four write actions run the ledger script of this plugin in
-the project's checkout: "Mark as finished", an answer to a question, "Start a session" (only with
+The page never writes a run file. Its five write actions run the ledger script of this plugin in
+the project's checkout: "Mark as finished", "Archive" and "Bring back" for a finished project, an answer to a question, "Start a session" (only with
 the user's setting `resume.enabled` in `config.json` of the runs folder; do not set it yourself),
 and the record of a merged PR. The page cannot answer a session-only question, for example the merge yes, unless the user's setting `answers.confirmOnPage` permits a typed confirmation (do not set it yourself). The server binds to
 127.0.0.1 only.

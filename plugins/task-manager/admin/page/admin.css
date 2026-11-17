@@ -948,3 +948,9 @@ tr.row-merged td {
 .badge.session {
   border-color: currentColor;
 }
+
+.run-search {
+  min-width: 16rem;
+  padding: 0.3rem 0.5rem;
+  font: inherit;
+}

@@ -617,6 +617,7 @@ export function listRuns(root, { checkout, states } = {}) {
         done: layers.filter((l) => l.column === 'done').length,
         openQuestions: open.length,
         updated: run.updated,
+        archived: run.archived === true,
       });
     } catch (error) {
       // One bad folder must never stop `list`, or `init` for every checkout.
@@ -941,6 +942,8 @@ const RUN_SETTERS = {
   stage: (v) => oneOf('stage', v, STAGES),
   // `null` clears it when nothing is left to do.
   nextStep: (v) => (v === 'null' ? null : text('nextStep', v)),
+  // An archived run is a finished run that the admin page hides. It is a mark for the user only.
+  archived: (v) => oneOf('archived', v, ['true', 'false']) === 'true',
   // How many report layers can work at the same time. 1 is one at a time.
   parallel: (v) => intIn('parallel', v, 1, MAX_PARALLEL),
   // The number of the native GitHub stack that links the run's PRs (the Stacks REST API).
@@ -975,8 +978,23 @@ function setRunUnlocked(root, runId, pairs, summary) {
     }
     changes.push(`${key}=${raw}`);
   }
-  if (before === 'finished' && run.state === 'finished') {
+  // A finished run is closed. The archive mark is the one field that it still takes.
+  const onlyArchive = pairs.every(([key]) => key === 'archived');
+  if (before === 'finished' && run.state === 'finished' && !onlyArchive) {
     fail(`run ${run.id} is finished; reopen it first with: run --run ${run.id} --set state=paused`);
+  }
+  const setsArchive = pairs.some(([key]) => key === 'archived');
+  // The mark is for a finished run only, also the value `false`.
+  if (setsArchive && run.state !== 'finished') fail(`only a finished run can be archived; run ${run.id} is ${run.state}`);
+  if (setsArchive && run.archived) {
+    // An archived run is out of view, so nothing of it must wait for the user.
+    const open = openQuestions(foldLatest(readJsonl(path.join(dir, 'questions.jsonl'))));
+    if (open.length) fail(`run ${run.id} has an open question (${open.map((q) => q.id).join(', ')}): answer it before you archive the run`);
+  }
+  if (run.archived && run.state !== 'finished') {
+    // A reopen brings the run back into view.
+    run.archived = false;
+    changes.push('archived=false');
   }
   saveRun(dir, run);
   addEvent(dir, {
@@ -1386,7 +1404,7 @@ export function show(root, runId) {
   const answered = new Map(state.questions.filter((q) => q.answer !== null && q.answer !== undefined).map((q) => [q.id, q]));
   const lines = [];
   const tasks = run.kind === 'tasks';
-  lines.push(`run ${run.id} [${run.kind}, ${run.state}, stage ${run.stage}] ${run.title}`);
+  lines.push(`run ${run.id} [${run.kind}, ${run.state}${run.archived ? ', archived' : ''}, stage ${run.stage}] ${run.title}`);
   lines.push(`checkout ${run.checkout}`);
   lines.push(`request: ${run.request}`);
   for (const d of run.decisions) lines.push(`decision: ${d.question} -> ${d.answer}`);
@@ -1693,13 +1711,9 @@ export async function waitForAnswer(root, runId, { timeoutMs = 0, pollMs = 2000,
   const fromPage = (q) => q.via === 'dashboard';
   // Tell the admin page that a session will get the answer, while this wait runs.
   const marker = path.join(watchersDir(dir), String(process.pid));
-  try {
-    mkdirSync(watchersDir(dir), { recursive: true });
-    writeFileSync(marker, JSON.stringify({ lstart: processStart(process.pid) ?? null }));
-  } catch {
-    // The marker is a hint for the page. The wait works without it.
-  }
   // A closed session ends its background commands with a signal, and `finally` does not run then.
+  // The handlers come before the marker: a signal that arrives with no handler ends the process at
+  // once, and a marker that is written just before it would stay.
   const onSignal = (signal) => {
     rmSync(marker, { force: true });
     process.exit(128 + (signal === 'SIGINT' ? 2 : signal === 'SIGHUP' ? 1 : 15));
@@ -1707,10 +1721,17 @@ export async function waitForAnswer(root, runId, { timeoutMs = 0, pollMs = 2000,
   const signals = handleSignals ? ['SIGTERM', 'SIGINT', 'SIGHUP'] : [];
   for (const signal of signals) process.once(signal, onSignal);
   try {
+    mkdirSync(watchersDir(dir), { recursive: true });
+    writeFileSync(marker, JSON.stringify({ lstart: processStart(process.pid) ?? null }));
+  } catch {
+    // The marker is a hint for the page. The wait works without it.
+  }
+  try {
     return await poll();
   } finally {
-    for (const signal of signals) process.off(signal, onSignal);
+    // The marker goes first: without a handler, a signal ends the process at once.
     rmSync(marker, { force: true });
+    for (const signal of signals) process.off(signal, onSignal);
   }
 
   async function poll() {

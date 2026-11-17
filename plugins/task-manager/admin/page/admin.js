@@ -255,10 +255,20 @@ function captureState() {
   for (const el of view.querySelectorAll('[data-keep]')) {
     kept.set(el.dataset.keep, { open: el.open, top: el.scrollTop, left: el.scrollLeft });
   }
-  return { kept, x: window.scrollX, y: window.scrollY };
+  // A text box with an id keeps its focus and its caret: the list redraws while the user types.
+  const active = document.activeElement;
+  const focus = active && active.id && view.contains(active) ? { id: active.id, start: active.selectionStart ?? null, end: active.selectionEnd ?? null } : null;
+  return { kept, x: window.scrollX, y: window.scrollY, focus };
 }
 
-function restoreState({ kept, x, y }) {
+function restoreState({ kept, x, y, focus }) {
+  if (focus) {
+    const el = document.getElementById(focus.id);
+    if (el && view.contains(el)) {
+      el.focus();
+      if (focus.start !== null && el.setSelectionRange) el.setSelectionRange(focus.start, focus.end ?? focus.start);
+    }
+  }
   for (const el of view.querySelectorAll('[data-keep]')) {
     const saved = kept.get(el.dataset.keep);
     if (!saved) continue;
@@ -347,12 +357,81 @@ setInterval(tick, 15_000);
 
 // ── Runs view ────────────────────────────────────────────────────────────────────────────────────
 
+/** The filters of the Projects view, kept in this browser: a search text, a clone or null for all, and the archive switch. */
+const RUN_FILTER_KEY = 'task-manager-admin:run-filters';
+
+function loadRunFilters() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(RUN_FILTER_KEY) ?? 'null');
+    if (saved && typeof saved === 'object') return { text: typeof saved.text === 'string' ? saved.text : '', clone: typeof saved.clone === 'string' ? saved.clone : null, archived: saved.archived === true };
+  } catch {
+    // No storage in this browser: the filters last until the page closes.
+  }
+  return { text: '', clone: null, archived: false };
+}
+
+let runFilters = loadRunFilters();
+
+function setRunFilters(change) {
+  runFilters = { ...runFilters, ...change };
+  try {
+    localStorage.setItem(RUN_FILTER_KEY, JSON.stringify(runFilters));
+  } catch {
+    // See loadRunFilters.
+  }
+  redraw();
+}
+
+/**
+ * The handlers of a search box. Each change redraws the view, and a redraw makes a new input. A
+ * dead key or an input method composes a character in the input over several events, so a redraw
+ * in between cuts it: the change waits for the end of the composition.
+ */
+function searchHandlers(change) {
+  return {
+    oninput: (event) => {
+      if (!event.isComposing) change(event.target.value);
+    },
+    oncompositionend: (event) => change(event.target.value),
+  };
+}
+
+/** True when every word of the search is in the title, the id or the clone of the run. */
+function matchesSearch(text, ...fields) {
+  const hay = fields.join(' ').toLowerCase();
+  return text.toLowerCase().split(/\s+/).filter(Boolean).every((word) => hay.includes(word));
+}
+
+/** The search box, the clone chips and the archive switch, for a list of runs with `checkout` and `archived`. */
+function runToolbar(items, filtersNow, setter, checkoutOf, archivedOf) {
+  const clones = [...new Set(items.map((r) => clone(checkoutOf(r))))].sort();
+  const archivedCount = items.filter(archivedOf).length;
+  return h(
+    'div',
+    { class: 'filters' },
+    h(
+      'div',
+      { class: 'filter-row' },
+      h('input', { type: 'search', id: 'run-search', class: 'run-search', placeholder: 'Search by title, id or clone', value: filtersNow.text, 'aria-label': 'Search', ...searchHandlers((text) => setter({ text })) }),
+      clones.length > 1 ? [h('span', { class: 'filter-label' }, 'Clone'), chip('All', !filtersNow.clone || !clones.includes(filtersNow.clone), () => setter({ clone: null })), clones.map((c) => chip(c, filtersNow.clone === c, () => setter({ clone: c })))] : null,
+      archivedCount || filtersNow.archived
+        ? h('label', { class: 'switch' }, h('input', { type: 'checkbox', checked: filtersNow.archived, onchange: (event) => setter({ archived: event.target.checked }) }), ` Show archived (${archivedCount})`)
+        : null,
+    ),
+  );
+}
+
 function renderRuns({ runs: all, broken }) {
   // Tasks runs have their own view ("Tasks").
-  const runs = all.filter((r) => r.kind !== 'tasks');
+  const everyRun = all.filter((r) => r.kind !== 'tasks');
+  const clones = new Set(everyRun.map((r) => clone(r.checkout)));
+  const cloneFilter = clones.has(runFilters.clone) ? runFilters.clone : null;
+  const runs = everyRun.filter((r) => (runFilters.archived || !r.archived) && (!cloneFilter || clone(r.checkout) === cloneFilter) && matchesSearch(runFilters.text, r.title, r.id, r.checkout));
+  const hidden = everyRun.length - runs.length;
   const rank = (r) => (r.openQuestions > 0 ? 0 : r.stale ? 1 : r.state === 'active' ? 2 : r.state === 'paused' ? 3 : 4);
   const ordered = [...runs].sort((a, b) => rank(a) - rank(b) || String(b.lastEvent).localeCompare(String(a.lastEvent)));
-  const waiting = ordered.filter((r) => r.openQuestions > 0);
+  // A question waits for the user also when a filter hides its run.
+  const waiting = [...everyRun].filter((r) => r.openQuestions > 0);
   const current = ordered.filter((r) => r.state !== 'finished');
   const finished = ordered.filter((r) => r.state === 'finished');
 
@@ -376,7 +455,9 @@ function renderRuns({ runs: all, broken }) {
       )
       : null,
     h('h2', null, 'Projects'),
-    current.length ? runTable(current) : h('p', { class: 'muted' }, runs.length ? 'No active or paused projects.' : 'No projects in this root yet.'),
+    everyRun.length ? runToolbar(everyRun, runFilters, setRunFilters, (r) => r.checkout, (r) => r.archived) : null,
+    hidden ? h('p', { class: 'muted small' }, `${hidden} project${hidden === 1 ? ' is' : 's are'} hidden by the search, the clone filter or the archive.`) : null,
+    current.length ? runTable(current) : h('p', { class: 'muted' }, everyRun.length ? 'No active or paused projects here.' : 'No projects in this root yet.'),
     finished.length ? h('details', { class: 'finished', 'data-keep': 'finished-runs' }, h('summary', null, `Finished projects (${finished.length})`), runTable(finished)) : null,
     broken.length
       ? h(
@@ -401,7 +482,7 @@ function runTable(runs) {
         h(
           'tr',
           { class: r.openQuestions ? 'row-waiting' : r.stale ? 'row-stale' : null },
-          h('td', null, h('a', { href: `#/run/${enc(r.id)}` }, r.title), h('div', { class: 'muted small' }, r.id)),
+          h('td', null, h('a', { href: `#/run/${enc(r.id)}` }, r.title), r.archived ? [' ', badge('archived')] : null, h('div', { class: 'muted small' }, r.id)),
           h('td', null, badge(r.state, `state-${r.state}`), ' ', h('span', { class: 'muted small' }, r.stage), r.stale ? [' ', badge('stale', 'stale')] : null),
           h('td', null, h('code', null, clone(r.checkout))),
           h('td', null, `${r.done} / ${r.layers}`),
@@ -457,11 +538,13 @@ function runHeader(state, tab) {
       h('h1', null, run.title),
       sessionControl(state),
       run.state !== 'finished' ? h('button', { type: 'button', class: 'btn', onclick: () => confirmFinish(state) }, 'Mark as finished') : null,
+      archiveControl(state),
     ),
     h(
       'div',
       { class: 'meta' },
       badge(run.state, `state-${run.state}`),
+      run.archived ? badge('archived') : null,
       badge(`stage: ${run.stage}`),
       state.stale ? sinceEl('span', { class: 'badge stale' }, state.lastEvent, 'stale: no event for ') : null,
       h('span', null, 'clone ', h('code', { title: run.checkout }, clone(run.checkout))),
@@ -533,6 +616,32 @@ function openConfirm({ title, content, confirmLabel, url, action, getBody = null
 
   document.body.append(dialog);
   dialog.showModal();
+}
+
+/** Archive a finished project, or bring it back. It only hides the project on this page: nothing is deleted. */
+function archiveControl(state) {
+  const { run } = state;
+  if (run.state !== 'finished') return null;
+  const next = !run.archived;
+  const tasks = run.kind === 'tasks';
+  return h(
+    'button',
+    {
+      type: 'button',
+      class: 'btn',
+      onclick: () =>
+        openConfirm({
+          title: next ? (tasks ? 'Archive this run, with all its tasks?' : 'Archive this project?') : tasks ? 'Bring this run back?' : 'Bring this project back?',
+          confirmLabel: next ? 'Archive' : 'Bring back',
+          confirmClass: 'btn',
+          url: `/api/runs/${enc(run.id)}/archive`,
+          action: 'archive',
+          getBody: () => ({ archived: next }),
+          content: h('p', null, next ? `The page hides an archived ${tasks ? 'run, with every task of it' : 'project'}. Its run folder stays as it is, and "Show archived" brings it back into the list.` : 'It shows in the lists again.'),
+        }),
+    },
+    next ? (tasks ? 'Archive run' : 'Archive') : 'Bring back',
+  );
 }
 
 /** Ask before marking a project as finished. */
@@ -827,12 +936,15 @@ function toggleColumn(key) {
 function renderGeneralBoard({ runs, broken }) {
   const rank = { active: 0, paused: 1, finished: 2 };
   const ordered = [...runs].sort((a, b) => (rank[a.run.state] ?? 3) - (rank[b.run.state] ?? 3) || String(b.lastEvent).localeCompare(String(a.lastEvent)));
-  const visible = ordered.filter((e) => filters.finished || e.run.state !== 'finished');
+  // An archived run is out of the board: the Projects view and the Tasks view bring it back.
+  const visible = ordered.filter((e) => !e.run.archived && (filters.finished || e.run.state !== 'finished'));
   const visibleIds = visible.map((e) => e.run.id);
   const picked = filters.runs ? filters.runs.filter((id) => visibleIds.includes(id)) : [];
   const selected = picked.length ? visible.filter((e) => picked.includes(e.run.id)) : visible;
   const all = picked.length === 0;
-  const finishedCount = runs.length - runs.filter((e) => e.run.state !== 'finished').length;
+  const shownOnBoard = runs.filter((e) => !e.run.archived);
+  const finishedCount = shownOnBoard.filter((e) => e.run.state === 'finished').length;
+  const archivedOnBoard = runs.length - shownOnBoard.length;
   const columnCount = (key) => selected.reduce((n, e) => n + e.layers.filter((l) => l.column === key).length + (key === 'needs_input' ? e.openQuestions.filter((q) => !q.layer).length : 0), 0);
 
   const toolbar = h(
@@ -882,7 +994,7 @@ function renderGeneralBoard({ runs, broken }) {
       )
       : null,
     !visible.length
-      ? h('p', { class: 'muted' }, runs.length ? 'No active or paused projects. Turn on "Show finished projects" to see the others.' : 'No projects in this root yet.')
+      ? h('p', { class: 'muted' }, runs.length ? (finishedCount && !filters.finished ? 'No active or paused projects. Turn on "Show finished projects" to see the others.' : `Nothing to show here.${archivedOnBoard ? ` ${archivedOnBoard} archived project${archivedOnBoard === 1 ? ' is' : 's are'} in the Projects view and the Tasks view, under "Show archived".` : ''}`) : 'No projects in this root yet.')
       : boardColumns(selected, filters.columns, 'board', true),
     broken.length ? h('p', { class: 'muted small' }, `${broken.length} folder${broken.length === 1 ? '' : 's'} cannot be read. See `, h('a', { href: '#/runs' }, 'Projects'), '.') : null,
   );
@@ -1225,11 +1337,11 @@ const TASK_FILTER_KEY = 'task-manager-admin:task-filters';
 function loadTaskFilters() {
   try {
     const saved = JSON.parse(localStorage.getItem(TASK_FILTER_KEY) ?? 'null');
-    if (saved && typeof saved === 'object') return { finished: saved.finished === true, clone: typeof saved.clone === 'string' ? saved.clone : null };
+    if (saved && typeof saved === 'object') return { finished: saved.finished === true, clone: typeof saved.clone === 'string' ? saved.clone : null, archived: saved.archived === true, text: typeof saved.text === 'string' ? saved.text : '' };
   } catch {
     // No storage in this browser: the filters last until the page closes.
   }
-  return { finished: false, clone: null };
+  return { finished: false, clone: null, archived: false, text: '' };
 }
 
 let taskFilters = loadTaskFilters();
@@ -1249,15 +1361,19 @@ const TASK_RANK = { needs_input: 0, in_progress: 1, todo: 2, done: 3 };
 const taskRank = (l) => TASK_RANK[l.column] * 2 + (l.phase === 'merged' || l.phase === 'delivered' ? 1 : 0);
 
 function renderTasks({ runs, broken }) {
-  const tasksRuns = runs.filter((e) => e.run.kind === 'tasks');
+  const everyTasksRun = runs.filter((e) => e.run.kind === 'tasks');
+  const archivedCount = everyTasksRun.filter((e) => e.run.archived).length;
+  const tasksRuns = everyTasksRun.filter((e) => taskFilters.archived || !e.run.archived);
   const shownRuns = tasksRuns.filter((e) => taskFilters.finished || e.run.state !== 'finished');
   const clones = [...new Set(shownRuns.map((e) => clone(e.run.checkout)))].sort();
   const cloneFilter = clones.includes(taskFilters.clone) ? taskFilters.clone : null;
   const selected = shownRuns.filter((e) => !cloneFilter || clone(e.run.checkout) === cloneFilter);
   const rows = selected
     .flatMap((state) => state.layers.map((l) => ({ state, l })))
+    .filter(({ state, l }) => matchesSearch(taskFilters.text ?? '', l.task, l.id, state.run.title, state.run.id, state.run.checkout))
     .sort((a, b) => taskRank(a.l) - taskRank(b.l) || String(b.l.lastEvent ?? b.state.lastEvent).localeCompare(String(a.l.lastEvent ?? a.state.lastEvent)));
-  const runQuestions = selected.flatMap((state) => state.openQuestions.filter((q) => !q.layer).map((q) => ({ state, q })));
+  // A question waits for the user also when a filter hides its run.
+  const runQuestions = everyTasksRun.flatMap((state) => state.openQuestions.filter((q) => !q.layer).map((q) => ({ state, q })));
   const finishedCount = tasksRuns.length - tasksRuns.filter((e) => e.run.state !== 'finished').length;
 
   const toolbar = h(
@@ -1275,6 +1391,10 @@ function renderTasks({ runs, broken }) {
         h('input', { type: 'checkbox', checked: taskFilters.finished, onchange: (event) => setTaskFilters({ finished: event.target.checked }) }),
         ` Show finished runs (${finishedCount})`,
       ),
+      archivedCount || taskFilters.archived
+        ? h('label', { class: 'switch' }, h('input', { type: 'checkbox', checked: taskFilters.archived, onchange: (event) => setTaskFilters({ archived: event.target.checked }) }), ` Show archived (${archivedCount})`)
+        : null,
+      h('input', { type: 'search', id: 'task-search', class: 'run-search', placeholder: 'Search by task, run or clone', value: taskFilters.text ?? '', 'aria-label': 'Search', ...searchHandlers((text) => setTaskFilters({ text })) }),
     ),
   );
 
@@ -1315,7 +1435,7 @@ function renderTasks({ runs, broken }) {
           h('tbody', null, rows.map(row)),
         ),
       )
-      : h('p', { class: 'muted' }, tasksRuns.length ? 'No task here. Turn on "Show finished runs", or pick another clone.' : 'No tasks runs in this root yet. The task-manager skill makes them.'),
+      : h('p', { class: 'muted' }, everyTasksRun.length ? 'No task here. Change the search or the clone, or turn on "Show finished runs" or "Show archived".' : 'No tasks runs in this root yet. The task-manager skill makes them.'),
     broken.length ? h('p', { class: 'muted small' }, `${broken.length} folder${broken.length === 1 ? '' : 's'} cannot be read. See `, h('a', { href: '#/runs' }, 'Projects'), '.') : null,
   );
 }
@@ -1376,6 +1496,7 @@ async function renderTask(state, route) {
       h('h1', null, `${l.id}: ${l.task}`),
       sessionControl(state),
       run.state !== 'finished' ? h('button', { type: 'button', class: 'btn', onclick: () => confirmFinish(state), title: 'Marks the whole tasks run as finished' }, 'Mark run as finished') : null,
+      archiveControl(state),
     ),
     h(
       'div',
