@@ -9,6 +9,8 @@
  */
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import * as path from 'node:path';
+import process from 'node:process';
+import { spawnSync } from 'node:child_process';
 
 export const SCHEMA = 1;
 export const RUN_ID = /^[0-9]{4}-[0-9]{2}-[0-9]{2}-[a-z0-9]+(-[a-z0-9]+)*$/;
@@ -209,6 +211,53 @@ export function listPlans(dir) {
   return [...namesIn('plans', 'main-'), ...namesIn('plans', 'plan-'), ...namesIn('reports', 'report-')];
 }
 
+/**
+ * True when the process that wrote a marker still runs: the same PID with the same start time.
+ * This is the rule of `processAlive` in the helper's core module. A process that ended and that
+ * nobody collected (a zombie) does not run. With no usable `ps`, the PID alone decides.
+ */
+export function processAlive(pid, lstart) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    if (error.code !== 'EPERM') return false;
+  }
+  const out = spawnSync('ps', ['-o', 'stat=,lstart=', '-p', String(pid)], { encoding: 'utf8' });
+  if (out.error) return true;
+  const line = (out.stdout ?? '').trim();
+  if (out.status !== 0 || line === '') return false;
+  const [stat, ...rest] = line.split(/\s+/);
+  if (stat.startsWith('Z')) return false;
+  return typeof lstart !== 'string' || rest.join(' ') === lstart;
+}
+
+function jsonOrNull(file) {
+  try {
+    return JSON.parse(readFileSync(file, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Who works on a run now, from the two marker files of the helper (`sessionsOf` in its core
+ * module): `watching` is true while a `wait` command of a session runs, and `started` is the
+ * session that the page started, while its process runs.
+ */
+export function sessionOf(dir, alive = processAlive) {
+  let watching = false;
+  try {
+    const folder = path.join(dir, 'watchers');
+    watching = readdirSync(folder).some((name) => alive(Number(name), jsonOrNull(path.join(folder, name))?.lstart));
+  } catch {
+    // No watcher folder: no watcher.
+  }
+  const saved = jsonOrNull(path.join(dir, 'session.json'));
+  const started = saved && alive(saved.pid, saved.lstart) ? { pid: saved.pid, started: saved.started ?? null } : null;
+  return { watching, started };
+}
+
 // ── Runs ─────────────────────────────────────────────────────────────────────────────────────────
 
 /** Read one run with every derived value. `at` (milliseconds) is "now", for tests. */
@@ -255,6 +304,7 @@ export function readRun(root, id, { at = Date.now() } = {}) {
     stale: isStale(run, events, open, at),
     phaseTimes: phaseTimes(events, until),
     plans: listPlans(dir),
+    session: sessionOf(dir),
     errors,
   };
 }
@@ -306,11 +356,12 @@ export function listRuns(root, { at = Date.now() } = {}) {
  * does not show.
  */
 export function readBoard(root, { at = Date.now() } = {}) {
-  return scanRuns(root, at, ({ run, layers, questions, openQuestions: open, next, lastEvent, stale, plans }) => ({
+  return scanRuns(root, at, ({ run, layers, questions, openQuestions: open, next, lastEvent, stale, plans, session }) => ({
     run: { id: run.id, title: run.title, kind: run.kind, state: run.state, stage: run.stage, checkout: run.checkout, nextStep: run.nextStep },
     layers,
     // The Tasks view links a report only when its file is there, so it needs the file names.
     plans,
+    session,
     // Only the questions that a card shows: the open ones and the question of each parked layer.
     questions: questions.filter((q) => q.answer === null || q.answer === undefined || layers.some((l) => l.parked?.question === q.id)),
     openQuestions: open,

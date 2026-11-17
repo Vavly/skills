@@ -4,6 +4,8 @@
  * JSON API. It never writes a run file itself: the skill's helper is the only writer. Two things
  * run the helper, in the project's own clone:
  *   - "Mark as finished", which the user confirms on the page;
+ *   - "Start a session", which the user confirms on the page, and only with the user's setting
+ *     `resume.enabled` in config.json of the runs root (see startSession);
  *   - the PR sync: when GitHub says a layer's PR is merged, it records the merge (see createPrSync).
  *
  * Usage:
@@ -163,6 +165,28 @@ async function finishRun(root, id, helperFor) {
   if (target.state.run.state === 'finished') throw new HttpError(409, `run ${id} is already finished`);
   await runHelper(root, target, ['run', '--run', id, '--set', 'state=finished', '--summary', 'Marked finished in the task-manager admin UI']);
   return { id, state: readRun(root, id).run.state };
+}
+
+/** True when the user's settings permit the page to start a session. A bad file means no. */
+export function canStartSessions(root) {
+  try {
+    return JSON.parse(readFileSync(path.join(root, 'config.json'), 'utf8'))?.resume?.enabled === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Start a session that resumes the run, through the helper (`start-session`). The helper makes
+ * every check again under the run lock: the setting, no live watcher, no session that the page
+ * started earlier and that still runs.
+ */
+async function startSession(root, id, helperFor) {
+  if (!canStartSessions(root)) throw new HttpError(403, 'starting a session is off in the settings of this user (config.json, "resume.enabled")');
+  const target = writableRun(root, id, helperFor);
+  if (target.state.run.state === 'finished') throw new HttpError(409, `run ${id} is finished`);
+  const started = JSON.parse(await runHelper(root, target, ['start-session', '--run', id]));
+  return { id, pid: started.pid };
 }
 
 const MAX_ANSWER = 2000;
@@ -371,6 +395,10 @@ function route(root, pathname, res) {
     sendJson(res, 200, listRuns(root));
     return;
   }
+  if (pathname === '/api/settings') {
+    sendJson(res, 200, { startSessions: canStartSessions(root) });
+    return;
+  }
   if (pathname === '/api/board') {
     sendJson(res, 200, readBoard(root));
     return;
@@ -403,6 +431,16 @@ export function createHandler(root, port, { helperFor = helperOf, sync = createP
         }
         checkWrite(req, port(), 'finish');
         sendJson(res, 200, await finishRun(root, decode(finish[1]), helperFor));
+        return;
+      }
+      const session = /^\/api\/runs\/([^/]+)\/session$/.exec(pathname);
+      if (session) {
+        if (req.method !== 'POST') {
+          res.setHeader('Allow', 'POST');
+          throw new HttpError(405, 'only POST is accepted here');
+        }
+        checkWrite(req, port(), 'session');
+        sendJson(res, 200, await startSession(root, decode(session[1]), helperFor));
         return;
       }
       const answer = /^\/api\/runs\/([^/]+)\/questions\/(q[1-9][0-9]*)\/answer$/.exec(pathname);

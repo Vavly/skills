@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert';
 import { spawn, spawnSync } from 'node:child_process';
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, utimesSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import process from 'node:process';
@@ -1425,4 +1425,223 @@ test('N7. [review] a long question is cut for the senders, so a command that rea
   const out = spawnSync(process.execPath, [CLI, 'ask', '--run', id, '--question', readFileSync(file, 'utf8')], { env: { ...process.env, TASK_MANAGER_RUNS: root }, encoding: 'utf8', timeout: 15_000 });
   assert.equal(out.status, 0, out.stderr);
   assert.ok(Date.now() - started < 10_000, `the CLI took ${Date.now() - started} ms`);
+});
+
+// ── Sessions of a run ────────────────────────────────────────────────────────────────────────────
+
+/** A root with a paused run, whose settings start a stand-in for the session program: it records its call and stays alive. */
+function sessionRoot({ enabled = true, lifeMs = 4000, extra = {} } = {}) {
+  const base = tempRoot();
+  const root = path.join(base, 'runs');
+  const checkout = path.join(base, 'clone');
+  mkdirSync(root);
+  mkdirSync(checkout);
+  const fake = path.join(base, 'fake-session.mjs');
+  const call = path.join(base, 'call.json');
+  writeFileSync(
+    fake,
+    `#!/usr/bin/env node
+import { writeFileSync } from 'node:fs';
+writeFileSync(${JSON.stringify(call)}, JSON.stringify({ args: process.argv.slice(2), cwd: process.cwd(), env: process.env }));
+console.log('session output');
+setTimeout(() => {}, ${lifeMs});
+`,
+  );
+  chmodSync(fake, 0o755);
+  writeFileSync(path.join(root, 'config.json'), JSON.stringify({ resume: { enabled, command: fake, args: ['--permission-mode', 'acceptEdits'], ...extra } }));
+  const id = initRun(root, { title: 'Undo timeline', checkout, request: 'do it', layers: layers(2), date: '2026-11-06' }).id;
+  setRun(root, id, [['state', 'paused']]);
+  return { base, root, checkout, call, id, fake };
+}
+
+async function fileJson(file) {
+  for (let i = 0; i < 200; i += 1) {
+    if (existsSync(file)) {
+      try {
+        return JSON.parse(readFileSync(file, 'utf8'));
+      } catch {
+        // Written in part: try again.
+      }
+    }
+    await new Promise((done) => setTimeout(done, 25));
+  }
+  throw new Error(`no ${file} after 5 s`);
+}
+
+const stopProcess = (pid) => {
+  try {
+    process.kill(pid);
+  } catch {
+    // It ended already.
+  }
+};
+
+test('X1. start-session starts the program in the checkout with the resume prompt and tight permissions, records it, and refuses a second one while it runs', async () => {
+  const { realpathSync } = await import('node:fs');
+  const { root, checkout, call, id } = sessionRoot();
+  const env = { TASK_MANAGER_RUNS: root };
+  // The identity of the session that started the admin server must not reach the new session.
+  const parent = { CLAUDECODE: '1', CLAUDE_PID: '1', CLAUDE_CODE_SESSION_ID: 'old', CLAUDE_CODE_CHILD_SESSION: '1', CLAUDE_CODE_MESSAGING_SOCKET: '/x', CLAUDE_CODE_ENTRYPOINT: 'cli', CLAUDE_CODE_USE_BEDROCK: 'keep' };
+  const out = spawnSync(process.execPath, [CLI, 'start-session', '--run', id], { env: { ...process.env, ...parent, ...env }, encoding: 'utf8' });
+  assert.equal(out.status, 0, out.stderr);
+  const started = JSON.parse(out.stdout);
+  try {
+    const seen = await fileJson(call);
+    assert.deepEqual(seen.args.filter((_, i) => i !== 1), ['--settings', '--permission-mode', 'acceptEdits', '-p', `/task-manager resume ${id}`]);
+    const skill = path.resolve(path.dirname(CLI), '..');
+    const { permissions } = JSON.parse(seen.args[1]);
+    assert.deepEqual(permissions.allow, [`Read(/${skill}/**)`, `Read(/${root}/${id}/**)`, `Edit(/${root}/${id}/plans/**)`, `Edit(/${root}/${id}/reports/**)`]);
+    // The session can never edit the ledger code or the settings file: both run with no permission check.
+    assert.equal(permissions.deny.includes(`Edit(/${skill}/**)`), true);
+    assert.equal(permissions.deny.includes(`Edit(/${root}/config.json)`), true);
+    assert.equal(seen.args.includes('--add-dir'), false);
+    assert.equal(realpathSync(seen.cwd), realpathSync(checkout));
+    assert.equal(seen.env.TASK_MANAGER_RUNS, root);
+    assert.equal(seen.env.TASK_MANAGER_NO_TERMINAL, '1');
+    assert.deepEqual(Object.keys(parent).filter((key) => key in seen.env), ['CLAUDE_CODE_USE_BEDROCK']);
+    assert.deepEqual(JSON.parse(readFileSync(path.join(root, id, 'session.json'), 'utf8')), started);
+    assert.equal(started.log, path.join(root, id, 'session.log'));
+    assert.match(readRun(root, id).events.at(-1).summary, /a session was started from the admin page/);
+    const again = cli(root, 'start-session', '--run', id);
+    assert.equal(again.code, 1);
+    assert.match(again.stderr, new RegExp(`a started session works on run ${id} \\(process ${started.pid}\\)`));
+  } finally {
+    stopProcess(started.pid);
+  }
+  // When that process is gone, its record has no effect: a new session can start.
+  for (let i = 0; i < 200; i += 1) {
+    const next = cli(root, 'start-session', '--run', id);
+    if (next.code === 0) {
+      stopProcess(JSON.parse(next.stdout).pid);
+      assert.match(readFileSync(path.join(root, id, 'session.log'), 'utf8'), /session output/);
+      return;
+    }
+    await new Promise((done) => setTimeout(done, 25));
+  }
+  assert.fail('a new session did not start after the first one ended');
+});
+
+test('X2. start-session is off by default, and it refuses a finished run, a bad checkout, a missing program and bad settings', () => {
+  const off = sessionRoot({ enabled: false });
+  const refused = cli(off.root, 'start-session', '--run', off.id);
+  assert.equal(refused.code, 1);
+  assert.match(refused.stderr, /starting a session is off; set "resume": \{ "enabled": true \}/);
+  assert.equal(existsSync(path.join(off.root, off.id, 'session.json')), false);
+  // No settings file at all is also off.
+  const bare = tempRoot();
+  assert.match(cli(bare, 'start-session', '--run', newRun(bare)).stderr, /starting a session is off/);
+
+  const { root, id } = sessionRoot();
+  const config = path.join(root, 'config.json');
+  writeFileSync(config, JSON.stringify({ resume: { enabled: true, command: '/no/such/program' } }));
+  const missing = cli(root, 'start-session', '--run', id);
+  assert.equal(missing.code, 1);
+  assert.match(missing.stderr, /cannot start "\/no\/such\/program"/);
+  assert.equal(existsSync(path.join(root, id, 'session.json')), false);
+  for (const [bad, message] of [
+    [{ resume: { enabled: true, args: 'x' } }, /"resume.args" .* must be a list of texts/],
+    [{ resume: { enabled: true, command: 5 } }, /"resume.command" .* must be the name of a program/],
+    [{ resume: { enabled: true, checkouts: ['relative'] } }, /"resume.checkouts" .* must be a list of absolute paths/],
+    [{ resume: [] }, /"resume" .* must be an object/],
+  ]) {
+    writeFileSync(config, JSON.stringify(bad));
+    assert.match(cli(root, 'start-session', '--run', id).stderr, message);
+  }
+  writeFileSync(config, '{ not json');
+  assert.match(cli(root, 'start-session', '--run', id).stderr, /is not a JSON object/);
+
+  // A checkout that is not there, and one that is a file: an input error, not a crash.
+  for (const make of [() => '/no/such/clone', (base) => (writeFileSync(path.join(base, 'a-file'), ''), path.join(base, 'a-file'))]) {
+    const bad = sessionRoot();
+    const file = path.join(bad.root, bad.id, 'run.json');
+    const checkout = make(bad.base);
+    writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, 'utf8')), checkout }));
+    const out = cli(bad.root, 'start-session', '--run', bad.id);
+    assert.equal(out.code, 1);
+    assert.match(out.stderr, /does not exist, or is not a folder/);
+  }
+  const done = sessionRoot();
+  cli(done.root, 'run', '--run', done.id, '--set', 'state=finished');
+  assert.match(cli(done.root, 'start-session', '--run', done.id).stderr, /is finished/);
+});
+
+test('X3. a wait marks the run as watched while it runs, and start-session refuses a watched run', async () => {
+  const { waitForAnswer, sessionsOf } = await import('../lib/task-manager-core.mjs');
+  const { root, id } = sessionRoot();
+  const dir = path.join(root, id);
+  const q1 = JSON.parse(cli(root, 'ask', '--run', id, '--question', 'A or B?').stdout).id;
+  const waiting = waitForAnswer(root, id, { pollMs: 5, timeoutMs: 5000 });
+  await new Promise((done) => setTimeout(done, 30));
+  assert.deepEqual(sessionsOf(dir).watchers, [process.pid]);
+  const refused = cli(root, 'start-session', '--run', id);
+  assert.equal(refused.code, 1);
+  assert.match(refused.stderr, new RegExp(`a session watches run ${id}`));
+  cli(root, 'answer', '--run', id, '--id', q1, '--answer', 'A');
+  await waiting;
+  assert.deepEqual(sessionsOf(dir), { watchers: [], started: null });
+});
+
+test('X4. [review] a marker counts only for the process that wrote it: not for a dead PID, a PID that another process has now, or a bad file', async () => {
+  const { sessionsOf, processStart } = await import('../lib/task-manager-core.mjs');
+  const { root, id } = sessionRoot();
+  const dir = path.join(root, id);
+  mkdirSync(path.join(dir, 'watchers'), { recursive: true });
+  const mine = processStart(process.pid);
+  assert.equal(typeof mine, 'string');
+  assert.equal(processStart(2147483646), null);
+  // This process runs, but the marker has the start time of an earlier process with the same PID.
+  writeFileSync(path.join(dir, 'watchers', String(process.pid)), JSON.stringify({ lstart: 'Thu Jan  1 00:00:00 1970' }));
+  writeFileSync(path.join(dir, 'watchers', '2147483646'), JSON.stringify({ lstart: mine }));
+  writeFileSync(path.join(dir, 'watchers', 'not-a-pid'), '');
+  writeFileSync(path.join(dir, 'watchers', '0'), '');
+  assert.deepEqual(sessionsOf(dir).watchers, []);
+  for (const pid of [0, -1, process.pid]) {
+    writeFileSync(path.join(dir, 'session.json'), JSON.stringify({ pid, lstart: 'Thu Jan  1 00:00:00 1970' }));
+    assert.equal(sessionsOf(dir).started, null);
+  }
+  // The same PID with the right start time is alive.
+  writeFileSync(path.join(dir, 'watchers', String(process.pid)), JSON.stringify({ lstart: mine }));
+  assert.deepEqual(sessionsOf(dir).watchers, [process.pid]);
+  // start-session removes the markers of the processes that ended.
+  cli(root, 'run', '--run', id, '--set', 'nextStep=x');
+  assert.equal(cli(root, 'start-session', '--run', id).code, 1);
+  assert.deepEqual(readdirSync(path.join(dir, 'watchers')), [String(process.pid)]);
+});
+
+test('X5. [review] a wait that a signal ends removes its marker', async () => {
+  const { root, id } = sessionRoot();
+  const marker = (pid) => path.join(root, id, 'watchers', String(pid));
+  cli(root, 'ask', '--run', id, '--question', 'A or B?');
+  const child = spawn(process.execPath, [CLI, 'wait', '--run', id, '--timeout', '30'], { env: { ...process.env, TASK_MANAGER_RUNS: root } });
+  for (let i = 0; i < 200 && !existsSync(marker(child.pid)); i += 1) await new Promise((done) => setTimeout(done, 25));
+  assert.equal(existsSync(marker(child.pid)), true);
+  child.kill('SIGTERM');
+  const code = await new Promise((done) => child.on('close', done));
+  assert.equal(code, 143);
+  assert.equal(existsSync(marker(child.pid)), false);
+});
+
+test('X6. [review] an active run is not started unless it had no event for an hour; the checkout list limits the clones', async () => {
+  const { startSession } = await import('../lib/task-manager-core.mjs');
+  const { root, id, checkout } = sessionRoot();
+  cli(root, 'run', '--run', id, '--set', 'state=active');
+  const active = cli(root, 'start-session', '--run', id);
+  assert.equal(active.code, 1);
+  assert.match(active.stderr, /is active: a session works on it/);
+  // After an hour with no event, the session that worked on it is gone.
+  const calls = [];
+  const spawnFn = (file, args, options) => (calls.push({ file, args, options }), { pid: process.pid, on() {}, unref() {} });
+  const started = startSession(root, id, { spawnFn, at: Date.now() + 61 * 60 * 1000, alive: () => false });
+  assert.equal(started.pid, process.pid);
+  assert.equal(calls.length, 1);
+
+  const listed = sessionRoot({ extra: { checkouts: ['/some/other/clone'] } });
+  const out = cli(listed.root, 'start-session', '--run', listed.id);
+  assert.equal(out.code, 1);
+  assert.match(out.stderr, /is not in "resume.checkouts"/);
+  writeFileSync(path.join(listed.root, 'config.json'), JSON.stringify({ resume: { enabled: true, command: listed.fake, checkouts: [`${listed.checkout}/`] } }));
+  const ok = cli(listed.root, 'start-session', '--run', listed.id);
+  assert.equal(ok.code, 0, ok.stderr);
+  stopProcess(JSON.parse(ok.stdout).pid);
+  assert.equal(typeof checkout, 'string');
 });

@@ -182,6 +182,8 @@ It does not block you: continue with the next layer. It ends when an open questi
 answer, and the harness then starts you again with its output: the question id, the layer, the
 answer and its source. Do not poll it. When it ends:
 
+- If the run is `paused`, run `L run --set state=active` before you act on an answer: the admin
+  page starts no second session for an active run.
 - `via: dashboard`: the answer is in the ledger already. Do not run `L answer` for it. Tell the
   user in one line which answer you got. Then act on it as on an answer in the session: at the
   next stop point.
@@ -379,6 +381,7 @@ steps below leave it out. In each command, `--layer` takes the layer id.
 | A layer field changes: phase, round, branch, SHAs, agent ids, tier, escalation, PR | `L layer --layer <layer> --set key=value ...` |
 | A run field changes: state, stage, next step, CI | `L run --set key=value ...` |
 | A question to the user, and its answer | `L ask [--layer] [--session-only] --question --option ...`, `L answer --id --answer`. `--session-only` is for the questions that "The user can answer in two places" lists: the admin page cannot answer it. |
+| Start a session with no terminal, for the admin page | `L start-session --run <id>`. Only the admin page runs it, and only with the user's setting. Do not run it yourself. |
 | Test the user's notification settings | `L notify-test`. It sends one test notification in place, and prints what each sender did. `L` sends the real notifications itself, after `ask`, `park` and a change to `paused` or `finished`: you run no command for them. |
 | Wait for an answer, in the background | `L wait --run <id> [--timeout <seconds>]`. It prints `{"answered": [{id, layer, answer, via}], "reason"}` and ends. `reason` is `answered`, `no_open_question`, `run_finished` or `timeout`. |
 | Park a layer, and resume it | `L park --layer (--question --option ... [--session-only] \| --id) --tip`, `L unpark --layer --base --base-tip --head [--last-reviewed]` |
@@ -407,6 +410,18 @@ GitHub stack number, or `null` after an unstack), `ciPr`, `ciRunUrl`, `ciResult`
 
 `/task-manager resume [<run-id>]` continues a run in a new session. `L show` gives the kind of
 the run: read its kind file before you continue.
+
+**A session with no terminal.** The admin page can start this mode for the user. The environment
+variable `TASK_MANAGER_NO_TERMINAL` is then `1`, and no user reads your text or answers in the
+session. In that session:
+
+- Do not use `AskUserQuestion`. Record each question with `L ask` or `L park`: the user answers
+  on the admin page, and the ledger notifies the user.
+- Do not wait for a session-only answer, and do not do its action. Leave the question open.
+- When no layer can move, set `state=paused` with the next step, and end. Start no answer watcher
+  before you end: the page then shows that no session watches, and the user can start one again.
+- If a step needs a permission that you do not get, record it with `L event --type note`, set
+  `state=paused`, and end.
 
 1. **Find the run.** With no run id, run
    `L list --checkout <absolute path of this checkout> --state active,paused`. If it gives more

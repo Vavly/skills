@@ -4,7 +4,7 @@
  */
 import { strict as assert } from 'node:assert';
 import { spawn } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
@@ -796,4 +796,62 @@ test('V2. [review] a body over the limit gets 413 and records nothing; a relativ
     s.close();
   }
   assert.throws(() => defaultRoot({ TASK_MANAGER_RUNS: 'runs' }), /must be an absolute path/);
+});
+
+// ── Start a session from the page ───────────────────────────────────────────────────────────────
+
+test('P1. the page starts a session only with the user setting, through the real helper; the run then shows the session', async () => {
+  const core = await import('../../skills/task-manager/scripts/lib/task-manager-core.mjs');
+  const own = mkdtempSync(path.join(tmpdir(), 'task-manager-admin-session-'));
+  const ownRoot = path.join(own, 'runs');
+  const checkout = path.join(own, 'clone');
+  mkdirSync(checkout);
+  const fake = path.join(own, 'fake-session.mjs');
+  writeFileSync(fake, '#!/usr/bin/env node\nsetTimeout(() => {}, 4000);\n');
+  chmodSync(fake, 0o755);
+  const { id } = core.initRun(ownRoot, { title: 'Scroll position', checkout, request: 'do it', layers: [{ task: 'a', source: 'request', tier: 'M', tierReason: 'r', dependsOn: [] }] });
+  core.setRun(ownRoot, id, [['state', 'paused']]);
+  const config = path.join(ownRoot, 'config.json');
+  const s = await startAdminServer({ root: ownRoot, port: 0 });
+  const origin = `http://127.0.0.1:${s.address().port}`;
+  const ok = { origin, 'x-task-manager-admin': 'session' };
+  const url = `/api/runs/${id}/session`;
+  let pid = null;
+  try {
+    // Off: no settings file, a bad file, and a file that does not say `enabled: true`.
+    assert.deepEqual(json(await request(s, '/api/settings')), { startSessions: false });
+    assert.equal((await post(s, url, {}, ok)).status, 403);
+    writeFileSync(config, '{ not json');
+    assert.deepEqual(json(await request(s, '/api/settings')), { startSessions: false });
+    writeFileSync(config, JSON.stringify({ resume: { enabled: 'yes', command: fake } }));
+    assert.equal((await post(s, url, {}, ok)).status, 403);
+    assert.deepEqual(json(await request(s, `/api/runs/${id}`)).session, { watching: false, started: null });
+
+    writeFileSync(config, JSON.stringify({ resume: { enabled: true, command: fake } }));
+    assert.deepEqual(json(await request(s, '/api/settings')), { startSessions: true });
+    assert.equal((await post(s, url, {}, { origin: 'http://evil.example', 'x-task-manager-admin': 'session' })).status, 403);
+    assert.equal((await post(s, url, {}, { origin, 'x-task-manager-admin': 'answer' })).status, 403);
+    assert.equal((await request(s, url)).status, 405);
+    assert.equal((await post(s, '/api/runs/2026-01-01-no-run/session', {}, ok)).status, 404);
+
+    const res = await post(s, url, {}, ok);
+    assert.equal(res.status, 200, res.body);
+    pid = json(res).pid;
+    assert.equal(Number.isInteger(pid), true);
+    assert.equal(json(await request(s, `/api/runs/${id}`)).session.started.pid, pid);
+    assert.equal(json(await request(s, '/api/board')).runs[0].session.started.pid, pid);
+    // A second click while it runs: the helper refuses.
+    const again = await post(s, url, {}, ok);
+    assert.equal(again.status, 409);
+    assert.match(json(again).error, /a started session works on run/);
+  } finally {
+    if (pid) {
+      try {
+        process.kill(pid);
+      } catch {
+        // It ended already.
+      }
+    }
+    s.close();
+  }
 });

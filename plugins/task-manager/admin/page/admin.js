@@ -138,6 +138,44 @@ function parseHash() {
   return { name: 'run-board', id: parts[1] };
 }
 
+/** The settings of this user that the page needs: `startSessions` permits the "Start a session" button. */
+let settings = { startSessions: false };
+
+/**
+ * Who works on a run, and the button that starts a session when nobody does. A session that
+ * watches gets an answer by itself. With no session, an answer waits for a resume.
+ */
+function sessionControl(state) {
+  const { run, session } = state;
+  if (!session || run.state === 'finished') return null;
+  if (session.started) return h('span', { class: 'badge session', title: `process ${session.started.pid}` }, 'session started from this page');
+  if (session.watching) return h('span', { class: 'badge session', title: 'A session waits for answers to this run' }, 'a session watches');
+  // An active run belongs to the session that works on it. Only a long silence shows that it is gone.
+  const idle = run.state === 'paused' || !state.lastEvent || Date.now() - Date.parse(state.lastEvent) >= 60 * 60 * 1000;
+  if (!idle) return h('span', { class: 'badge session', title: 'The run is active: a session works on it' }, 'a session works');
+  if (!settings.startSessions) return h('span', { class: 'badge', title: 'An answer waits until you run /task-manager resume. To start a session from this page, set "resume.enabled" in config.json of the runs folder.' }, 'no session');
+  return h('button', { type: 'button', class: 'btn', onclick: () => confirmStartSession(state) }, 'Start a session');
+}
+
+/** Ask before starting a session: it runs with no terminal, in the clone of the run. */
+function confirmStartSession(state) {
+  const { run } = state;
+  openConfirm({
+    title: 'Start a session for this run?',
+    confirmLabel: 'Start a session',
+    confirmClass: 'btn',
+    url: `/api/runs/${enc(run.id)}/session`,
+    action: 'session',
+    content: h(
+      'div',
+      null,
+      h('p', null, 'This starts a session with no terminal that runs ', h('code', null, `/task-manager resume ${run.id}`), ' in this folder:'),
+      h('p', null, h('code', null, run.checkout)),
+      h('ul', null, h('li', null, 'Start it only if you know this folder: the session uses the settings that are in it.'), h('li', null, 'It acts on the answers that wait, and it continues the run.'), h('li', null, 'It changes files in that clone. Do not work in the clone at the same time.'), h('li', null, 'It cannot ask you in a terminal. A session-only question still needs your own session.'), h('li', null, 'Its output goes to ', h('code', null, 'session.log'), ' in the run folder.')),
+    ),
+  });
+}
+
 /** The data and route of the view on screen. A poll with the same signature does not redraw. */
 let lastSignature = null;
 
@@ -211,13 +249,14 @@ async function refresh({ force = false } = {}) {
   markMenu(route);
   try {
     const url = route.name === 'board' || route.name === 'tasks' ? '/api/board' : route.name === 'runs' ? '/api/runs' : `/api/runs/${enc(route.id)}`;
-    const data = await getJson(url);
+    const [data, fresh] = await Promise.all([getJson(url), getJson('/api/settings').catch(() => ({ startSessions: false }))]);
     if (mine !== token) return;
+    settings = fresh;
     live.textContent = `Updated ${new Date().toLocaleTimeString()}`;
     live.classList.remove('error');
     // Phase times grow with the clock on an active run. They are not run data that changed, so they
     // stay out of the signature; tick() updates them in place.
-    const signature = `${location.hash}|${JSON.stringify({ ...data, phaseTimes: undefined })}`;
+    const signature = `${location.hash}|${JSON.stringify(settings)}|${JSON.stringify({ ...data, phaseTimes: undefined })}`;
     if (!force && signature === lastSignature) return;
     // Keep the user's selection. The next poll tries again.
     if (!force && selectionInView()) return;
@@ -366,6 +405,7 @@ function runHeader(state, tab) {
       'div',
       { class: 'title-row' },
       h('h1', null, run.title),
+      sessionControl(state),
       run.state !== 'finished' ? h('button', { type: 'button', class: 'btn', onclick: () => confirmFinish(state) }, 'Mark as finished') : null,
     ),
     h(
@@ -548,7 +588,9 @@ function answerControl(state, q) {
     event.stopPropagation();
     openAnswer(state, q);
   });
-  return h('p', { class: 'answer-row' }, button, h('span', { class: 'muted small' }, ` or answer in the session (run ${state.run.id})`));
+  const idle = state.session && !state.session.watching && !state.session.started && state.run.state !== 'active';
+  const note = idle ? ` No session watches run ${state.run.id}: the answer waits for a resume${settings.startSessions ? ', or for "Start a session" on the run page' : ''}.` : ` or answer in the session (run ${state.run.id})`;
+  return h('p', { class: 'answer-row' }, button, h('span', { class: 'muted small' }, note));
 }
 
 function questionCard(state, q, showRun = false) {
@@ -1262,6 +1304,7 @@ async function renderTask(state, route) {
       'div',
       { class: 'title-row' },
       h('h1', null, `${l.id}: ${l.task}`),
+      sessionControl(state),
       run.state !== 'finished' ? h('button', { type: 'button', class: 'btn', onclick: () => confirmFinish(state), title: 'Marks the whole tasks run as finished' }, 'Mark run as finished') : null,
     ),
     h(
