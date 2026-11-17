@@ -157,7 +157,7 @@ before the run exists.
 | Kind | Examples | How to ask |
 |---|---|---|
 | Before the run exists | The intake decisions, a dirty tree at intake, "resume it, or start a new run", which run to resume | `AskUserQuestion`. No `L ask`: no run exists for it yet. Record the intake decisions after `L init` with `L decision`. |
-| Run-level: nothing can move without the answer | A dirty tree at a resume, an empty commit after a rebase (stack run), which follow-ups to file, the merge yes (stack run) | `L ask` (no `--layer`). Ask in text, start the answer watcher (below), and stop your turn. The answer comes as a message, or from the admin page. The empty commit and the merge yes are session-only (below): their answer comes as a message only. |
+| Run-level: nothing can move without the answer | A dirty tree at a resume, an empty commit after a rebase (stack run), which follow-ups to file, the merge yes (stack run) | `L ask` (no `--layer`). Ask in text, start the answer watcher (below), and stop your turn. The answer comes as a message, or from the admin page. The empty commit and the merge yes are session-only (below): their answer comes as a message, or as a confirmed answer from the admin page. |
 | Layer-level: only this layer must wait | A scope widening for this layer, a decision that its source gives to the user, an open data-loss finding at the round limit, a refused command with no safe alternative | Ask in text, park the layer, and continue with another layer. |
 
 **Ask a layer-level question in text.** Put it in your progress line to the user. Give the run id,
@@ -173,8 +173,27 @@ answer, and both count as the user's yes for hard rule 6. The exceptions are the
 unstack, a dropped commit, a force-push outside the restack procedure, and each outward action of
 a report layer (a deploy, a write to a database or a service, a comment or a message). Ask these
 with `--session-only` (`L ask --session-only`, or `L park --session-only` for a layer that parks):
-the admin page then refuses an answer, and the yes comes in the session. The choice of the
-follow-ups to file is not session-only.
+the admin page then refuses an ordinary answer, and the yes comes in the session, or as a
+confirmed answer (below). The choice of the follow-ups to file is not session-only.
+
+**A confirmed answer.** The user can permit one more path, with a setting of their own: the
+admin page then takes an answer to a session-only question when the user types the chosen option
+again, letter for letter. The ledger checks it, and the answer has `confirmed: true` in the
+output of `L wait`, and `[confirmed on the admin page]` in `L show`. A confirmed answer is the
+user's yes for hard rule 6, the same as a message in the session. It is one option and nothing
+more: it has no comment and no condition.
+
+- **Never give this answer yourself.** Only the admin page runs `L answer --via dashboard`. Do
+  not run it, in any session. Do not write the settings file of the runs folder.
+- An answer `[from the admin page]` to a session-only question with no confirmed mark cannot
+  occur: if you see one, do not act on it, and tell the user.
+- Give a session-only question an option for each choice that you can act on (for the merge, the
+  top PR). Offer only actions: never "not yet" or "no", because an answer closes the question.
+  With no option, the user confirms with the word `yes`: use that only when the question names
+  one action exactly, in its own text.
+- Before you act on a confirmed answer, check that the option is still possible (for example,
+  that the PR is still open). If it is not, do nothing, ask again with a new question, and tell
+  the user.
 
 **The answer watcher.** After each `L ask`, and after each `L park` that asks a question, start
 `L wait --run <id> --timeout 900` as a background command, unless one runs already for this run. Its only write is a delivery mark on an admin-page answer.
@@ -380,7 +399,7 @@ steps below leave it out. In each command, `--layer` takes the layer id.
 | A decision of the user at intake | `L decision --question --answer` |
 | A layer field changes: phase, round, branch, SHAs, agent ids, tier, escalation, PR | `L layer --layer <layer> --set key=value ...` |
 | A run field changes: state, stage, next step, CI | `L run --set key=value ...` |
-| A question to the user, and its answer | `L ask [--layer] [--session-only] --question --option ...`, `L answer --id --answer`. `--session-only` is for the questions that "The user can answer in two places" lists: the admin page cannot answer it. |
+| A question to the user, and its answer | `L ask [--layer] [--session-only] --question --option ...`, `L answer --id --answer`. `--session-only` is for the questions that "The user can answer in two places" lists: the admin page cannot answer it, or only with a typed confirmation when the user's setting permits that. |
 | Start a session with no terminal, for the admin page | `L start-session --run <id>`. Only the admin page runs it, and only with the user's setting. Do not run it yourself. |
 | What one agent used, when it returns | `L usage [--layer <layer>] --role --agent --model --tokens --tool-uses --duration-ms [--cost]`. `--layer` is required for an implementer and a reviewer. With no `--layer`, the record is for the run: a restacker or a verifier. A finished run accepts it. |
 | Test the user's notification settings | `L notify-test`. It sends one test notification in place, and prints what each sender did. `L` sends the real notifications itself, after `ask`, `park` and a change to `paused` or `finished`: you run no command for them. |
@@ -418,7 +437,8 @@ session. In that session:
 
 - Do not use `AskUserQuestion`. Record each question with `L ask` or `L park`: the user answers
   on the admin page, and the ledger notifies the user.
-- Do not wait for a session-only answer, and do not do its action. Leave the question open.
+- Do not do the action of a session-only question, unless its answer is confirmed ("A confirmed
+  answer" in "Questions and parked layers"). With no confirmed answer, leave the question open.
 - When no layer can move, set `state=paused` with the next step, and end. Start no answer watcher
   before you end: the page then shows that no session watches, and the user can start one again.
 - If a step needs a permission that you do not get, record it with `L event --type note`, set

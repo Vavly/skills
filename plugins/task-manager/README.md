@@ -146,6 +146,22 @@ field is always there. The page records the answer in the ledger. The session ha
 gets the answer at the next `/task-manager resume`. Some questions take an answer in the session only: a merge, an unstack, a dropped commit, a
 force-push, and an outward action of a report task (a deploy, a write to a database, a comment).
 
+**A confirmed answer to a session-only question.** With your setting, the page takes these
+answers too, with one more step: you choose an option, and you type that option again, letter for
+letter (for a merge, the top PR, such as `#506`). A question with no options takes the word
+`yes`. A confirmed answer has no comment: to say "not yet" or to add a condition, answer in the
+session. The ledger checks the typed text, and it marks the answer as confirmed. It refuses this
+answer from a session that the page started. It cannot refuse it from a session with a terminal
+that runs the same command: the rule against that is a prompt, as the rule for every answer is. The setting is in
+`config.json` in the runs folder, and it is off by default:
+
+```json
+{ "answers": { "confirmOnPage": true } }
+```
+
+With this setting and "Start a session", a merge can go from your answer on the page to the
+merge with no terminal. Turn it on only if you want that.
+
 **Start a session from the page.** A run shows who works on it: "a session watches" while a
 session waits for answers, and "no session" when an answer would wait for a resume. With your
 setting, the run page then has a "Start a session" button. It starts
@@ -171,7 +187,7 @@ files and its own run folder, and it writes plans and reports there. It cannot e
 files or `config.json`, also when your `args` permit more. It does not get the identity of the
 session that started the dashboard.
 
-Its output goes to `session.log` in the run folder. It cannot take a session-only answer. It uses
+Its output goes to `session.log` in the run folder. It acts on a session-only question only when its answer is confirmed (above). It uses
 the settings of the clone (`.claude/` in it) with no trust question, so turn this on only for
 clones that you know, and in which you do not work at the same time. A permission that you give
 in `args` is a permission for a session that nobody watches: give the smallest one that works.

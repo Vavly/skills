@@ -78,6 +78,7 @@ const OPTIONS = {
   'data-loss': { type: 'boolean' },
   'session-only': { type: 'boolean' },
   via: { type: 'string' },
+  confirm: { type: 'string' },
   timeout: { type: 'string' },
   issue: { type: 'string' },
   role: { type: 'string' },
@@ -142,7 +143,7 @@ const COMMANDS = {
       url: v.url,
     }),
   ask: (v, root) => ask(root, need(v, 'run'), { layer: v.layer, question: need(v, 'question'), options: v.option, sessionOnly: v['session-only'] }),
-  answer: (v, root) => answer(root, need(v, 'run'), need(v, 'id'), need(v, 'answer'), v.via),
+  answer: (v, root) => answer(root, need(v, 'run'), need(v, 'id'), need(v, 'answer'), v.via, v.confirm),
   park: (v, root) =>
     park(root, need(v, 'run'), need(v, 'layer'), { question: v.question, questionId: v.id, options: v.option, tip: need(v, 'tip'), sessionOnly: v['session-only'] }),
   unpark: (v, root) =>

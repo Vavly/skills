@@ -819,16 +819,16 @@ test('P1. the page starts a session only with the user setting, through the real
   let pid = null;
   try {
     // Off: no settings file, a bad file, and a file that does not say `enabled: true`.
-    assert.deepEqual(json(await request(s, '/api/settings')), { startSessions: false });
+    assert.deepEqual(json(await request(s, '/api/settings')), { startSessions: false, confirmOnPage: false });
     assert.equal((await post(s, url, {}, ok)).status, 403);
     writeFileSync(config, '{ not json');
-    assert.deepEqual(json(await request(s, '/api/settings')), { startSessions: false });
+    assert.deepEqual(json(await request(s, '/api/settings')), { startSessions: false, confirmOnPage: false });
     writeFileSync(config, JSON.stringify({ resume: { enabled: 'yes', command: fake } }));
     assert.equal((await post(s, url, {}, ok)).status, 403);
     assert.deepEqual(json(await request(s, `/api/runs/${id}`)).session, { watching: false, started: null });
 
     writeFileSync(config, JSON.stringify({ resume: { enabled: true, command: fake } }));
-    assert.deepEqual(json(await request(s, '/api/settings')), { startSessions: true });
+    assert.deepEqual(json(await request(s, '/api/settings')), { startSessions: true, confirmOnPage: false });
     assert.equal((await post(s, url, {}, { origin: 'http://evil.example', 'x-task-manager-admin': 'session' })).status, 403);
     assert.equal((await post(s, url, {}, { origin, 'x-task-manager-admin': 'answer' })).status, 403);
     assert.equal((await request(s, url)).status, 405);
@@ -896,4 +896,69 @@ test('U1. the reader adds the usage for each layer, each role and each tier, and
   // A run from before this file has no usage, and nothing fails.
   assert.deepEqual(usageOf({ layers: [{ id: 'l1', tier: 'S' }] }, []), { total: sumUsage([]), layers: {}, tiers: {}, runLevel: {} });
   assert.equal(readRun(root, IDS.main, { at: end }).usage.total.agents, 0);
+});
+
+// ── A confirmed answer to a session-only question ───────────────────────────────────────────────
+
+test('C1. the page answers a session-only question only with the user setting and the option typed exactly', async () => {
+  const core = await import('../../skills/task-manager/scripts/lib/task-manager-core.mjs');
+  const own = mkdtempSync(path.join(tmpdir(), 'task-manager-admin-confirm-'));
+  const ownRoot = path.join(own, 'runs');
+  const checkout = path.join(own, 'clone');
+  mkdirSync(checkout);
+  const entry = (task) => ({ task, source: 'request', tier: 'M', tierReason: 'r', dependsOn: [] });
+  const { id } = core.initRun(ownRoot, { title: 'Stack', checkout, request: 'do it', layers: [entry('a'), entry('b')] });
+  const merge = core.ask(ownRoot, id, { question: 'Merge the stack? Which PR is the top?', options: ['#504', '#506'], sessionOnly: true }).id;
+  const bare = core.ask(ownRoot, id, { question: 'Deploy to staging?', sessionOnly: true }).id;
+  const config = path.join(ownRoot, 'config.json');
+  const s = await startAdminServer({ root: ownRoot, port: 0 });
+  const origin = `http://127.0.0.1:${s.address().port}`;
+  const ok = { origin, 'x-task-manager-admin': 'answer' };
+  const url = (q) => `/api/runs/${id}/questions/${q}/answer`;
+  const open = () => readRun(ownRoot, id).openQuestions.map((q) => q.id);
+  try {
+    // Off by default: the page cannot answer, also with a correct confirmation.
+    assert.equal((await post(s, url(merge), { answer: '#506', confirm: '#506' }, ok)).status, 409);
+    writeFileSync(config, JSON.stringify({ answers: { confirmOnPage: 'yes' } }));
+    assert.equal((await post(s, url(merge), { answer: '#506', confirm: '#506' }, ok)).status, 409);
+
+    writeFileSync(config, JSON.stringify({ answers: { confirmOnPage: true } }));
+    assert.equal(json(await request(s, '/api/settings')).confirmOnPage, true);
+    // No confirmation, a wrong one, one that differs in case or space, and an answer for another option.
+    assert.equal((await post(s, url(merge), { answer: '#506' }, ok)).status, 400);
+    for (const body of [
+      { answer: '#506', confirm: '506' },
+      { answer: '#506', confirm: '#506 ' },
+      { answer: '#506', confirm: 'yes' },
+      { answer: '#504', confirm: '#506' },
+      { answer: 'not yet', confirm: '#506' },
+      { answer: '#5060', confirm: '#506' },
+      // A comment could add a condition to the yes.
+      { answer: '#506 — but not #505', confirm: '#506' },
+      { answer: 'yes', confirm: 'YES' },
+    ]) {
+      const res = await post(s, url(body.confirm === 'YES' ? bare : merge), body, ok);
+      assert.equal(res.status, 409, JSON.stringify(body));
+      // Refused for the confirmation, not for another reason such as a setting that reads as off.
+      assert.match(json(res).error, /needs a confirmation|must be the confirmed option/, JSON.stringify(body));
+    }
+    assert.deepEqual(open(), [merge, bare]);
+
+    // The option typed exactly. A server that a session with no terminal started still acts for the user.
+    process.env.TASK_MANAGER_NO_TERMINAL = '1';
+    let res;
+    try {
+      res = await post(s, url(merge), { answer: '#506', confirm: '#506' }, ok);
+    } finally {
+      delete process.env.TASK_MANAGER_NO_TERMINAL;
+    }
+    assert.equal(res.status, 200, res.body);
+    const saved = readRun(ownRoot, id).questions.find((q) => q.id === merge);
+    assert.deepEqual([saved.answer, saved.via, saved.confirmed], ['#506', 'dashboard', true]);
+    // A question with no options takes the word "yes".
+    assert.equal((await post(s, url(bare), { answer: 'yes', confirm: 'yes' }, ok)).status, 200);
+    assert.deepEqual(open(), []);
+  } finally {
+    s.close();
+  }
 });

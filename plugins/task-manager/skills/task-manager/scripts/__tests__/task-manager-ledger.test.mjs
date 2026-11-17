@@ -1703,3 +1703,87 @@ test('U1. usage records what an agent used; show adds it up; bad numbers and an 
   const other = tempRoot();
   assert.doesNotMatch(cli(other, 'show', '--run', newRun(other)).stdout, /usage:/);
 });
+
+// ── A confirmed answer to a session-only question ───────────────────────────────────────────────
+
+test('K1. a session-only question takes a page answer only with the user setting and the exact option; the wait gives it as confirmed', async () => {
+  const { waitForAnswer } = await import('../lib/task-manager-core.mjs');
+  const root = tempRoot();
+  const id = newRun(root);
+  const q1 = JSON.parse(cli(root, 'ask', '--run', id, '--session-only', '--question', 'Merge the stack?', '--option', '#504', '--option', '#506').stdout).id;
+  const page = (...args) => cli(root, 'answer', '--run', id, '--id', q1, '--via', 'dashboard', ...args);
+  // Off by default, also with the right confirmation.
+  assert.match(page('--answer', '#506', '--confirm', '#506').stderr, /takes an answer in the session only/);
+  writeFileSync(path.join(root, 'config.json'), '{ not json');
+  assert.match(page('--answer', '#506', '--confirm', '#506').stderr, /takes an answer in the session only/);
+  writeFileSync(path.join(root, 'config.json'), JSON.stringify({ answers: { confirmOnPage: true } }));
+  assert.match(page('--answer', '#506').stderr, /needs a confirmation: type one of its options exactly \("#504", "#506"\)/);
+  assert.match(page('--answer', '#506', '--confirm', '506').stderr, /needs a confirmation/);
+  assert.match(page('--answer', '#504', '--confirm', '#506').stderr, /must be the confirmed option "#506" and nothing more/);
+  assert.match(page('--answer', '#5060', '--confirm', '#506').stderr, /must be the confirmed option "#506"/);
+  // A comment could add a condition to the yes, so a confirmed answer has none.
+  assert.match(page('--answer', '#506 — but not #505', '--confirm', '#506').stderr, /and nothing more/);
+  assert.equal(readRun(root, id).openQuestions.length, 1);
+  // A session that the page started cannot give the answer of the page.
+  process.env.TASK_MANAGER_NO_TERMINAL = '1';
+  try {
+    assert.match(page('--answer', '#506', '--confirm', '#506').stderr, /a session cannot give the answer of the admin page/);
+  } finally {
+    delete process.env.TASK_MANAGER_NO_TERMINAL;
+  }
+  // With no such variable, the same command is the page's own call: it works.
+  const ok = page('--answer', '#506', '--confirm', '#506');
+  assert.equal(ok.code, 0, ok.stderr);
+
+  // The mark is still there after the wait wrote its delivery line.
+  assert.deepEqual(await waitForAnswer(root, id, { pollMs: 5, timeoutMs: 5000 }), { answered: [{ id: q1, layer: null, answer: '#506', via: 'dashboard', confirmed: true }], reason: 'answered' });
+  const saved = readRun(root, id).questions.find((q) => q.id === q1);
+  assert.deepEqual([saved.confirmed, saved.delivered, saved.via], [true, true, 'dashboard']);
+  assert.match(readRun(root, id).events.at(-1).summary, /from the admin page, with a typed confirmation/);
+  assert.match(cli(root, 'show', '--run', id).stdout, /-> #506 \[confirmed on the admin page\]/);
+
+  // A session answer needs no confirmation, and an ordinary question ignores one.
+  const q2 = JSON.parse(cli(root, 'ask', '--run', id, '--session-only', '--question', 'Deploy?').stdout).id;
+  assert.equal(cli(root, 'answer', '--run', id, '--id', q2, '--answer', 'go').code, 0);
+  const q3 = JSON.parse(cli(root, 'ask', '--run', id, '--question', 'A or B?').stdout).id;
+  assert.equal(cli(root, 'answer', '--run', id, '--id', q3, '--answer', 'A', '--via', 'dashboard').code, 0);
+  assert.equal(readRun(root, id).questions.find((q) => q.id === q3).confirmed, undefined);
+  // With no options, the word is "yes".
+  const q4 = JSON.parse(cli(root, 'ask', '--run', id, '--session-only', '--question', 'Force-push?').stdout).id;
+  assert.match(cli(root, 'answer', '--run', id, '--id', q4, '--via', 'dashboard', '--answer', 'ok', '--confirm', 'ok').stderr, /type one of its options exactly \("yes"\)/);
+  assert.equal(cli(root, 'answer', '--run', id, '--id', q4, '--via', 'dashboard', '--answer', 'yes', '--confirm', 'yes').code, 0);
+});
+
+test('K2. [review] show gives the mark of an answer where a resume reads it: on a parked layer and in the layer view', () => {
+  const root = tempRoot();
+  const id = newRun(root);
+  writeFileSync(path.join(root, 'config.json'), JSON.stringify({ answers: { confirmOnPage: true } }));
+  cli(root, 'layer', '--run', id, '--layer', 'l1', '--set', 'phase=implementing');
+  const q1 = JSON.parse(cli(root, 'park', '--run', id, '--layer', 'l1', '--session-only', '--question', 'Deploy the fix to staging?', '--tip', 'a'.repeat(40)).stdout).id;
+  assert.equal(cli(root, 'answer', '--run', id, '--id', q1, '--via', 'dashboard', '--answer', 'yes', '--confirm', 'yes').code, 0);
+  assert.match(cli(root, 'show', '--run', id).stdout, /answer: yes \[confirmed on the admin page\] - ready to unpark/);
+  assert.match(cli(root, 'show', '--run', id, '--layer', 'l1').stdout, /q1 \[session only\]: Deploy the fix to staging\? -> yes \[confirmed on the admin page\]/);
+  // An ordinary answer from the page has its own mark, and a session answer has none.
+  const q2 = JSON.parse(cli(root, 'ask', '--run', id, '--layer', 'l2', '--question', 'A or B?').stdout).id;
+  cli(root, 'answer', '--run', id, '--id', q2, '--answer', 'A', '--via', 'dashboard');
+  const q3 = JSON.parse(cli(root, 'ask', '--run', id, '--layer', 'l2', '--question', 'C or D?').stdout).id;
+  cli(root, 'answer', '--run', id, '--id', q3, '--answer', 'C');
+  const view = cli(root, 'show', '--run', id, '--layer', 'l2').stdout;
+  assert.match(view, /q2: A or B\? -> A \[from the admin page\]/);
+  assert.match(view, /q3: C or D\? -> C$/);
+});
+
+test('K3. [review] an option is a text that the user can type again: not empty, and with no space around it', () => {
+  const root = tempRoot();
+  const id = newRun(root);
+  writeFileSync(path.join(root, 'config.json'), JSON.stringify({ answers: { confirmOnPage: true } }));
+  for (const bad of ['', '   ']) {
+    const out = cli(root, 'ask', '--run', id, '--session-only', '--question', 'Merge?', `--option=${bad}`, '--option', 'b');
+    assert.equal(out.code, 1);
+    assert.match(out.stderr, /option is required/);
+  }
+  assert.equal(readRun(root, id).questions.length, 0);
+  const q1 = JSON.parse(cli(root, 'ask', '--run', id, '--session-only', '--question', 'Merge?', '--option', ' #506 ').stdout).id;
+  assert.deepEqual(readRun(root, id).questions[0].options, ['#506']);
+  assert.equal(cli(root, 'answer', '--run', id, '--id', q1, '--via', 'dashboard', '--answer', '#506', '--confirm', '#506').code, 0);
+});
