@@ -26,6 +26,7 @@ import {
   followupFiled,
   initRun,
   listRuns,
+  notifyTest,
   park,
   readRun,
   resolve,
@@ -159,6 +160,7 @@ const COMMANDS = {
     addFollowup(root, need(v, 'run'), { layer: v.layer, title: need(v, 'title'), body: need(v, 'body'), dataLoss: v['data-loss'] }),
   'followup-filed': (v, root) => followupFiled(root, need(v, 'run'), need(v, 'id'), need(v, 'issue')),
   list: (v, root) => listRuns(root, { checkout: v.checkout, states: v.state ? v.state.split(',') : undefined }),
+  'notify-test': (v, root) => notifyTest(root),
   show: (v, root) => (v.layer ? showLayer(root, need(v, 'run'), v.layer) : show(root, need(v, 'run'))),
 };
 
