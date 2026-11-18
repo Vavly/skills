@@ -192,6 +192,19 @@ function parseHash() {
 let settings = { startSessions: false, confirmOnPage: false };
 
 /**
+ * True when no process gives an answer to a session: no watcher runs, and the page started no
+ * session. An open session can still be there, but it does not see an answer from this page.
+ */
+function noWatcher(state) {
+  return Boolean(state.session) && !state.session.watching && !state.session.started && state.run.state !== 'finished';
+}
+
+/** What the user does after an answer that no session watches for. */
+function tellSession(state) {
+  return `No session watches run ${state.run.id}. If its session is open, type a message there after your answer, for example "I answered on the admin page". If it is closed, run /task-manager resume ${state.run.id}${settings.startSessions ? ', or use "Start a session" on the run page' : ''}.`;
+}
+
+/**
  * Who works on a run, and the button that starts a session when nobody does. A session that
  * watches gets an answer by itself. With no session, an answer waits for a resume.
  */
@@ -739,7 +752,9 @@ function openAnswer(state, q) {
     strict ? null : h('label', { class: 'answer-option' }, 'Comment', comment),
     strict ? h('p', { class: 'warn-text' }, 'This question is about an action that cannot be undone, or that goes out of this machine. The session does that action when it gets your answer. It takes no comment: to say "not yet" or to add a condition, answer in the session.') : null,
     strict ? h('label', { class: 'answer-option' }, 'To confirm, type the option that you chose, exactly', typed) : null,
-    h('p', { class: 'muted small' }, 'The session of clone ', h('code', null, clone(state.run.checkout)), ' gets this answer from the run. If the session is closed, it gets the answer when you resume the run.'),
+    noWatcher(state)
+      ? h('p', { class: 'warn-text' }, tellSession(state))
+      : h('p', { class: 'muted small' }, 'The session of clone ', h('code', null, clone(state.run.checkout)), ' gets this answer from the run. If the session is closed, it gets the answer when you resume the run.'),
   );
   form.addEventListener('submit', (event) => event.preventDefault());
   openConfirm({
@@ -774,9 +789,9 @@ function answerControl(state, q) {
     event.stopPropagation();
     openAnswer(state, q);
   });
-  const idle = state.session && !state.session.watching && !state.session.started && state.run.state !== 'active';
-  const note = idle ? ` No session watches run ${state.run.id}: the answer waits for a resume${settings.startSessions ? ', or for "Start a session" on the run page' : ''}.` : ` or answer in the session (run ${state.run.id})`;
-  return h('p', { class: 'answer-row' }, button, h('span', { class: 'muted small' }, note));
+  // An active run with no watcher is the same for an answer as a paused one: no session gets it.
+  const alone = noWatcher(state);
+  return h('p', { class: 'answer-row' }, button, h('span', { class: alone ? 'warn-text small' : 'muted small' }, alone ? ` ${tellSession(state)}` : ` or answer in the session (run ${state.run.id})`));
 }
 
 function questionCard(state, q, showRun = false) {
@@ -827,6 +842,9 @@ function layerCard(state, l, showRun = false) {
         parkedQuestion ? h('p', { class: 'q' }, parkedQuestion.question) : null,
         parkedQuestion?.options?.length ? h('ul', { class: 'options' }, parkedQuestion.options.map((o) => h('li', null, o))) : null,
         parkedQuestion?.answer ? h('p', null, 'Answer: ', h('strong', null, parkedQuestion.answer), ' — ready to unpark') : null,
+        // An answer from this page that no watcher took, and nothing gives it to a session: the user
+        // must do that. An answer that a session has already needs no warning.
+        parkedQuestion?.answer && parkedQuestion.via === 'dashboard' && !parkedQuestion.delivered && noWatcher(state) ? h('p', { class: 'warn-text' }, tellSession(state).replace('after your answer', 'now')) : null,
         parkedQuestion ? answerControl(state, parkedQuestion) : null,
         h('p', { class: 'muted small' }, 'Clone ', h('code', null, clone(state.run.checkout))),
       )

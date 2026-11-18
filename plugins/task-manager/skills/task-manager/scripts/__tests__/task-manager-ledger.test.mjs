@@ -330,7 +330,9 @@ test('18. nextLayer skips blocked layers, takes the lowest free queued layer, an
   assert.equal(nextLayer(readRun(root, id).run), 'l2');
   phase(root, id, 'l2', 'pr_open');
   assert.equal(nextLayer(readRun(root, id).run), null, 'l3 and l4 depend on the parked l1');
-  assert.deepEqual(JSON.parse(cli(root, 'next', '--run', id).stdout), { next: null, ready: [], held: [], working: [], parallel: 1 });
+  // A question is open here, and no watcher runs: `next` also prints the reminder (test WR1).
+  const { watch: _reminder, ...blocked } = JSON.parse(cli(root, 'next', '--run', id).stdout);
+  assert.deepEqual(blocked, { next: null, ready: [], held: [], working: [], parallel: 1 });
 });
 
 test('19. unpark needs an answer, then places the layer above the highest PR layer and keeps its id', () => {
@@ -2045,7 +2047,8 @@ test('W1. a layer starts only when no other layer is in work; a parked layer and
   assert.equal(set('l3', 'phase=implementing').code, 0);
   // More changes on l1 (pr_open to fixing) is not a start, and the ledger does not judge it.
   assert.equal(set('l1', 'phase=fixing').code, 0);
-  assert.deepEqual(JSON.parse(cli(root, 'next', '--run', id).stdout), { next: 'l4', ready: [{ id: 'l4', outcome: 'pr', alone: true }], held: [], working: [{ id: 'l1', outcome: 'pr', phase: 'fixing' }, { id: 'l3', outcome: 'pr', phase: 'implementing' }], parallel: 1 });
+  const { watch: _reminder, ...inWork } = JSON.parse(cli(root, 'next', '--run', id).stdout);
+  assert.deepEqual(inWork, { next: 'l4', ready: [{ id: 'l4', outcome: 'pr', alone: true }], held: [], working: [{ id: 'l1', outcome: 'pr', phase: 'fixing' }, { id: 'l3', outcome: 'pr', phase: 'implementing' }], parallel: 1 });
 });
 
 test('W2. report layers work at the same time up to the limit of the run, and never with a pr layer', () => {
@@ -2272,4 +2275,47 @@ test('RR3. [real run] a run that a session left active takes a new session only 
   assert.throws(() => startSession(other.root, other.id, { evenIfActive: true }), /a session watches run/);
   cli(other.root, 'answer', '--run', other.id, '--id', q, '--answer', 'A');
   await waiting;
+});
+
+// ── The reminder of the answer watcher ──────────────────────────────────────────────────────────
+
+test('WR1. [real run] ask, park and next say when no answer watcher runs, and only then', async () => {
+  const { waitForAnswer, watchHint } = await import('../lib/task-manager-core.mjs');
+  const root = tempRoot();
+  const id = newRun(root, 2);
+  const out = (...args) => JSON.parse(cli(root, ...args).stdout);
+  // No open question: nothing to watch for.
+  assert.equal('watch' in out('next', '--run', id), false);
+  const hint = new RegExp(`^No answer watcher runs for this run.*Start one now, as a background command: L wait --run ${id} --timeout 900$`);
+  const asked = out('ask', '--run', id, '--question', 'A or B?');
+  assert.match(asked.watch, hint);
+  assert.match(out('next', '--run', id).watch, hint);
+  phase(root, id, 'l1', 'implementing');
+  const parked = out('park', '--run', id, '--layer', 'l1', '--question', 'Push refused. How do we continue?', '--tip', 'a'.repeat(40));
+  assert.match(parked.watch, hint);
+  // A session with no terminal starts no watcher, so it gets no reminder.
+  const quiet = JSON.parse(main(['next', '--run', id], { TASK_MANAGER_RUNS: root, TASK_MANAGER_NO_TERMINAL: '1' }).stdout);
+  assert.equal('watch' in quiet, false);
+  // While a watcher runs, the reminder is gone. After all answers, it stays gone.
+  const waiting = waitForAnswer(root, id, { pollMs: 5, timeoutMs: 5000 });
+  await new Promise((done) => setTimeout(done, 30));
+  assert.equal('watch' in out('next', '--run', id), false);
+  assert.equal('watch' in out('ask', '--run', id, '--question', 'C or D?'), false);
+  cli(root, 'answer', '--run', id, '--id', asked.id, '--answer', 'A');
+  await waiting;
+  assert.match(out('next', '--run', id).watch, hint);
+  // An answer from the admin page with no watcher: the reminder names it, until a watcher takes it.
+  const [first, ...rest] = readRun(root, id).openQuestions;
+  for (const q of rest) cli(root, 'answer', '--run', id, '--id', q.id, '--answer', 'x');
+  cli(root, 'answer', '--run', id, '--id', first.id, '--answer', 'x', '--via', 'dashboard');
+  assert.match(out('next', '--run', id).watch, new RegExp(`^An answer from the admin page waits \\(${first.id}\\), and no answer watcher runs.*L wait --run ${id} --timeout 900$`));
+  assert.deepEqual((await waitForAnswer(root, id, { pollMs: 5, timeoutMs: 5000 })).answered.map((q) => q.id), [first.id]);
+  assert.equal('watch' in out('next', '--run', id), false);
+  // A finished run needs no watcher, also with a question that stays open.
+  const other = tempRoot();
+  const closed = newRun(other, 1);
+  main(['ask', '--run', closed, '--question', 'Late?'], { TASK_MANAGER_RUNS: other });
+  assert.match(watchHint(other, closed, {}).watch, /No answer watcher/);
+  setRun(other, closed, [['state', 'finished']]);
+  assert.deepEqual(watchHint(other, closed, {}), {});
 });

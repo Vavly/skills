@@ -22,6 +22,7 @@ import {
   addMainPlan,
   addFollowup,
   addUsage,
+  watchHint,
   answer,
   ask,
   followupFiled,
@@ -145,10 +146,12 @@ const COMMANDS = {
       pr: v.pr,
       url: v.url,
     }),
-  ask: (v, root) => ask(root, need(v, 'run'), { layer: v.layer, question: need(v, 'question'), options: v.option, sessionOnly: v['session-only'] }),
+  ask: (v, root, env) => ({ ...ask(root, need(v, 'run'), { layer: v.layer, question: need(v, 'question'), options: v.option, sessionOnly: v['session-only'] }), ...watchHint(root, v.run, env) }),
   answer: (v, root) => answer(root, need(v, 'run'), need(v, 'id'), need(v, 'answer'), v.via, v.confirm),
-  park: (v, root) =>
-    park(root, need(v, 'run'), need(v, 'layer'), { question: v.question, questionId: v.id, options: v.option, tip: need(v, 'tip'), sessionOnly: v['session-only'] }),
+  park: (v, root, env) => ({
+    ...park(root, need(v, 'run'), need(v, 'layer'), { question: v.question, questionId: v.id, options: v.option, tip: need(v, 'tip'), sessionOnly: v['session-only'] }),
+    ...watchHint(root, v.run, env),
+  }),
   unpark: (v, root) =>
     unpark(root, need(v, 'run'), need(v, 'layer'), {
       base: need(v, 'base'),
@@ -157,9 +160,9 @@ const COMMANDS = {
       lastReviewed: v['last-reviewed'],
     }),
   'main-plan': (v, root) => addMainPlan(root, need(v, 'run'), need(v, 'file')),
-  next: (v, root) => {
+  next: (v, root, env) => {
     const state = readRun(root, need(v, 'run'));
-    return { next: state.next, ready: state.ready, held: state.held, working: state.working, parallel: state.run.parallel ?? 1 };
+    return { next: state.next, ready: state.ready, held: state.held, working: state.working, parallel: state.run.parallel ?? 1, ...watchHint(root, v.run, env) };
   },
   finding: (v, root) =>
     addFinding(root, need(v, 'run'), need(v, 'layer'), {
@@ -192,7 +195,7 @@ export function main(argv, env = process.env) {
     const { values } = parseArgs({ args: rest, options: OPTIONS, strict: true, allowPositionals: false });
     // A flag that promises no write must never be ignored by a command that writes.
     if (values['dry-run'] && command !== 'init') throw new LedgerError('--dry-run applies to init only');
-    const result = COMMANDS[command](values, resolveRoot(env));
+    const result = COMMANDS[command](values, resolveRoot(env), env);
     return { code: 0, stdout: typeof result === 'string' ? result : JSON.stringify(result) };
   } catch (error) {
     if (error instanceof LedgerError || error?.code?.startsWith?.('ERR_PARSE_ARGS')) {

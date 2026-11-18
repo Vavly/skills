@@ -205,6 +205,11 @@ more: it has no comment and no condition.
 
 **The answer watcher.** After each `L ask`, and after each `L park` that asks a question, start
 `L wait --run <id> --timeout 900` as a background command, unless one runs already for this run. Its only write is a delivery mark on an admin-page answer.
+**Start it before you write the question to the user, and before you stop your turn.** With no
+watcher, an answer from the admin page reaches no session, and the user waits for nothing.
+`L ask`, `L park` and `L next` print a `watch` field while no watcher runs, and a question is
+open or an answer from the admin page waits. When you see it, start the watcher as your next
+command.
 It does not block you: continue with the next layer. It ends when an open question gets an
 answer, and the harness then starts you again with its output: the question id, the layer, the
 answer and its source. Do not poll it. When it ends:
@@ -436,7 +441,7 @@ steps below leave it out. In each command, `--layer` takes the layer id.
 | A plan document that the user gave as a source (the intake of your kind file) | `L main-plan --file <path>`. It copies the file to `plans/main-<slug>.md` and prints the path. The same text is copied one time only. |
 | An out-of-scope item, and its issue when filed | `L followup [--layer] --title --body [--data-loss]`, `L followup-filed --id --issue` |
 | Anything else worth a line in the history | `L event --type <type> --summary` |
-| Read the state | `L show` (the run), `L show --layer <layer>` (one layer's findings, rulings, review rounds and questions), `L next` (it prints `next`, and also `held`: the layers that did not start and wait for an answer, `ready`: every layer that can start, with `alone: true` for a layer that is never in a group, `working`: the layers in work, and `parallel`: the limit of the run), `L list [--checkout] [--state]` |
+| Read the state | `L show` (the run), `L show --layer <layer>` (one layer's findings, rulings, review rounds and questions), `L next` (it prints `next`, and also `held`: the layers that did not start and wait for an answer, `ready`: every layer that can start, with `alone: true` for a layer that is never in a group, `working`: the layers in work, `parallel`: the limit of the run, and `watch`: the reminder to start the answer watcher, only when one is necessary), `L list [--checkout] [--state]` |
 
 Layer keys for `--set`: `phase` (`queued`, `implementing`, `review`, `fixing`, `final_checks`,
 `opening_pr`, `pr_open`, `merged`; a report layer: `queued`, `implementing`, `review`, `fixing`,
