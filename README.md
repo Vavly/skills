@@ -37,6 +37,7 @@ tool call denied rather than a gate that quietly does nothing.
 | Plugin | What it does |
 |---|---|
 | [**spec-gate**](plugins/spec-gate) | Moves oversight of AI-written code from *approving each tool call* to *reviewing each outcome*. A `Stop` hook refuses to end a turn on a diff that hasn't been through adversarial review; a `PreToolUse` hook blocks production code until a spec exists and you have approved it. Ships two reviewer subagents, three skills, and a Cursor adapter. |
+| [**task-manager**](plugins/task-manager) | An orchestrator for tasks that subagents do, each with a separate reviewer. Code changes end as reviewed pull requests, stacked or on the default branch. Investigations, plans, debug sessions and code executions end as reviewed reports. A ledger outside the repo makes every run resumable, and a local dashboard shows all runs. Project rules come from one profile file, so it works in any repository. |
 
 ### spec-gate
 

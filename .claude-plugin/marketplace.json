@@ -16,6 +16,16 @@
       "source": "./plugins/spec-gate",
       "category": "development",
       "homepage": "https://github.com/Vavly/skills/tree/main/plugins/spec-gate"
+    },
+    {
+      "name": "task-manager",
+      "description": "An orchestrator for tasks that subagents do, each with a separate reviewer. Code changes end as reviewed pull requests, stacked or on the default branch. Investigations, plans, debug sessions and code executions end as reviewed reports. A ledger outside the repo makes every run resumable, and a local dashboard shows all runs.",
+      "author": {
+        "name": "Ernesto Rodriguez"
+      },
+      "source": "./plugins/task-manager",
+      "category": "development",
+      "homepage": "https://github.com/Vavly/skills/tree/main/plugins/task-manager"
     }
   ]
 }

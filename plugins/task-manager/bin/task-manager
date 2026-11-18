@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+# task-manager: one short command for the dashboard and the ledger of the task-manager plugin.
+#
+#   task-manager admin [--port <n>] [--root <dir>] [--no-open]   start the dashboard, and open it
+#   task-manager admin stop [--port <n>]                         stop the dashboard
+#   task-manager runs                                            list the runs of this machine
+#   task-manager ledger <command> [options]                      run a ledger command
+#   task-manager install [--dir <folder>] [--force]              put this command on your PATH
+#   task-manager uninstall [--dir <folder>]                      remove it again
+#
+# It needs node 20 or later. It is bash 3.2-safe, for macOS.
+set -euo pipefail
+# With CDPATH, `cd` can go to another folder and print its name.
+unset CDPATH
+
+# The folder of a file, with every symbolic link followed. macOS has no `readlink -f`.
+self_dir() {
+  local src="$1" dir
+  while [ -L "$src" ]; do
+    dir=$(cd -P -- "$(dirname -- "$src")" && pwd)
+    src=$(readlink -- "$src")
+    case "$src" in
+      /*) ;;
+      *) src="$dir/$src" ;;
+    esac
+  done
+  cd -P -- "$(dirname -- "$src")" && pwd
+}
+
+HERE=$(self_dir "${BASH_SOURCE[0]}")
+PLUGIN=$(cd -- "$HERE/.." && pwd)
+SERVER="$PLUGIN/admin/server.mjs"
+LEDGER="$PLUGIN/skills/task-manager/scripts/task-manager-ledger.mjs"
+# The second line of a launcher file marks it as ours. `install` and `uninstall` change no other file.
+MARK='# task-manager-launcher: written by "task-manager install". Safe to delete.'
+
+usage() {
+  cat <<'USAGE'
+task-manager: one short command for the dashboard and the ledger of the task-manager plugin.
+
+  task-manager admin [--port <n>] [--root <dir>] [--no-open]   start the dashboard, and open it
+  task-manager admin stop [--port <n>]                         stop the dashboard
+  task-manager runs                                            list the runs of this machine
+  task-manager ledger <command> [options]                      run a ledger command
+  task-manager install [--dir <folder>] [--force]              put this command on your PATH
+  task-manager uninstall [--dir <folder>]                      remove it again
+
+install writes one launcher file, task-manager, into ~/.local/bin or into --dir. With --force it
+replaces a file of that name that it did not write.
+USAGE
+}
+
+need_node() {
+  if ! command -v node >/dev/null 2>&1; then
+    echo "task-manager: node is not installed; the dashboard and the ledger need node 20 or later" >&2
+    exit 1
+  fi
+}
+
+die() {
+  echo "task-manager: $1" >&2
+  exit 1
+}
+
+# A text in single quotes for a shell script. A quote in it is written as '\''.
+quote() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+# The folder for the launcher: --dir <folder>, or ~/.local/bin.
+target_dir=""
+force=0
+parse_install_args() {
+  target_dir="$HOME/.local/bin"
+  force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dir)
+        [ $# -ge 2 ] || die "--dir needs a folder"
+        [ -n "$2" ] || die "--dir needs a folder"
+        target_dir="$2"
+        shift 2
+        ;;
+      --force)
+        force=1
+        shift
+        ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
+}
+
+# True when the file is a launcher that `install` wrote. It reads the first two lines only.
+is_ours() {
+  [ -f "$1" ] && [ "$(sed -n '2{p;q;}' "$1")" = "$MARK" ]
+}
+
+# The marketplace of this plugin, when it runs from the plugin cache of Claude Code:
+# <...>/plugins/cache/<marketplace>/task-manager/<version>. Else nothing.
+marketplace_of_plugin() {
+  local parent grand
+  parent=$(dirname -- "$PLUGIN")
+  grand=$(dirname -- "$parent")
+  case "$PLUGIN" in
+    */plugins/cache/*/task-manager/*)
+      if [ "$(basename -- "$parent")" = "task-manager" ]; then basename -- "$grand"; fi
+      ;;
+  esac
+}
+
+install_launcher() {
+  parse_install_args "$@"
+  [ ! -e "$target_dir" ] || [ -d "$target_dir" ] || die "$target_dir is not a folder"
+  mkdir -p -- "$target_dir" || die "cannot make the folder $target_dir"
+  # An absolute folder: the launcher and the PATH must not depend on the current folder.
+  target_dir=$(cd -P -- "$target_dir" && pwd)
+  [ "$target_dir" != "$HERE" ] || die "$target_dir is the folder of the plugin's own command; choose another folder"
+  local file="$target_dir/task-manager"
+  [ ! -d "$file" ] || [ -L "$file" ] || die "$file is a folder; it stays"
+  if [ -e "$file" ] || [ -L "$file" ]; then
+    if ! is_ours "$file" && [ "$force" -ne 1 ]; then
+      die "$file exists and this command did not write it; give --force to replace it"
+    fi
+  fi
+  # Write a new file and move it into place. A redirect into "$file" would follow a symbolic link
+  # there and change the file that it points to. The move replaces the link itself.
+  local tmp
+  tmp=$(mktemp "$target_dir/.task-manager.XXXXXX") || die "cannot write into $target_dir"
+  {
+    echo '#!/usr/bin/env bash'
+    echo "$MARK"
+    echo "# It starts the task-manager command of the plugin. The values below are data."
+    echo "stored=$(quote "$HERE/task-manager")"
+    echo "marketplace=$(quote "$(marketplace_of_plugin)")"
+    cat <<'LAUNCHER'
+unset CDPATH
+target=""
+# A plugin update puts the new version into a new folder. Claude Code records the folder of the
+# installed version, so ask that record first, for the plugin of the same marketplace only.
+record="$HOME/.claude/plugins/installed_plugins.json"
+if [ -n "$marketplace" ] && [ -f "$record" ] && command -v node >/dev/null 2>&1; then
+  installed=$(node -e '
+    const fs = require("fs");
+    try {
+      const all = JSON.parse(fs.readFileSync(process.argv[1], "utf8")).plugins || {};
+      const entries = [].concat(all[process.argv[2]] || []).filter((e) => e && typeof e.installPath === "string");
+      entries.sort((a, b) => String(b.lastUpdated || b.installedAt || "").localeCompare(String(a.lastUpdated || a.installedAt || "")));
+      if (entries.length) process.stdout.write(entries[0].installPath);
+    } catch (error) {}
+  ' "$record" "task-manager@$marketplace" 2>/dev/null) || installed=""
+  if [ -n "$installed" ] && [ -x "$installed/bin/task-manager" ]; then target="$installed/bin/task-manager"; fi
+fi
+if [ -z "$target" ] && [ -x "$stored" ]; then target="$stored"; fi
+if [ -z "$target" ]; then
+  echo "task-manager: the task-manager plugin is not where this launcher expects it ($stored). Install the plugin again, then run its bin/task-manager install" >&2
+  exit 1
+fi
+exec "$target" "$@"
+LAUNCHER
+  } > "$tmp" || {
+    rm -f -- "$tmp"
+    die "cannot write into $target_dir"
+  }
+  chmod 755 "$tmp" || {
+    rm -f -- "$tmp"
+    die "cannot make the launcher executable"
+  }
+  mv -f -- "$tmp" "$file" || {
+    rm -f -- "$tmp"
+    die "cannot write $file"
+  }
+  echo "installed $file"
+  case ":$PATH:" in
+    *":$target_dir:"*) ;;
+    *) echo "This folder is not on your PATH yet. Add it in the profile of your shell: $target_dir" ;;
+  esac
+}
+
+uninstall_launcher() {
+  parse_install_args "$@"
+  local file="$target_dir/task-manager"
+  if [ ! -e "$file" ] && [ ! -L "$file" ]; then
+    echo "nothing to remove: $file does not exist"
+    return 0
+  fi
+  if ! is_ours "$file"; then
+    die "$file is not a launcher that this command wrote; it stays"
+  fi
+  rm -- "$file"
+  echo "removed $file"
+}
+
+run_admin() {
+  need_node
+  if [ "${1:-}" = "stop" ]; then
+    shift
+    exec node "$SERVER" --stop "$@"
+  fi
+  # Open the browser, as `/task-manager admin` does, unless --no-open is given.
+  local open=1 arg
+  local args=()
+  for arg in "$@"; do
+    if [ "$arg" = "--no-open" ]; then open=0; else args+=("$arg"); fi
+  done
+  if [ "$open" -eq 1 ]; then args+=("--open"); fi
+  # bash 3.2 with `set -u` fails on an empty array, so expand it only when it has an item.
+  exec node "$SERVER" ${args[@]+"${args[@]}"}
+}
+
+command="${1:-help}"
+[ $# -gt 0 ] && shift
+case "$command" in
+  admin) run_admin "$@" ;;
+  runs)
+    need_node
+    exec node "$LEDGER" list "$@"
+    ;;
+  ledger)
+    need_node
+    exec node "$LEDGER" "$@"
+    ;;
+  install) install_launcher "$@" ;;
+  uninstall) uninstall_launcher "$@" ;;
+  help | --help | -h) usage ;;
+  *)
+    echo "task-manager: unknown command $command" >&2
+    usage >&2
+    exit 1
+    ;;
+esac
