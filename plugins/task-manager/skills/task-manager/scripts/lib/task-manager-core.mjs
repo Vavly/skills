@@ -1569,6 +1569,27 @@ export function processAlive(pid, lstart) {
   return start === undefined || typeof lstart !== 'string' || start === lstart;
 }
 
+/**
+ * The reminder that `ask`, `park` and `next` print while no answer watcher runs, and a question is
+ * open or an answer from the admin page waits for its delivery: `{ watch: <text> }`, or `{}`. A rule that is only in the text of the skill is easy to
+ * skip, and an answer from the admin page then reaches no session. A session with no terminal
+ * starts no watcher (it ends, and the page starts a new one), so it gets no reminder.
+ */
+export function watchHint(root, runId, env = process.env) {
+  if (env.TASK_MANAGER_NO_TERMINAL === '1') return {};
+  // Not `load`: that refuses a finished run, and a reminder must never make a command fail.
+  const dir = runDir(root, runId);
+  const run = readJsonOrNull(path.join(dir, 'run.json'));
+  if (!run || run.state === 'finished' || sessionsOf(dir).watchers.length) return {};
+  const questions = foldLatest(readJsonl(path.join(dir, 'questions.jsonl')));
+  const start = `Start one now, as a background command: L wait --run ${run.id} --timeout 900`;
+  // An answer from the admin page that no watcher took: a watcher that starts now gives it at once.
+  const waiting = questions.filter((q) => q.via === 'dashboard' && !q.delivered && q.answer !== null && q.answer !== undefined);
+  if (waiting.length) return { watch: `An answer from the admin page waits (${waiting.map((q) => q.id).join(', ')}), and no answer watcher runs for this run. ${start}` };
+  if (!openQuestions(questions).length) return {};
+  return { watch: `No answer watcher runs for this run: an answer from the admin page does not reach you. ${start}` };
+}
+
 /** Who works on the run now: the PIDs of the live watchers, and the live started session or null. */
 export function sessionsOf(dir, alive = processAlive) {
   const watchers = [];
