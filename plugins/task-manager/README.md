@@ -60,7 +60,9 @@ At the start of a run, the orchestrator gives each task its outcome and chooses 
 - a **tasks run** in all other cases: each `pr` task has its PR on the default branch, with CI,
   and the run stops at the open PRs. It never merges.
 
-One checkout has one writer. The tasks run one at a time, no agent uses a git worktree, and one
+One checkout has one writer, and the ledger enforces it at the start of each task. Report tasks
+change nothing in the checkout, so up to 4 of them can work at the same time when the profile
+permits it ("Parallel report tasks"; the default is 1). All other tasks run one at a time, no agent uses a git worktree, and one
 checkout has one active run. A question about one task parks only that task.
 
 ## Preview before you start

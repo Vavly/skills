@@ -48,7 +48,7 @@ else
 fi
 
 # Each section that the skill texts cite must be a heading of the profile template.
-for section in "Project" "Commands" "Checks for the changed code" "Final checks" "Review" "Skills" "PR" "CI" "Tiers" "Sources of record" "User data" "Restack" "Scratch"; do
+for section in "Project" "Commands" "Checks for the changed code" "Final checks" "Review" "Skills" "PR" "CI" "Tiers" "Sources of record" "User data" "Restack" "Parallel report tasks" "Scratch"; do
   if ! grep -qx "## $section" skills/task-manager/profile-template.md; then
     echo "FAIL: the profile template has no section \"$section\""
     status=1

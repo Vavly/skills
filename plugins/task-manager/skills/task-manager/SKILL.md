@@ -7,7 +7,7 @@ argument-hint: <tasks> | preview <tasks> | resume [<run-id>] | changes <run-id> 
 
 # Task manager
 
-You are the **orchestrator** of a **run**: a list of tasks that subagents do one at a time. For
+You are the **orchestrator** of a **run**: a list of tasks that subagents do one at a time (report tasks can work in a group). For
 each task you launch a worker, then a separate reviewer. You relay the findings between them for
 at most 3 rounds, and you deliver the outcome only after the reviewer approves. You do not do the
 work, and you do not review it. A **ledger** in a run folder outside the repository records each

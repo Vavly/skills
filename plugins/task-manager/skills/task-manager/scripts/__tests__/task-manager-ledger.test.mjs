@@ -330,7 +330,7 @@ test('18. nextLayer skips blocked layers, takes the lowest free queued layer, an
   assert.equal(nextLayer(readRun(root, id).run), 'l2');
   phase(root, id, 'l2', 'pr_open');
   assert.equal(nextLayer(readRun(root, id).run), null, 'l3 and l4 depend on the parked l1');
-  assert.deepEqual(JSON.parse(cli(root, 'next', '--run', id).stdout), { next: null });
+  assert.deepEqual(JSON.parse(cli(root, 'next', '--run', id).stdout), { next: null, ready: [], working: [], parallel: 1 });
 });
 
 test('19. unpark needs an answer, then places the layer above the highest PR layer and keeps its id', () => {
@@ -818,8 +818,8 @@ test('G26. a finished run refuses every write, except a reopen, a merge of an op
   assert.throws(() => setRun(root, id, [['state', 'active']]), new RegExp(`run ${other} is active`));
   assert.equal(readRun(root, id).run.state, 'finished');
   // A reopen to paused works, and with it the other writes.
-  setRun(root, id, [['state', 'paused'], ['nextStep', 'l3 starts']]);
-  setLayer(root, id, 'l3', [['phase', 'implementing']]);
+  setRun(root, id, [['state', 'paused'], ['nextStep', 'l2 continues']]);
+  setLayer(root, id, 'l2', [['round', '1']]);
   assert.equal(readRun(root, id).run.state, 'paused');
 });
 
@@ -2015,4 +2015,133 @@ test('E3. [review] the send step of an issue layer: park on a session-only quest
     assert.equal(set('phase=fixing').code, 0);
     assert.equal(readRun(root, id).layers[0].delivery, 'https://github.com/o/r/issues/1, https://github.com/o/r/issues/2');
   }
+});
+
+// ── One writer, and report layers in parallel ────────────────────────────────────────────────────
+
+test('W1. a layer starts only when no other layer is in work; a parked layer and a layer with its outcome do not count', () => {
+  const root = tempRoot();
+  const id = newRun(root, 4);
+  const set = (layer, ...pairs) => cli(root, 'layer', '--run', id, '--layer', layer, ...pairs.flatMap((p) => ['--set', p]));
+  assert.equal(set('l1', 'phase=implementing').code, 0);
+  const refused = set('l2', 'phase=implementing');
+  assert.equal(refused.code, 1);
+  assert.match(refused.stderr, /layer l2 cannot start: l1 is in work, and one checkout has one writer/);
+  // The message never tells how to get past the rule.
+  assert.doesNotMatch(refused.stderr, /parallel=/);
+  assert.equal(readRun(root, id).layers.find((l) => l.id === 'l2').phase, 'queued');
+  // The same in every phase in which an agent works on l1.
+  for (const phase of ['review', 'fixing', 'final_checks', 'opening_pr']) {
+    assert.equal(set('l1', `phase=${phase}`).code, 0);
+    assert.equal(set('l2', 'phase=implementing').code, 1, phase);
+  }
+  // A PR that is open: l1 has its outcome, so l2 can start.
+  assert.equal(set('l1', 'phase=pr_open').code, 0);
+  assert.equal(set('l2', 'phase=implementing').code, 0);
+  // A parked layer waits for the user: nobody works on it.
+  cli(root, 'park', '--run', id, '--layer', 'l2', '--question', 'q', '--tip', 'a'.repeat(40));
+  assert.equal(set('l3', 'phase=implementing').code, 0);
+  // More changes on l1 (pr_open to fixing) is not a start, and the ledger does not judge it.
+  assert.equal(set('l1', 'phase=fixing').code, 0);
+  assert.deepEqual(JSON.parse(cli(root, 'next', '--run', id).stdout), { next: 'l4', ready: [{ id: 'l4', outcome: 'pr', alone: true }], working: [{ id: 'l1', outcome: 'pr', phase: 'fixing' }, { id: 'l3', outcome: 'pr', phase: 'implementing' }], parallel: 1 });
+});
+
+test('W2. report layers work at the same time up to the limit of the run, and never with a pr layer', () => {
+  const root = tempRoot();
+  const entry = (task, outcome, extra = {}) => ({ task, source: 's', tier: 'S', tierReason: 'r', outcome, ...extra });
+  const id = initRun(root, { title: 'Audit', checkout: CHECKOUT, request: 'r', kind: 'tasks', date: '2026-11-06', layers: [entry('a', 'report'), entry('b', 'issue'), entry('c', 'comment'), entry('d', 'report'), entry('e', 'pr'), entry('f', 'report', { dependsOn: [1] })] }).id;
+  const set = (layer, ...pairs) => cli(root, 'layer', '--run', id, '--layer', layer, ...pairs.flatMap((p) => ['--set', p]));
+  const next = () => JSON.parse(cli(root, 'next', '--run', id).stdout);
+  // l6 waits for l1, so it is not ready.
+  assert.deepEqual(next().ready.map((l) => l.id), ['l1', 'l2', 'l3', 'l4', 'l5']);
+  // The default is one at a time, also for report layers.
+  assert.equal(set('l1', 'phase=implementing').code, 0);
+  const full = set('l2', 'phase=implementing');
+  assert.match(full.stderr, /1 report layer works now \(l1\), and this run permits 1 at the same time/);
+  assert.doesNotMatch(full.stderr, /--set/);
+
+  for (const bad of ['0', '5', 'many']) assert.equal(cli(root, 'run', '--run', id, '--set', `parallel=${bad}`).code, 1, bad);
+  assert.equal(cli(root, 'run', '--run', id, '--set', 'parallel=3').code, 0);
+  assert.equal(set('l2', 'phase=implementing').code, 0);
+  assert.equal(set('l3', 'phase=implementing').code, 0);
+  assert.match(set('l4', 'phase=implementing').stderr, /3 report layers work now \(l1, l2, l3\), and this run permits 3/);
+  // A pr layer never starts while a report layer is in work, whatever the limit.
+  assert.match(set('l5', 'phase=implementing').stderr, /layer l5 cannot start: l1, l2, l3 are in work/);
+  // The group keeps the order in which its layers started.
+  assert.match(cli(root, 'show', '--run', id).stdout, /1\. l1 [^\n]*\n[^\n]*\n  2\. l2 [^\n]*\n[^\n]*\n  3\. l3 /);
+  assert.match(cli(root, 'show', '--run', id).stdout, /in work: l1 \(implementing\), l2 \(implementing\), l3 \(implementing\); report layers at the same time: at most 3/);
+  assert.deepEqual([next().working.length, next().parallel], [3, 3]);
+
+  // One report is delivered: the next report can start, and l6 becomes ready.
+  writeFileSync(path.join(root, id, 'reports', 'report-a.md'), 'x');
+  assert.equal(set('l1', 'report=reports/report-a.md', 'phase=delivered').code, 0);
+  assert.equal(set('l4', 'phase=implementing').code, 0);
+  assert.deepEqual(next().ready.map((l) => l.id), ['l5', 'l6']);
+  // And no report layer starts while a pr layer is in work.
+  const other = tempRoot();
+  const mixed = initRun(other, { title: 'Mixed', checkout: CHECKOUT, request: 'r', kind: 'tasks', date: '2026-11-06', layers: [entry('p', 'pr'), entry('r', 'report')] }).id;
+  cli(other, 'run', '--run', mixed, '--set', 'parallel=4');
+  assert.equal(cli(other, 'layer', '--run', mixed, '--layer', 'l1', '--set', 'phase=implementing').code, 0);
+  assert.match(cli(other, 'layer', '--run', mixed, '--layer', 'l2', '--set', 'phase=implementing').stderr, /layer l2 cannot start: l1 is in work/);
+});
+
+test('W3. [review] the resume of a parked layer, a restack and a report that reads the code of a pr layer obey the one-writer rule', () => {
+  const entry = (task, outcome, extra = {}) => ({ task, source: 's', tier: 'S', tierReason: 'r', outcome, ...extra });
+  const tip = 'a'.repeat(40);
+  // A tasks run: a parked pr task cannot come back while reports work; a parked report can, also over the limit.
+  const root = tempRoot();
+  const id = initRun(root, { title: 'Mix', checkout: CHECKOUT, request: 'r', kind: 'tasks', date: '2026-11-06', layers: [entry('p', 'pr'), entry('a', 'report'), entry('b', 'report'), entry('c', 'report')] }).id;
+  const set = (layer, ...pairs) => cli(root, 'layer', '--run', id, '--layer', layer, ...pairs.flatMap((p) => ['--set', p]));
+  const unpark = (layer) => cli(root, 'unpark', '--run', id, '--layer', layer, '--base', 'main', '--base-tip', tip, '--head', tip);
+  cli(root, 'run', '--run', id, '--set', 'parallel=2');
+  set('l1', 'phase=implementing');
+  const q1 = JSON.parse(cli(root, 'park', '--run', id, '--layer', 'l1', '--question', 'q', '--tip', tip).stdout).id;
+  assert.equal(set('l2', 'phase=implementing').code, 0);
+  const q2 = JSON.parse(cli(root, 'park', '--run', id, '--layer', 'l2', '--question', 'q', '--tip', tip).stdout).id;
+  assert.equal(set('l3', 'phase=implementing').code, 0);
+  assert.equal(set('l4', 'phase=implementing').code, 0);
+  cli(root, 'answer', '--run', id, '--id', q1, '--answer', 'a');
+  cli(root, 'answer', '--run', id, '--id', q2, '--answer', 'a');
+  const refused = unpark('l1');
+  assert.equal(refused.code, 1);
+  assert.match(refused.stderr, /layer l1 cannot resume: l3, l4 are in work, and one checkout has one writer/);
+  assert.notEqual(readRun(root, id).layers.find((l) => l.id === 'l1').parked, null);
+  // The answer of a report layer does not wait for a free place in the group.
+  assert.equal(unpark('l2').code, 0);
+  assert.equal(readRun(root, id).working.length, 3);
+  // But it waits while a pr layer is in work.
+  const other = tempRoot();
+  const mixed = initRun(other, { title: 'Mix', checkout: CHECKOUT, request: 'r', kind: 'tasks', date: '2026-11-06', layers: [entry('a', 'report'), entry('p', 'pr')] }).id;
+  cli(other, 'layer', '--run', mixed, '--layer', 'l1', '--set', 'phase=implementing');
+  const q = JSON.parse(cli(other, 'park', '--run', mixed, '--layer', 'l1', '--question', 'q', '--tip', tip).stdout).id;
+  cli(other, 'layer', '--run', mixed, '--layer', 'l2', '--set', 'phase=implementing');
+  cli(other, 'answer', '--run', mixed, '--id', q, '--answer', 'a');
+  assert.match(cli(other, 'unpark', '--run', mixed, '--layer', 'l1', '--base', 'main', '--base-tip', tip, '--head', tip).stderr, /layer l1 cannot resume: l2 is in work/);
+
+  // A stack run: no start during a restack, and a report that reads the code of a pr layer works alone.
+  const stackRoot = tempRoot();
+  const stack = initRun(stackRoot, { title: 'Stack', checkout: CHECKOUT, request: 'r', kind: 'stack', date: '2026-11-06', layers: [entry('p', 'pr'), entry('a', 'report'), entry('b', 'report'), entry('m', 'report', { dependsOn: [1] }), entry('n', 'report', { dependsOn: [4] })] }).id;
+  const sset = (layer, ...pairs) => cli(stackRoot, 'layer', '--run', stack, '--layer', layer, ...pairs.flatMap((p) => ['--set', p]));
+  cli(stackRoot, 'run', '--run', stack, '--set', 'parallel=4');
+  sset('l1', 'phase=implementing');
+  sset('l1', 'phase=pr_open');
+  cli(stackRoot, 'run', '--run', stack, '--set', 'stage=restack');
+  assert.match(sset('l2', 'phase=implementing').stderr, /layer l2 cannot start: a restack runs/);
+  cli(stackRoot, 'run', '--run', stack, '--set', 'stage=layers');
+  // l4 reads the code of l1, and l5 waits for l4: both are marked, and l4 is never in a group.
+  assert.deepEqual(JSON.parse(cli(stackRoot, 'next', '--run', stack).stdout).ready, [{ id: 'l2', outcome: 'report', alone: false }, { id: 'l3', outcome: 'report', alone: false }, { id: 'l4', outcome: 'report', alone: true }]);
+  assert.equal(sset('l2', 'phase=implementing').code, 0);
+  assert.equal(sset('l3', 'phase=implementing').code, 0);
+  assert.match(sset('l4', 'phase=implementing').stderr, /layer l4 cannot start: l2, l3 are in work/);
+  // The other direction: nothing starts while l4 works.
+  for (const layer of ['l2', 'l3']) {
+    writeFileSync(path.join(stackRoot, stack, 'reports', `report-${layer}.md`), 'x');
+    assert.equal(sset(layer, `report=reports/report-${layer}.md`, 'phase=delivered').code, 0);
+  }
+  assert.equal(sset('l4', 'phase=implementing').code, 0);
+  // The limit of a run stays after a finish and a reopen, and a finished run refuses a change of it.
+  cli(stackRoot, 'run', '--run', stack, '--set', 'state=finished');
+  assert.equal(cli(stackRoot, 'run', '--run', stack, '--set', 'parallel=1').code, 1);
+  cli(stackRoot, 'run', '--run', stack, '--set', 'state=paused');
+  assert.equal(JSON.parse(cli(stackRoot, 'next', '--run', stack).stdout).parallel, 4);
 });

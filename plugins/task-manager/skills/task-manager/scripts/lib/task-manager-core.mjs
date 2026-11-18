@@ -405,6 +405,70 @@ export function nextLayer(run) {
   return null;
 }
 
+/** Phases in which an agent works on a layer. A parked layer in one of them waits: nobody works on it. */
+const WORKING = new Set(['implementing', 'review', 'fixing', 'final_checks', 'opening_pr']);
+/** The most report layers that can work at the same time. 1 means one at a time. */
+export const MAX_PARALLEL = 4;
+
+/** The layers that an agent works on now, in stack order. */
+export function workingLayers(run) {
+  return byPosition(run.layers).filter((l) => WORKING.has(l.phase) && !l.parked);
+}
+
+/** Every `queued` layer whose dependencies are complete, in stack order: the layers that can start. */
+export function readyLayers(run) {
+  return byPosition(run.layers).filter((l) => l.phase === 'queued' && waitsFor(run, l.id).length === 0);
+}
+
+/**
+ * True for a layer whose work needs the checkout for itself: a `pr` layer, and a report layer
+ * that depends on a `pr` layer (in a stack run, its worker reads the code of that layer, so the
+ * checkout is on that branch). Such a layer is never in a group.
+ */
+export function worksAlone(run, layer) {
+  if (!isReportLike(layer)) return true;
+  const byId = new Map(run.layers.map((l) => [l.id, l]));
+  const seen = new Set();
+  const stack = [...layer.dependsOn];
+  while (stack.length) {
+    const id = stack.pop();
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const dep = byId.get(id);
+    if (!dep) continue;
+    if (!isReportLike(dep)) return true;
+    stack.push(...dep.dependsOn);
+  }
+  return false;
+}
+
+/**
+ * Hard rule 1: one checkout has one writer. A layer goes into work (a start, or the resume of a
+ * parked layer) only when no agent works on another layer, and no restack runs. The one exception
+ * is a group of report layers that do not work alone: they change nothing in the checkout, so up
+ * to `run.parallel` of them can work at the same time. `overLimit` is false for a resume: a
+ * parked report layer was in the group before, and its answer must not wait for a free place.
+ */
+function assertCanWork(run, layer, { verb = 'start', overLimit = true } = {}) {
+  if (run.stage === 'restack') fail(`layer ${layer.id} cannot ${verb}: a restack runs, and it rewrites the branches of the checkout`);
+  const others = workingLayers(run).filter((l) => l.id !== layer.id);
+  if (!others.length) return;
+  const names = others.map((l) => l.id).sort(byLayerNumber).join(', ');
+  if (worksAlone(run, layer) || others.some((l) => worksAlone(run, l))) {
+    fail(
+      `layer ${layer.id} cannot ${verb}: ${names} ${others.length === 1 ? 'is' : 'are'} in work, and one checkout has one writer. ` +
+        'Only report layers that depend on no pr layer can work at the same time. Wait until no layer is in work',
+    );
+  }
+  const limit = run.parallel ?? 1;
+  if (overLimit && others.length >= limit) {
+    fail(
+      `layer ${layer.id} cannot ${verb}: ${others.length} report layer${others.length === 1 ? '' : 's'} work${others.length === 1 ? 's' : ''} now (${names}), ` +
+        `and this run permits ${limit} at the same time. The limit comes from the profile ("Parallel report tasks"): wait for a delivery`,
+    );
+  }
+}
+
 /**
  * Move a layer directly above the highest layer whose PR is open or merged. Every other layer
  * (parked, or not started) stays above it. This is the place of a layer that starts, and of a
@@ -418,6 +482,10 @@ function placeAboveBase(run, layerId) {
   rest.forEach((l, index) => {
     if (ANCHOR.has(l.phase) && !l.parked) anchor = index;
   });
+  // A group of report layers keeps the order in which its layers started.
+  if (isReportLike(self)) {
+    while (rest[anchor + 1] && isReportLike(rest[anchor + 1]) && WORKING.has(rest[anchor + 1].phase) && !rest[anchor + 1].parked) anchor += 1;
+  }
   rest.splice(anchor + 1, 0, self);
   rest.forEach((l, index) => {
     l.position = index + 1;
@@ -449,7 +517,7 @@ export function readRun(root, id) {
   }));
   // Only records: a line such as `null` is valid JSON, and it must not break `show`.
   const usage = readJsonl(path.join(dir, 'usage.jsonl'), errors).filter((r) => r !== null && typeof r === 'object' && !Array.isArray(r));
-  return { run: { ...run, kind: kindOf(run), mainPlans: run.mainPlans ?? [] }, layers, events, questions, openQuestions: open, followups, findings, usage, next: nextLayer(run), errors };
+  return { run: { ...run, kind: kindOf(run), mainPlans: run.mainPlans ?? [] }, layers, events, questions, openQuestions: open, followups, findings, usage, next: nextLayer(run), ready: readyLayers(run).map((l) => ({ id: l.id, outcome: outcomeOf(l), alone: worksAlone(run, l) })), working: workingLayers(run).map((l) => ({ id: l.id, outcome: outcomeOf(l), phase: l.phase })), errors };
 }
 
 // ── Writes ───────────────────────────────────────────────────────────────────────────────────────
@@ -841,6 +909,7 @@ function setLayerUnlocked(root, runId, layerId, pairs, summary) {
     if (layer.report) fail(`layer ${layer.id} is a pr layer: it has no report`);
     if (layer.delivery) fail(`layer ${layer.id} is a pr layer: it has no delivery`);
   }
+  if (before === 'queued' && WORKING.has(layer.phase)) assertCanWork(run, layer);
   if (before === 'queued' && layer.phase !== 'queued') placeAboveBase(run, layer.id);
   saveRun(dir, run);
   const phaseChanged = before !== layer.phase;
@@ -872,6 +941,8 @@ const RUN_SETTERS = {
   stage: (v) => oneOf('stage', v, STAGES),
   // `null` clears it when nothing is left to do.
   nextStep: (v) => (v === 'null' ? null : text('nextStep', v)),
+  // How many report layers can work at the same time. 1 is one at a time.
+  parallel: (v) => intIn('parallel', v, 1, MAX_PARALLEL),
   // The number of the native GitHub stack that links the run's PRs (the Stacks REST API).
   // `null` clears it after an unstack.
   stack: (v) => (v === 'null' ? null : intIn('stack', v, 1, Number.MAX_SAFE_INTEGER)),
@@ -1089,6 +1160,8 @@ function unparkUnlocked(root, runId, layerId, { base, baseTip, head, lastReviewe
   if (layer.parked.lastReviewed && lastReviewed === undefined) {
     fail('give --last-reviewed: the rebased counterpart of the last reviewed SHA, from the range-diff');
   }
+  // The layer comes back into work, in its recorded phase.
+  if (WORKING.has(layer.phase)) assertCanWork(run, layer, { verb: 'resume', overLimit: false });
   layer.parked = null;
   layer.base = base;
   layer.baseTip = baseTip;
@@ -1348,6 +1421,9 @@ export function show(root, runId) {
   if (state.usage.length) {
     const used = sumUsage(state.usage);
     lines.push(`usage: ${used.agents} agents, ${used.tokens} tokens, ${used.toolUses} tool uses, ${Math.round(used.durationMs / 60_000)} min of agent time${used.cost === null ? '' : `, $${used.cost.toFixed(2)}`}`);
+  }
+  if (state.working.length > 1 || (run.parallel ?? 1) > 1) {
+    lines.push(`in work: ${state.working.map((l) => `${l.id} (${l.phase})`).join(', ') || 'none'}; report layers at the same time: at most ${run.parallel ?? 1}`);
   }
   lines.push(`next ${tasks ? 'task' : 'layer'} that can move: ${state.next ?? 'none'}`);
   if (state.openQuestions.length) {

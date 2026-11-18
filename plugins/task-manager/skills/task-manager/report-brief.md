@@ -16,6 +16,10 @@ tells you to read first. Run every command as its "Commands" section says.
   remove what it wrote before you report. At the end, `git status -sb` must show a clean tree.
   If the orchestrator says that the folder has no git, skip the git commands of this brief, and
   change no file except the plan, the report and your scratch files.
+- **When other workers use the same checkout** (the orchestrator says so): write nothing into the
+  checkout, also no cache, no build output and no log. Run every command that writes in your own
+  copy outside the checkout, in the scratch folder that the orchestrator gave you. A dirty tree
+  cannot be traced to one worker, so it stops every task of the group.
 - **Nothing goes out.** Only read from systems outside this machine. File no issue, post no
   comment, send no message, start no deploy, and write to no database or service. If the task
   needs such an action, stop and report it as an open point.

@@ -90,6 +90,12 @@ Write only a command that works in this repository. Delete these comments when t
 - Conflict rules: <rules for files that many layers edit, for example a counted value that a test must confirm, or "none">
 - Checks after a rebase: <commands for each layer, and for the top of the stack>
 
+## Parallel report tasks
+
+<!-- Report tasks change nothing in the checkout, so some can work at the same time. 1 is one at a time. -->
+
+- Workers at the same time: <1 to 4; write 1 if a command of this project writes into the checkout and cannot run in a copy>
+
 ## Scratch
 
 - Scratch folder: <a gitignored folder for agent outputs, for example `tmp/`, or "none">
