@@ -152,6 +152,32 @@ this repository:
 node plugins/task-manager/admin/server.mjs --open [--port <n>] [--root <dir>]
 ```
 
+**A short command.** `bin/task-manager` in the plugin is one command for the dashboard and the
+ledger. Put it on your PATH one time:
+
+```
+plugins/task-manager/bin/task-manager install
+```
+
+This writes one small launcher file to `~/.local/bin/task-manager` (`--dir <folder>` for another
+place). It replaces only a launcher that it wrote. With `--force` it also replaces another file
+of that name. It never writes through a symbolic link, and it never replaces a folder. Then,
+from any folder:
+
+```
+task-manager admin             # start the dashboard and open it
+task-manager admin stop        # stop it
+task-manager runs              # list the runs of this machine
+task-manager ledger show --run <run-id>
+```
+
+A plugin update puts the new version into a new folder. When you install the launcher from the
+installed plugin, it asks the record of Claude Code (`~/.claude/plugins/installed_plugins.json`)
+for the current folder of the plugin, of the same marketplace only, on each run. When you install
+it from a clone of this repository, it runs that clone. `task-manager uninstall` removes the
+launcher. The command needs
+`bash` and `node`, so it is for macOS and Linux.
+
 The page is at http://127.0.0.1:4747/. Without `--open`, the server only prints the URL. If the
 port is in use, `--open` opens the page of the server that runs already.
 
@@ -257,6 +283,7 @@ follow `core.md` and the briefs. The plugin has no hooks.
 | `report-brief.md` | The agents of a report task |
 | `restack.md` | The restacker and the stack verifier |
 | `scripts/lib/task-manager-notify.mjs` | The senders of the notifications |
+| `bin/task-manager` | You: one short command for the dashboard and the ledger |
 | `setup.md`, `admin.md`, `profile-template.md` | The two side modes, and the profile |
 
 ## Test

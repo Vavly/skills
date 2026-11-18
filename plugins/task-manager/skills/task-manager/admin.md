@@ -7,6 +7,11 @@ levels above the folder of this file. If that file does not exist, the skill was
 with no plugin around it: tell the user to run `admin/server.mjs` from a clone of the plugin's
 repository.
 
+The plugin also has a command for the user's own terminal, `<skill>/../../bin/task-manager`
+(`task-manager admin`, `task-manager runs`). Its `install` writes a launcher into a folder of
+the user's PATH. Tell the user about it when they ask for a shorter command. Run `install` only
+when the user asks for it: it writes outside the project.
+
 1. Start the server in the background, with the arguments that the user gave:
    `node <server file> --open [--port <n>] [--root <dir>]`.
    `--open` opens the page in the user's default browser.

@@ -17,6 +17,15 @@ node --test skills/task-manager/scripts/__tests__/*.test.mjs || status=1
 echo "== admin =="
 node --test admin/test/*.test.mjs || status=1
 
+echo "== launcher =="
+# The command must be bash 3.2-safe: macOS ships that version as /bin/bash.
+if /bin/bash -n bin/task-manager && [ -x bin/task-manager ]; then
+  echo "ok: bin/task-manager parses and is executable"
+else
+  echo "FAIL: bin/task-manager does not parse with /bin/bash, or has no executable bit"
+  status=1
+fi
+
 echo "== skill files =="
 # Every file that a skill text links to must exist. A broken link is a rule that no agent reads.
 checked=0
