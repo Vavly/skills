@@ -28,6 +28,7 @@ import { Buffer } from 'node:buffer';
 import { homedir } from 'node:os';
 import * as path from 'node:path';
 import process from 'node:process';
+import { notify, notifyNow } from './task-manager-notify.mjs';
 
 export const SCHEMA = 1;
 
@@ -792,6 +793,10 @@ function setRunUnlocked(root, runId, pairs, summary) {
     type: before !== run.state ? 'state' : 'run_update',
     summary: summary || changes.join(', '),
   });
+  // A reopen (finished to paused) is the user's own action: it needs no notification.
+  if (before !== run.state && before !== 'finished' && (run.state === 'paused' || run.state === 'finished')) {
+    notify(root, { type: run.state, run: run.id, title: run.title, layer: null, text: run.nextStep ?? null });
+  }
   return { run: run.id, state: run.state, stage: run.stage };
 }
 
@@ -834,11 +839,22 @@ function writeQuestion(dir, run, { layer, question, options, sessionOnly = false
   return id;
 }
 
+/** What a notification says about a new question. */
+function questionEvent(run, { id, layer, question, sessionOnly }) {
+  return { type: 'question', run: run.id, title: run.title, layer: layer ?? null, questionId: id, text: question, sessionOnly: Boolean(sessionOnly) };
+}
+
+/** Send a test notification in place, and report each sender. It writes nothing. */
+export function notifyTest(root) {
+  return notifyNow(root, { type: 'question', run: 'test', title: 'Test notification', layer: null, questionId: 'q0', text: 'The notifications of the task manager work.', sessionOnly: false });
+}
+
 function askUnlocked(root, runId, { layer, question, options, sessionOnly }) {
   const { dir, run } = load(root, runId);
   const id = writeQuestion(dir, run, { layer, question, options, sessionOnly });
   saveRun(dir, run);
   addEvent(dir, { type: 'question', layer: layer ?? null, summary: `${id}: ${question}` });
+  notify(root, questionEvent(run, { id, layer, question, sessionOnly }));
   return { id };
 }
 
@@ -874,7 +890,8 @@ function parkUnlocked(root, runId, layerId, { question, questionId, options, tip
   for (const option of options ?? []) text('option', option);
   if (question !== undefined) text('question', question);
   let id = questionId;
-  if (id === undefined) {
+  const isNew = id === undefined;
+  if (isNew) {
     id = writeQuestion(dir, run, { layer: layerId, question, options, sessionOnly });
   } else {
     const existing = foldLatest(readJsonl(path.join(dir, 'questions.jsonl'))).find((q) => q.id === id);
@@ -893,6 +910,8 @@ function parkUnlocked(root, runId, layerId, { question, questionId, options, tip
   };
   saveRun(dir, run);
   addEvent(dir, { type: 'park', layer: layerId, round: layer.round, summary: `${id}: ${question}` });
+  // A question that `ask` recorded earlier got its notification then.
+  if (isNew) notify(root, questionEvent(run, { id, layer: layerId, question, sessionOnly }));
   return { id };
 }
 

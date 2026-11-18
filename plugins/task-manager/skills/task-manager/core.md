@@ -379,6 +379,7 @@ steps below leave it out. In each command, `--layer` takes the layer id.
 | A layer field changes: phase, round, branch, SHAs, agent ids, tier, escalation, PR | `L layer --layer <layer> --set key=value ...` |
 | A run field changes: state, stage, next step, CI | `L run --set key=value ...` |
 | A question to the user, and its answer | `L ask [--layer] [--session-only] --question --option ...`, `L answer --id --answer`. `--session-only` is for the questions that "The user can answer in two places" lists: the admin page cannot answer it. |
+| Test the user's notification settings | `L notify-test`. It sends one test notification in place, and prints what each sender did. `L` sends the real notifications itself, after `ask`, `park` and a change to `paused` or `finished`: you run no command for them. |
 | Wait for an answer, in the background | `L wait --run <id> [--timeout <seconds>]`. It prints `{"answered": [{id, layer, answer, via}], "reason"}` and ends. `reason` is `answered`, `no_open_question`, `run_finished` or `timeout`. |
 | Park a layer, and resume it | `L park --layer (--question --option ... [--session-only] \| --id) --tip`, `L unpark --layer --base --base-tip --head [--last-reviewed]` |
 | A finding, your ruling, its state after a fix | `L finding`, `L rule`, `L resolve` |

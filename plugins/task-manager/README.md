@@ -83,6 +83,33 @@ Agents write their plans and reports into the run folder. If your permission mod
 each write outside the project, add the folder to `permissions.additionalDirectories` in your
 settings.
 
+## Notifications
+
+The ledger can tell you when a run needs you, so you do not have to watch the dashboard. Put the
+settings in `config.json` in the runs folder (`~/.task-manager/runs/config.json`):
+
+```json
+{ "notify": { "desktop": true, "command": "my-notifier", "events": ["question", "finished"] } }
+```
+
+| Key | Meaning |
+|---|---|
+| `desktop` | `true` sends a desktop notification: `osascript` on macOS, `notify-send` on Linux. |
+| `command` | A shell command that runs for each event, for example a script that posts to a chat. |
+| `events` | Which events to send. The default is all three: `question` (a question opened), `paused` (the run waits for you) and `finished`. |
+
+The command gets the event as one line of JSON on stdin: `type`, `run`, `title`, `layer` and
+`text`, and for a `question` event also `questionId` and `sessionOnly`. A long text is cut to
+4000 characters. It gets the same values in the variables
+`TASK_MANAGER_EVENT`, `TASK_MANAGER_RUN`, `TASK_MANAGER_TITLE`, `TASK_MANAGER_LAYER`,
+`TASK_MANAGER_QUESTION_ID`, `TASK_MANAGER_TEXT` and `TASK_MANAGER_SESSION_ONLY`; a value that the
+event does not have is empty. No text of a run
+goes into the command line.
+
+With no file, nothing is sent. The file is per user and per machine, not per project, and
+`/task-manager setup` can write it. A sender that fails never stops a run: test the settings with
+`node skills/task-manager/scripts/task-manager-ledger.mjs notify-test`, which reports each sender.
+
 ## The dashboard
 
 `/task-manager admin` starts it and opens the page in your default browser. Or, from a clone of
@@ -136,6 +163,7 @@ follow `core.md` and the briefs. The plugin has no hooks.
 | `implementer-brief.md`, `reviewer-brief.md` | The agents of a `pr` task |
 | `report-brief.md` | The agents of a report task |
 | `restack.md` | The restacker and the stack verifier |
+| `scripts/lib/task-manager-notify.mjs` | The senders of the notifications |
 | `setup.md`, `admin.md`, `profile-template.md` | The two side modes, and the profile |
 
 ## Test

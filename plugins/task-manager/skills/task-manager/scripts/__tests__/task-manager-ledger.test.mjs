@@ -1290,3 +1290,139 @@ test('A6. [review] a layer can park on a session-only question, and the admin pa
   assert.match(cli(root, 'answer', '--run', id, '--id', q.id, '--answer', 'yes', '--via', 'dashboard').stderr, /in the session only/);
   assert.equal(cli(root, 'answer', '--run', id, '--id', q.id, '--answer', 'yes').code, 0);
 });
+
+// ── Notifications ────────────────────────────────────────────────────────────────────────────────
+
+/** Settings whose command appends each event, as one JSON line, to a file in the root. */
+function notifyRoot(extra = {}) {
+  const root = tempRoot();
+  const log = path.join(root, 'sent.jsonl');
+  writeFileSync(path.join(root, 'config.json'), JSON.stringify({ notify: { command: `cat >> "${log}"`, ...extra } }));
+  return { root, log };
+}
+
+/** The sender is a detached process: wait until it wrote `count` lines. */
+async function sentEvents(log, count) {
+  for (let i = 0; i < 200; i += 1) {
+    const lines = existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').filter(Boolean) : [];
+    if (lines.length >= count) return lines.map((line) => JSON.parse(line));
+    await new Promise((done) => setTimeout(done, 25));
+  }
+  throw new Error(`fewer than ${count} notifications after 5 s`);
+}
+
+test('N1. a new question, a paused run and a finished run each send one notification', async () => {
+  const { root, log } = notifyRoot();
+  const id = newRun(root);
+  const q1 = JSON.parse(cli(root, 'ask', '--run', id, '--layer', 'l1', '--question', 'A or B?', '--session-only').stdout).id;
+  assert.deepEqual(await sentEvents(log, 1), [{ type: 'question', run: id, title: 'Undo timeline', layer: 'l1', questionId: q1, text: 'A or B?', sessionOnly: true }]);
+  cli(root, 'layer', '--run', id, '--layer', 'l2', '--set', 'phase=implementing');
+  cli(root, 'park', '--run', id, '--layer', 'l2', '--question', 'C or D?', '--tip', 'a'.repeat(40));
+  assert.deepEqual((await sentEvents(log, 2))[1].text, 'C or D?');
+  cli(root, 'run', '--run', id, '--set', 'state=paused', '--set', 'nextStep=waits for the user');
+  assert.deepEqual((await sentEvents(log, 3))[2], { type: 'paused', run: id, title: 'Undo timeline', layer: null, text: 'waits for the user' });
+  cli(root, 'run', '--run', id, '--set', 'state=finished', '--set', 'nextStep=null');
+  assert.deepEqual((await sentEvents(log, 4))[3], { type: 'finished', run: id, title: 'Undo timeline', layer: null, text: null });
+});
+
+test('N2. a park on a question that was asked earlier, an answer and a stage change send nothing', async () => {
+  const { root, log } = notifyRoot();
+  const id = newRun(root);
+  const q1 = JSON.parse(cli(root, 'ask', '--run', id, '--layer', 'l1', '--question', 'A or B?').stdout).id;
+  // The senders are separate processes: wait for each one, so that the order in the file is sure.
+  await sentEvents(log, 1);
+  cli(root, 'layer', '--run', id, '--layer', 'l1', '--set', 'phase=implementing');
+  assert.equal(cli(root, 'park', '--run', id, '--layer', 'l1', '--id', q1, '--tip', 'a'.repeat(40)).code, 0);
+  cli(root, 'answer', '--run', id, '--id', q1, '--answer', 'A');
+  cli(root, 'run', '--run', id, '--set', 'stage=layers');
+  // A reopen of a finished run is the user's own action: it sends nothing.
+  cli(root, 'run', '--run', id, '--set', 'state=finished');
+  await sentEvents(log, 2);
+  cli(root, 'run', '--run', id, '--set', 'state=paused');
+  // A last question marks the end. A wrong notification from a step above started before it, so
+  // a short wait after the marker is sufficient to see it.
+  cli(root, 'ask', '--run', id, '--question', 'last?');
+  await sentEvents(log, 3);
+  await new Promise((done) => setTimeout(done, 300));
+  assert.deepEqual((await sentEvents(log, 3)).map((e) => [e.type, e.text]), [['question', 'A or B?'], ['finished', null], ['question', 'last?']]);
+});
+
+test('N3. the events list limits what is sent, and the command gets the event in its environment', async () => {
+  const root = tempRoot();
+  const log = path.join(root, 'env.txt');
+  writeFileSync(path.join(root, 'config.json'), JSON.stringify({ notify: { events: ['finished'], command: `printf '%s|%s|%s\\n' "$TASK_MANAGER_EVENT" "$TASK_MANAGER_RUN" "$TASK_MANAGER_TITLE" >> "${log}"` } }));
+  const id = newRun(root);
+  cli(root, 'ask', '--run', id, '--question', 'A or B?');
+  cli(root, 'run', '--run', id, '--set', 'state=paused');
+  cli(root, 'run', '--run', id, '--set', 'state=finished');
+  for (let i = 0; i < 200 && !existsSync(log); i += 1) await new Promise((done) => setTimeout(done, 25));
+  await new Promise((done) => setTimeout(done, 100));
+  assert.equal(readFileSync(log, 'utf8'), `finished|${id}|Undo timeline\n`);
+});
+
+test('N4. a question cannot inject shell code, and a command that fails does not fail the ledger', async () => {
+  const { root, log } = notifyRoot();
+  const id = newRun(root);
+  const marker = path.join(root, 'injected');
+  const evil = `"; touch "${marker}"; $(touch "${marker}") \`touch "${marker}"\``;
+  assert.equal(cli(root, 'ask', '--run', id, '--question', evil).code, 0);
+  assert.equal((await sentEvents(log, 1))[0].text, evil);
+  assert.equal(existsSync(marker), false);
+
+  for (const config of ['{ not json', JSON.stringify({ notify: { command: 'exit 7' } }), JSON.stringify({ notify: { command: '/no/such/program' } }), JSON.stringify({ notify: { events: ['nope'] } })]) {
+    writeFileSync(path.join(root, 'config.json'), config);
+    const out = cli(root, 'ask', '--run', id, '--question', 'still works?');
+    assert.equal(out.code, 0, out.stderr);
+  }
+});
+
+test('N5. notify-test reports each sender, a bad settings file, and no settings; the root with a settings file still lists its runs', () => {
+  const { root, log } = notifyRoot();
+  const id = newRun(root);
+  const ok = JSON.parse(cli(root, 'notify-test').stdout);
+  assert.deepEqual(ok.sent, [{ sender: 'command', ok: true }]);
+  assert.equal(JSON.parse(readFileSync(log, 'utf8').trim()).text, 'The notifications of the task manager work.');
+  assert.deepEqual(listRuns(root).runs.map((r) => r.id), [id]);
+
+  writeFileSync(path.join(root, 'config.json'), JSON.stringify({ notify: { command: 'echo no >&2; exit 3' } }));
+  assert.deepEqual(JSON.parse(cli(root, 'notify-test').stdout).sent, [{ sender: 'command', ok: false, reason: 'exit 3: no' }]);
+  writeFileSync(path.join(root, 'config.json'), '{ not json');
+  assert.match(JSON.parse(cli(root, 'notify-test').stdout).error, /is not valid JSON/);
+  assert.match(JSON.parse(cli(tempRoot(), 'notify-test').stdout).note, /nothing is sent/);
+});
+
+test('N6. the desktop command gets the text as arguments, never as script source', async () => {
+  const { desktopCommand, messageOf } = await import('../lib/task-manager-notify.mjs');
+  const event = { type: 'question', run: 'r', title: 'Undo "timeline"', layer: 'l2', text: 'A or B?\n" & do shell script "x' };
+  const mac = desktopCommand(event, 'darwin');
+  assert.equal(mac[0], 'osascript');
+  assert.equal(mac.at(-2), messageOf(event));
+  // A title that starts with `-e` would be one more line of script, without the `--` before it.
+  const dash = desktopCommand({ ...event, title: '-eproperty p : (do shell script "touch /tmp/x")' }, 'darwin');
+  assert.equal(dash.at(-3), '--');
+  assert.equal(dash.indexOf('--'), dash.length - 3);
+  assert.equal(mac.slice(1, -2).some((part) => part.includes('Undo') || part.includes('shell script')), false);
+  assert.deepEqual(desktopCommand(event, 'linux').slice(0, 2), ['notify-send', '--']);
+  assert.equal(desktopCommand(event, 'win32'), null);
+  assert.equal(desktopCommand({ ...event, text: 'x'.repeat(500) }, 'linux').at(-1).length, 240);
+});
+
+test('N7. [review] a long question is cut for the senders, so a command that reads nothing cannot hold the ledger process', async () => {
+  const { MAX_TEXT } = await import('../lib/task-manager-notify.mjs');
+  const { root, log } = notifyRoot();
+  const id = newRun(root);
+  cli(root, 'ask', '--run', id, '--question', 'x'.repeat(200_000));
+  const [event] = await sentEvents(log, 1);
+  assert.equal(event.text.length, MAX_TEXT);
+  // The ledger keeps the full question: only the notification is cut.
+  assert.equal(readRun(root, id).openQuestions[0].question.length, 200_000);
+
+  // The real CLI process must end at once, also when the command sleeps and reads no stdin.
+  writeFileSync(path.join(root, 'config.json'), JSON.stringify({ notify: { command: 'sleep 20' } }));
+  const file = path.join(root, 'long.txt');
+  writeFileSync(file, 'y'.repeat(120_000));
+  const started = Date.now();
+  const out = spawnSync(process.execPath, [CLI, 'ask', '--run', id, '--question', readFileSync(file, 'utf8')], { env: { ...process.env, TASK_MANAGER_RUNS: root }, encoding: 'utf8', timeout: 15_000 });
+  assert.equal(out.status, 0, out.stderr);
+  assert.ok(Date.now() - started < 10_000, `the CLI took ${Date.now() - started} ms`);
+});
