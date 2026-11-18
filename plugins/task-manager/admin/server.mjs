@@ -4,6 +4,7 @@
  * JSON API. It never writes a run file itself: the skill's helper is the only writer. Two things
  * run the helper, in the project's own clone:
  *   - "Mark as finished", which the user confirms on the page;
+ *   - "Archive" and "Bring back", for a finished project;
  *   - "Start a session", which the user confirms on the page, and only with the user's setting
  *     `resume.enabled` in config.json of the runs root (see startSession);
  *   - the PR sync: when GitHub says a layer's PR is merged, it records the merge (see createPrSync).
@@ -168,6 +169,23 @@ async function finishRun(root, id, helperFor) {
   if (target.state.run.state === 'finished') throw new HttpError(409, `run ${id} is already finished`);
   await runHelper(root, target, ['run', '--run', id, '--set', 'state=finished', '--summary', 'Marked finished in the task-manager admin UI']);
   return { id, state: readRun(root, id).run.state };
+}
+
+/** Archive a finished project, or bring it back: `run --set archived=true|false`. The page then hides it, or shows it again. */
+async function archiveRun(root, id, body, helperFor) {
+  if (typeof body.archived !== 'boolean') throw new HttpError(400, 'give "archived": true or false');
+  const state = runState(root, id);
+  if (state.broken) throw new HttpError(409, `run ${id} cannot be read: ${state.broken}`);
+  if (state.run.state !== 'finished') throw new HttpError(409, `run ${id} is ${state.run.state}: only a finished project can be archived`);
+  if (body.archived && state.openQuestions.length) throw new HttpError(409, `run ${id} has an open question: answer it before you archive the project`);
+  // An old project is the main reason to archive, and its clone can be gone. The mark needs no
+  // clone: the helper runs in the runs root then.
+  const { checkout } = state.run;
+  const helper = helperFor(checkout);
+  if (!existsSync(helper)) throw new HttpError(409, `no task-manager helper at ${helper}`);
+  const cwd = path.isAbsolute(checkout) && existsSync(checkout) ? checkout : root;
+  await runHelper(root, { checkout: cwd, helper }, ['run', '--run', id, '--set', `archived=${body.archived}`]);
+  return { id, archived: readRun(root, id).run.archived === true };
 }
 
 /** True when the user's settings permit the page to start a session. A bad file means no. */
@@ -448,6 +466,16 @@ export function createHandler(root, port, { helperFor = helperOf, sync = createP
         }
         checkWrite(req, port(), 'finish');
         sendJson(res, 200, await finishRun(root, decode(finish[1]), helperFor));
+        return;
+      }
+      const archive = /^\/api\/runs\/([^/]+)\/archive$/.exec(pathname);
+      if (archive) {
+        if (req.method !== 'POST') {
+          res.setHeader('Allow', 'POST');
+          throw new HttpError(405, 'only POST is accepted here');
+        }
+        checkWrite(req, port(), 'archive');
+        sendJson(res, 200, await archiveRun(root, decode(archive[1]), await readJsonBody(req), helperFor));
         return;
       }
       const session = /^\/api\/runs\/([^/]+)\/session$/.exec(pathname);

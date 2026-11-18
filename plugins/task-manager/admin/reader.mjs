@@ -392,6 +392,8 @@ export function listRuns(root, { at = Date.now() } = {}) {
     prsMerged: layers.filter((l) => l.pr && l.phase === 'merged').length,
     openQuestions: open.length,
     updated: run.updated,
+    created: run.created ?? null,
+    archived: run.archived === true,
     lastEvent,
     stale,
   }));
@@ -404,7 +406,7 @@ export function listRuns(root, { at = Date.now() } = {}) {
  */
 export function readBoard(root, { at = Date.now() } = {}) {
   return scanRuns(root, at, ({ run, layers, questions, openQuestions: open, next, lastEvent, stale, plans, session, usage }) => ({
-    run: { id: run.id, title: run.title, kind: run.kind, state: run.state, stage: run.stage, checkout: run.checkout, nextStep: run.nextStep },
+    run: { id: run.id, title: run.title, kind: run.kind, state: run.state, stage: run.stage, checkout: run.checkout, nextStep: run.nextStep, archived: run.archived === true },
     layers,
     // The Tasks view links a report only when its file is there, so it needs the file names.
     plans,

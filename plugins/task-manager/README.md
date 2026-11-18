@@ -225,8 +225,15 @@ the settings of the clone (`.claude/` in it) with no trust question, so turn thi
 clones that you know, and in which you do not work at the same time. A permission that you give
 in `args` is a permission for a session that nobody watches: give the smallest one that works.
 
-The page never writes a run file. It asks for four changes, and each one runs the ledger script
-in the project's checkout: "Mark as finished", an answer to a question, "Start a session", and the
+**Search and archive.** The runs folder is for the full machine, so the lists grow. The Projects
+view and the Tasks view have a search box (title, id, clone, and for a task its text) and a
+filter for each clone. A finished project has an "Archive" button: the page then hides it from
+the board and from the lists, until you turn on "Show archived". A project with an open question
+cannot be archived, and a project whose clone is gone can. Nothing is deleted: the run
+folder stays as it is, "Bring back" removes the mark, and a reopen of the run removes it too.
+
+The page never writes a run file. It asks for five changes, and each one runs the ledger script
+in the project's checkout: "Mark as finished", "Archive", an answer to a question, "Start a session", and the
 record of a PR that GitHub says is merged. The
 server binds to 127.0.0.1, answers only its own Host name, and accepts a write only with its own
 Origin and the `X-Task-Manager-Admin` header.
