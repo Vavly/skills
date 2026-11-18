@@ -151,7 +151,10 @@ function writableRun(root, id, helperFor) {
 /** Run the helper of a clone on this root. The helper takes the run lock, validates and records an event. */
 function runHelper(root, { checkout, helper }, args) {
   return new Promise((resolvePromise, reject) => {
-    execFile(process.execPath, [helper, ...args], { cwd: checkout, env: { ...process.env, TASK_MANAGER_RUNS: root }, timeout: HELPER_TIMEOUT_MS }, (error, stdout, stderr) => {
+    // The page acts for the user, also when a session with no terminal started this server.
+    const env = { ...process.env, TASK_MANAGER_RUNS: root };
+    delete env.TASK_MANAGER_NO_TERMINAL;
+    execFile(process.execPath, [helper, ...args], { cwd: checkout, env, timeout: HELPER_TIMEOUT_MS }, (error, stdout, stderr) => {
       if (!error) return resolvePromise(stdout);
       const reason = String(stderr).trim().replace(/^error: /, '') || error.message;
       reject(new HttpError(409, `the helper did not make the change: ${reason}`));
@@ -171,6 +174,15 @@ async function finishRun(root, id, helperFor) {
 export function canStartSessions(root) {
   try {
     return JSON.parse(readFileSync(path.join(root, 'config.json'), 'utf8'))?.resume?.enabled === true;
+  } catch {
+    return false;
+  }
+}
+
+/** True when the user's settings permit a confirmed answer to a session-only question. A bad file means no. */
+export function canConfirmOnPage(root) {
+  try {
+    return JSON.parse(readFileSync(path.join(root, 'config.json'), 'utf8'))?.answers?.confirmOnPage === true;
   } catch {
     return false;
   }
@@ -231,12 +243,17 @@ async function answerQuestion(root, id, questionId, body, helperFor) {
   const question = target.state.questions.find((q) => q.id === questionId);
   if (!question) throw new HttpError(404, `no question ${questionId} in run ${id}`);
   if (question.answer !== null && question.answer !== undefined) throw new HttpError(409, `question ${questionId} already has an answer`);
-  if (question.sessionOnly) throw new HttpError(409, `question ${questionId} takes an answer in the session only`);
+  const confirm = typeof body.confirm === 'string' ? body.confirm : null;
+  if (question.sessionOnly && !canConfirmOnPage(root)) throw new HttpError(409, `question ${questionId} takes an answer in the session only`);
+  if (question.sessionOnly && confirm === null) throw new HttpError(400, `question ${questionId} needs a typed confirmation`);
+  if (confirm !== null && confirm.length > MAX_ANSWER) throw new HttpError(400, 'the confirmation is too long');
   const answer = typeof body.answer === 'string' ? body.answer.trim() : '';
   if (!answer) throw new HttpError(400, 'the answer is empty: choose an option or write a comment');
   if (answer.length > MAX_ANSWER) throw new HttpError(400, `the answer is longer than ${MAX_ANSWER} characters`);
   // `--answer=<text>`: an answer that starts with a dash must not read as an option.
-  await runHelper(root, target, ['answer', '--run', id, '--id', questionId, `--answer=${answer}`, '--via', 'dashboard']);
+  // The helper checks the confirmation again, under the run lock: it must be an option of the question.
+  const confirmArgs = question.sessionOnly ? [`--confirm=${confirm}`] : [];
+  await runHelper(root, target, ['answer', '--run', id, '--id', questionId, `--answer=${answer}`, '--via', 'dashboard', ...confirmArgs]);
   const saved = readRun(root, id).questions.find((q) => q.id === questionId);
   return { id: questionId, answer: saved?.answer ?? null };
 }
@@ -396,7 +413,7 @@ function route(root, pathname, res) {
     return;
   }
   if (pathname === '/api/settings') {
-    sendJson(res, 200, { startSessions: canStartSessions(root) });
+    sendJson(res, 200, { startSessions: canStartSessions(root), confirmOnPage: canConfirmOnPage(root) });
     return;
   }
   if (pathname === '/api/board') {

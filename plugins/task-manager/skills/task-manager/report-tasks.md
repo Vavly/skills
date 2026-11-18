@@ -39,8 +39,9 @@ approves it. The agent that does the task is the **worker**. The ledger records 
 2. **Nothing goes out.** The worker only reads from systems outside this machine. It files no
    issue, posts no comment, sends no message, starts no deploy, and writes to no database or
    service. If the task needs one of these actions, that is a question for the user (hard
-   rule 6): ask in text, and park the layer with `L park --session-only`. The yes comes in the
-   session, not from the admin page.
+   rule 6): ask in text, and park the layer with `L park --session-only`. Name the one action exactly in
+   the question. The yes comes in the session, or as a confirmed answer from the admin page ("A
+   confirmed answer" in `core.md`).
 
 **With no git repository.** A report task can run in a folder that is not a git repository. Then
 skip rule 1 and every git check of this file and of the resume in `core.md`. Where a ledger

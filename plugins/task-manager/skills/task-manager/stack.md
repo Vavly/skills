@@ -110,13 +110,15 @@ and two or more PRs are open:
    follow-up answer"`, and finish the run after the answer. With merges still to come, run `L run --set state=paused --set stage=finish
    --set nextStep="<the next step>"`, and record the merge question that waits:
    `L ask --session-only --question "Merge the stack? Which PR is the top?" --option "<top PR>"`.
-   The admin page cannot answer a session-only question: the merge yes comes in the session. It stays open
+   The merge yes comes in the session, or as a confirmed answer from the admin page ("A confirmed
+   answer" in `core.md`). It stays open
    until the user says yes, so the board shows that the run waits for the user. "Not yet" is not
    an answer: record it with `L event --type note --summary "merge: not yet, <reason>"`, and leave
    the question open.
 4. Merging. Merge only after the user's explicit yes (hard rule 6) to the question of step 3. Its
-   answer names the top PR of the merge, so do not ask a second question. Record the yes with
-   `L answer`, and `L run --set state=active --set stage=finish`. After the yes, you run the merge
+   answer names the top PR of the merge, so do not ask a second question. Record a yes from the
+   session with `L answer` (a confirmed answer from the admin page is in the ledger already), and
+   run `L run --set state=active --set stage=finish`. After the yes, you run the merge
    procedure of "GitHub stack". A stack merge merges every open PR below the chosen PR, and that PR,
    with one request. GitHub then retargets and rebases the PRs above it, so no restack is necessary,
    unless a PR shows a conflict.

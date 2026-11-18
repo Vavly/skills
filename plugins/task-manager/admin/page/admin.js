@@ -185,7 +185,7 @@ function parseHash() {
 }
 
 /** The settings of this user that the page needs: `startSessions` permits the "Start a session" button. */
-let settings = { startSessions: false };
+let settings = { startSessions: false, confirmOnPage: false };
 
 /**
  * Who works on a run, and the button that starts a session when nobody does. A session that
@@ -295,7 +295,7 @@ async function refresh({ force = false } = {}) {
   markMenu(route);
   try {
     const url = route.name === 'board' || route.name === 'tasks' ? '/api/board' : route.name === 'runs' ? '/api/runs' : `/api/runs/${enc(route.id)}`;
-    const [data, fresh] = await Promise.all([getJson(url), getJson('/api/settings').catch(() => ({ startSessions: false }))]);
+    const [data, fresh] = await Promise.all([getJson(url), getJson('/api/settings').catch(() => ({ startSessions: false, confirmOnPage: false }))]);
     if (mine !== token) return;
     settings = fresh;
     live.textContent = `Updated ${new Date().toLocaleTimeString()}`;
@@ -598,15 +598,21 @@ function answerText(option, comment) {
 /** Answer an open question from the page. The session reads the answer from the run's ledger. */
 function openAnswer(state, q) {
   const name = `answer-${q.id}`;
-  const options = q.options ?? [];
+  // A session-only question is about an action that cannot be undone. It takes an option only,
+  // and the user types that option again. With no options, the option is the word "yes".
+  const strict = Boolean(q.sessionOnly);
+  const options = strict && !(q.options ?? []).length ? ['yes'] : (q.options ?? []);
+  const typed = h('input', { type: 'text', class: 'answer-confirm', autocomplete: 'off', spellcheck: 'false' });
   const choice = (value, label) => h('label', { class: 'answer-option' }, h('input', { type: 'radio', name, value }), ' ', label);
   const comment = h('textarea', { class: 'answer-comment', rows: 3, maxlength: 1500, placeholder: options.length ? 'Add a comment (optional with an option)' : 'Write your answer' });
   const form = h(
     'form',
     { class: 'answer-form' },
     h('p', { class: 'q' }, q.question),
-    options.length ? h('div', { class: 'answer-options' }, options.map((o) => choice(o, o)), choice('', 'No option: my comment is the answer')) : null,
-    h('label', { class: 'answer-option' }, 'Comment', comment),
+    options.length ? h('div', { class: 'answer-options' }, options.map((o) => choice(o, o)), strict ? null : choice('', 'No option: my comment is the answer')) : null,
+    strict ? null : h('label', { class: 'answer-option' }, 'Comment', comment),
+    strict ? h('p', { class: 'warn-text' }, 'This question is about an action that cannot be undone, or that goes out of this machine. The session does that action when it gets your answer. It takes no comment: to say "not yet" or to add a condition, answer in the session.') : null,
+    strict ? h('label', { class: 'answer-option' }, 'To confirm, type the option that you chose, exactly', typed) : null,
     h('p', { class: 'muted small' }, 'The session of clone ', h('code', null, clone(state.run.checkout)), ' gets this answer from the run. If the session is closed, it gets the answer when you resume the run.'),
   );
   form.addEventListener('submit', (event) => event.preventDefault());
@@ -618,7 +624,14 @@ function openAnswer(state, q) {
     url: `/api/runs/${enc(state.run.id)}/questions/${enc(q.id)}/answer`,
     action: 'answer',
     getBody: () => {
-      const answer = answerText(form.querySelector(`input[name="${name}"]:checked`)?.value ?? '', comment.value);
+      const chosen = form.querySelector(`input[name="${name}"]:checked`)?.value ?? '';
+      if (strict) {
+        // The answer is the option and nothing more: a comment could add a condition to the yes.
+        if (!chosen) throw new Error('Choose an option.');
+        if (typed.value !== chosen) throw new Error(`Type ${JSON.stringify(chosen)} exactly to confirm.`);
+        return { answer: chosen, confirm: typed.value };
+      }
+      const answer = answerText(chosen, comment.value);
       if (!answer) throw new Error('Choose an option or write a comment.');
       return { answer };
     },
@@ -628,8 +641,8 @@ function openAnswer(state, q) {
 /** The way to answer an open question: a button, or a note for a question that only the session takes. */
 function answerControl(state, q) {
   if (q.answer !== null && q.answer !== undefined) return null;
-  if (q.sessionOnly) return h('p', { class: 'muted small' }, 'Answer this question in the session of clone ', h('code', null, clone(state.run.checkout)), '. The page cannot answer it.');
-  const button = h('button', { type: 'button', class: 'btn answer' }, 'Answer');
+  if (q.sessionOnly && !settings.confirmOnPage) return h('p', { class: 'muted small' }, 'Answer this question in the session of clone ', h('code', null, clone(state.run.checkout)), '. The page cannot answer it.');
+  const button = h('button', { type: 'button', class: 'btn answer' }, q.sessionOnly ? 'Answer with a confirmation' : 'Answer');
   button.addEventListener('click', (event) => {
     event.preventDefault();
     event.stopPropagation();

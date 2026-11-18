@@ -835,7 +835,8 @@ function writeQuestion(dir, run, { layer, question, options, sessionOnly = false
     id,
     layer: layer ?? null,
     question: text('question', question),
-    options: options ?? [],
+    // An option is a text that the user can type again: not empty, and with no space around it.
+    options: (options ?? []).map((option) => text('option', option).trim()),
     // A session-only question (for example the merge yes) takes no answer from the admin page.
     sessionOnly: Boolean(sessionOnly),
     answer: null,
@@ -865,17 +866,59 @@ function askUnlocked(root, runId, { layer, question, options, sessionOnly }) {
 /** Where an answer came from: the user's message in the session, or the admin page. */
 export const ANSWER_VIAS = ['session', 'dashboard'];
 
-function answerUnlocked(root, runId, questionId, answerText, via = 'session') {
+/** How an answer came, for `show`: a session needs it to know if a session-only answer is the user's yes. */
+function answerMark(q) {
+  if (q.answer === null || q.answer === undefined) return '';
+  if (q.confirmed) return ' [confirmed on the admin page]';
+  return q.via === 'dashboard' ? ' [from the admin page]' : '';
+}
+
+/** True when this user permits a confirmed answer from the admin page to a session-only question. */
+export function confirmOnPage(root) {
+  const file = configPath(root);
+  if (!existsSync(file)) return false;
+  try {
+    return JSON.parse(readFileSync(file, 'utf8'))?.answers?.confirmOnPage === true;
+  } catch {
+    return false;
+  }
+}
+
+/** What the user must type for a question with no options. */
+export const CONFIRM_WORD = 'yes';
+
+/**
+ * Check a confirmed answer from the admin page to a session-only question. Such a question is
+ * about an action that cannot be undone, so one click is not sufficient: the user types the
+ * option that they choose, letter for letter, and the answer is that option and nothing more. A
+ * comment could add a condition ("#506, but not #505"), and then the text is not a plain yes. A
+ * question with no options takes the word `yes`. A session with no terminal can never give this
+ * answer: only the admin page does, for the user.
+ */
+function checkConfirmed(root, question, answerText, confirm) {
+  if (!confirmOnPage(root)) fail(`question ${question.id} takes an answer in the session only`);
+  if (process.env.TASK_MANAGER_NO_TERMINAL === '1') fail(`question ${question.id}: a session cannot give the answer of the admin page`);
+  const allowed = question.options?.length ? question.options : [CONFIRM_WORD];
+  if (typeof confirm !== 'string' || confirm.trim() === '' || !allowed.includes(confirm)) {
+    fail(`question ${question.id} needs a confirmation: type one of its options exactly (${allowed.map((o) => JSON.stringify(o)).join(', ')})`);
+  }
+  if (answerText !== confirm) {
+    fail(`the answer to question ${question.id} must be the confirmed option ${JSON.stringify(confirm)} and nothing more`);
+  }
+}
+
+function answerUnlocked(root, runId, questionId, answerText, via = 'session', confirm = undefined) {
   oneOf('via', via, ANSWER_VIAS);
   const { dir, run } = load(root, runId, { finishedOk: true });
   const file = path.join(dir, 'questions.jsonl');
   const current = foldLatest(readJsonl(file)).find((q) => q.id === questionId);
   if (!current) fail(`no question ${questionId}`);
   if (current.answer !== null && current.answer !== undefined) fail(`question ${questionId} is already answered`);
-  if (current.sessionOnly && via !== 'session') fail(`question ${questionId} takes an answer in the session only`);
-  appendLine(file, { ts: now(), id: questionId, answer: text('answer', answerText), via });
+  const confirmed = Boolean(current.sessionOnly) && via !== 'session';
+  if (confirmed) checkConfirmed(root, current, text('answer', answerText), confirm);
+  appendLine(file, { ts: now(), id: questionId, answer: text('answer', answerText), via, ...(confirmed ? { confirmed: true } : {}) });
   saveRun(dir, run);
-  addEvent(dir, { type: 'answer', layer: current.layer, summary: `${questionId}: ${answerText}${via === 'dashboard' ? ' (from the admin page)' : ''}` });
+  addEvent(dir, { type: 'answer', layer: current.layer, summary: `${questionId}: ${answerText}${via === 'dashboard' ? (confirmed ? ' (from the admin page, with a typed confirmation)' : ' (from the admin page)') : ''}` });
   return { id: questionId };
 }
 
@@ -1183,7 +1226,7 @@ export function show(root, runId) {
       lines.push(
         `     PARKED on ${l.parked.question} at ${l.parked.phase} r${l.parked.round}` +
           ` (base tip ${l.parked.baseTip ?? '-'}, tip ${l.parked.tip}, last reviewed ${l.parked.lastReviewed ?? '-'})` +
-          (a ? `; answer: ${a.answer} - ready to unpark` : '; no answer yet'),
+          (a ? `; answer: ${a.answer}${answerMark(a)} - ready to unpark` : '; no answer yet'),
       );
     }
   }
@@ -1201,7 +1244,7 @@ export function show(root, runId) {
   const recentAnswers = [...answered.values()].slice(-5);
   if (recentAnswers.length) {
     lines.push('answered questions (last 5):');
-    for (const q of recentAnswers) lines.push(`  ${q.id}${q.layer ? ` (${q.layer})` : ' (run)'}: ${q.question} -> ${q.answer}`);
+    for (const q of recentAnswers) lines.push(`  ${q.id}${q.layer ? ` (${q.layer})` : ' (run)'}: ${q.question} -> ${q.answer}${answerMark(q)}`);
   }
   const openFollowups = state.followups.filter((f) => f.issue === null || f.issue === undefined);
   if (openFollowups.length) {
@@ -1251,7 +1294,7 @@ export function showLayer(root, runId, layerId) {
   const questions = state.questions.filter((q) => q.layer === l.id);
   if (questions.length) {
     lines.push('questions:');
-    for (const q of questions) lines.push(`  ${q.id}: ${q.question} -> ${q.answer ?? '(no answer yet)'}`);
+    for (const q of questions) lines.push(`  ${q.id}${q.sessionOnly ? ' [session only]' : ''}: ${q.question} -> ${q.answer ?? '(no answer yet)'}${answerMark(q)}`);
   }
   for (const error of state.errors) lines.push(`warning: ${error}`);
   return lines.join('\n');
@@ -1502,7 +1545,7 @@ export async function waitForAnswer(root, runId, { timeoutMs = 0, pollMs = 2000,
       }
     }
     if (give.length) {
-      return { answered: give.map((q) => ({ id: q.id, layer: q.layer ?? null, answer: q.answer, via: q.via ?? 'session' })), reason: 'answered' };
+      return { answered: give.map((q) => ({ id: q.id, layer: q.layer ?? null, answer: q.answer, via: q.via ?? 'session', ...(q.confirmed ? { confirmed: true } : {}) })), reason: 'answered' };
     }
     const open = questions.filter((q) => !isAnswered(q));
     for (const q of open) watched.add(q.id);
