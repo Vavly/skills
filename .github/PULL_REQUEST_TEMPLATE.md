@@ -20,5 +20,7 @@
 - [ ] A fix? Then it carries a regression case that fails without the fix.
 - [ ] New or changed shell is bash 3.2-safe (no `declare -A`, `mapfile`, `${var,,}`).
 - [ ] New scripts are committed with the executable bit set.
+- [ ] Changes what a plugin ships? Its `version` in `.claude-plugin/plugin.json` is
+      bumped, or `claude plugin update` installs nothing.
 - [ ] New plugin? It is registered in `.claude-plugin/marketplace.json` and listed
       in the root README.

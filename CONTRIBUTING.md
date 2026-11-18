@@ -65,6 +65,22 @@ Touch one, touch the other. `spec-gate`'s suite asserts they register the same
 events with the same matchers, scripts and timeouts, so drift fails CI rather than
 shipping a plugin that enforces less than its README claims.
 
+## Bump the version when a plugin changes
+
+Claude Code installs a plugin into a folder named after the `version` in its
+`.claude-plugin/plugin.json`, and treats an unchanged version as "already up to
+date". Merge a change without bumping it and `claude plugin update` installs
+nothing: the fix is on `main`, and every existing install keeps running the old
+code. `task-manager` shipped a fix this way and it reached nobody until 0.1.1.
+
+So any PR that changes what a plugin ships — skill text, scripts, hooks, the admin
+page — bumps that plugin's `version` in the same PR. Patch for a fix, minor for a
+feature. Changes that only touch tests, CI or repo-level docs do not need one.
+
+After the merge, existing installs pick it up with
+`claude plugin update <plugin>@vavly-skills` and a new session; an open session
+keeps the skill text it started with.
+
 ## Shell conventions
 
 - `#!/usr/bin/env bash`, and bash — not sh. Arrays, `<<<` and process substitution
