@@ -10,9 +10,12 @@
  *   run.json, events.jsonl, questions.jsonl, followups.jsonl, findings/<layer-id>.jsonl
  */
 import {
+  accessSync,
   appendFileSync,
   closeSync,
+  constants as fsConstants,
   existsSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -539,12 +542,74 @@ export function listRuns(root, { checkout, states } = {}) {
   return { runs, broken };
 }
 
+/** Phases in which the work of a layer is complete, so its usage records are complete too. */
+const COMPLETE = new Set(['pr_open', 'merged', 'delivered']);
+
+/**
+ * The mean tokens that a layer used in the earlier runs of this root, for each tier and outcome:
+ * `{ "S/report": { layers, tokensPerLayer }, "M/pr": ... }`. It reads the usage records.
+ *   - Only a layer whose work is complete counts: a layer in progress has a part of its usage.
+ *   - Only the records of a layer count: its workers and reviewers. A restacker and a stack
+ *     verifier have no layer.
+ *   - Every project of the root counts, not only one checkout.
+ * A run that cannot be read is skipped, and so is a link to a run folder.
+ */
+export function tierHistory(root) {
+  const sums = {};
+  if (!existsSync(root)) return sums;
+  for (const name of readdirSync(root)) {
+    const dir = path.join(root, name);
+    if (!RUN_ID.test(name) || lstatSync(dir).isSymbolicLink() || !existsSync(path.join(dir, 'usage.jsonl'))) continue;
+    let run;
+    try {
+      run = readRunJson(dir);
+    } catch {
+      continue;
+    }
+    const records = readJsonl(path.join(dir, 'usage.jsonl')).filter((r) => r !== null && typeof r === 'object' && typeof r.tokens === 'number');
+    for (const layer of run.layers) {
+      if (!COMPLETE.has(layer.phase)) continue;
+      const tokens = records.filter((r) => r.layer === layer.id).reduce((sum, r) => sum + r.tokens, 0);
+      if (!tokens) continue;
+      const key = `${layer.tier}/${outcomeOf(layer)}`;
+      sums[key] ??= { layers: 0, tokens: 0 };
+      sums[key].layers += 1;
+      sums[key].tokens += tokens;
+    }
+  }
+  return Object.fromEntries(Object.entries(sums).map(([key, sum]) => [key, { layers: sum.layers, tokensPerLayer: Math.round(sum.tokens / sum.layers) }]));
+}
+
+/** The id of the next run with this title: the date and the title, with a number when that folder exists. */
+function freeRunId(root, base) {
+  let id = base;
+  for (let n = 2; existsSync(path.join(root, id)); n += 1) id = `${base}-${n}`;
+  return id;
+}
+
+/** Fail when the runs root cannot be made or written: a real `init` would fail there too. */
+function assertRootWritable(root) {
+  let dir = root;
+  while (!existsSync(dir) && path.dirname(dir) !== dir) dir = path.dirname(dir);
+  try {
+    if (!statSync(dir).isDirectory()) throw new Error('not a folder');
+    accessSync(dir, fsConstants.W_OK);
+  } catch {
+    fail(`the runs folder ${root} cannot be made: ${dir} is not a folder that you can write`);
+  }
+}
+
 /**
  * Create a run. `layers` is an array of `{task, source, tier, tierReason, dependsOn}` in stack
  * order, where `dependsOn` holds 1-based indexes of earlier entries. A `tasks` run takes the same
- * array in work order, and its tasks are independent: no `dependsOn`.
+ * array in work order, and a task of it can wait only for a report task.
+ *
+ * With `dryRun`, check the same input and write nothing. The result shows the run that `init`
+ * would make, the runs of the checkout that a real start meets (`activeRun` blocks it, and a
+ * paused run makes a stack run ask "resume it, or start a new run"), and an estimate of the
+ * tokens from the earlier runs of this root.
  */
-export function initRun(root, { title, checkout, request, layers, kind = 'stack', date = now().slice(0, 10) }) {
+export function initRun(root, { title, checkout, request, layers, kind = 'stack', date = now().slice(0, 10), dryRun = false }) {
   oneOf('kind', kind, KINDS);
   text('title', title);
   text('checkout', checkout);
@@ -553,7 +618,7 @@ export function initRun(root, { title, checkout, request, layers, kind = 'stack'
   text('request', request);
   if (!Array.isArray(layers) || layers.length === 0) fail('the layers file must be a non-empty JSON array');
   const active = listRuns(root, { checkout, states: ['active'] }).runs;
-  if (active.length) fail(`run ${active[0].id} is active for this checkout; set it to paused or finished first`);
+  if (active.length && !dryRun) fail(`run ${active[0].id} is active for this checkout; set it to paused or finished first`);
 
   const built = layers.map((entry, index) => {
     const number = index + 1;
@@ -594,6 +659,23 @@ export function initRun(root, { title, checkout, request, layers, kind = 'stack'
       plan: null,
     };
   });
+
+  if (dryRun) {
+    assertRootWritable(root);
+    const history = tierHistory(root);
+    const past = (l) => history[`${l.tier}/${l.outcome}`];
+    return {
+      dryRun: true,
+      id: freeRunId(root, `${date}-${slugify(title)}`),
+      kind,
+      checkout,
+      activeRun: active[0]?.id ?? null,
+      pausedRuns: listRuns(root, { checkout, states: ['paused'] }).runs.map((r) => r.id),
+      layers: built.map((l) => ({ id: l.id, task: l.task, outcome: l.outcome, tier: l.tier, dependsOn: l.dependsOn, tokens: past(l)?.tokensPerLayer ?? null })),
+      // A total only when the earlier runs have a record for every tier and outcome of this plan.
+      estimate: { tokens: built.every(past) ? built.reduce((sum, l) => sum + past(l).tokensPerLayer, 0) : null, history },
+    };
+  }
 
   mkdirSync(root, { recursive: true });
   const base = `${date}-${slugify(title)}`;

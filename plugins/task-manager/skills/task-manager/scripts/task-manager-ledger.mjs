@@ -77,6 +77,7 @@ const OPTIONS = {
   body: { type: 'string' },
   'data-loss': { type: 'boolean' },
   'session-only': { type: 'boolean' },
+  'dry-run': { type: 'boolean' },
   via: { type: 'string' },
   confirm: { type: 'string' },
   timeout: { type: 'string' },
@@ -128,6 +129,7 @@ const COMMANDS = {
       request: readJsonFile(need(v, 'request-file'), 'request'),
       layers: readJsonFile(need(v, 'layers-file'), 'layers'),
       kind: v.kind,
+      dryRun: v['dry-run'],
     }),
   layer: (v, root) => setLayer(root, need(v, 'run'), need(v, 'layer'), pairs(v), v.summary),
   run: (v, root) => setRun(root, need(v, 'run'), pairs(v), v.summary),
@@ -184,6 +186,8 @@ export function main(argv, env = process.env) {
   }
   try {
     const { values } = parseArgs({ args: rest, options: OPTIONS, strict: true, allowPositionals: false });
+    // A flag that promises no write must never be ignored by a command that writes.
+    if (values['dry-run'] && command !== 'init') throw new LedgerError('--dry-run applies to init only');
     const result = COMMANDS[command](values, resolveRoot(env));
     return { code: 0, stdout: typeof result === 'string' ? result : JSON.stringify(result) };
   } catch (error) {

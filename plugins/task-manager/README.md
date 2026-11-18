@@ -58,6 +58,17 @@ At the start of a run, the orchestrator gives each task its outcome and chooses 
 One checkout has one writer. The tasks run one at a time, no agent uses a git worktree, and one
 checkout has one active run. A question about one task parks only that task.
 
+## Preview before you start
+
+`/task-manager preview <tasks>` shows what a run would do, and it starts nothing: no run, no
+agent, no question, no change. You get the run kind, each task with its outcome, tier and source,
+the order, the questions that the run would ask, and the blockers (a tree that is not clean, an
+active run, a missing GitHub remote). Start the run with `/task-manager <tasks>`.
+
+When earlier runs on this machine have usage records, you also get a token estimate. It is the
+mean of the complete tasks of those runs, for each tier and outcome, from all your projects, and
+it counts the workers and the reviewers only. Read it as an order of size, not as a price.
+
 ## The profile
 
 The skill holds no project rule. The commands, the checks, the CI start, the review skill, the PR

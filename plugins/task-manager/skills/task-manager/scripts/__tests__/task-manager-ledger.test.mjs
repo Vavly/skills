@@ -1,5 +1,6 @@
 import { strict as assert } from 'node:assert';
 import { spawn, spawnSync } from 'node:child_process';
+import * as fsForSnapshot from 'node:fs';
 import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
@@ -1786,4 +1787,143 @@ test('K3. [review] an option is a text that the user can type again: not empty, 
   const q1 = JSON.parse(cli(root, 'ask', '--run', id, '--session-only', '--question', 'Merge?', '--option', ' #506 ').stdout).id;
   assert.deepEqual(readRun(root, id).questions[0].options, ['#506']);
   assert.equal(cli(root, 'answer', '--run', id, '--id', q1, '--via', 'dashboard', '--answer', '#506', '--confirm', '#506').code, 0);
+});
+
+// ── A dry run of init ────────────────────────────────────────────────────────────────────────────
+
+/** Every file under a folder with its size and change time: equal snapshots mean that nothing was written. */
+function treeSnapshot(dir) {
+  const { statSync } = fsForSnapshot;
+  const out = [];
+  const walk = (folder) => {
+    for (const name of readdirSync(folder).sort()) {
+      const file = path.join(folder, name);
+      const stat = statSync(file);
+      out.push(`${path.relative(dir, file)} ${stat.size} ${stat.mtimeMs}`);
+      if (stat.isDirectory()) walk(file);
+    }
+  };
+  walk(dir);
+  return out;
+}
+
+test('D1. init --dry-run checks the plan and writes nothing; it reports the active and the paused runs of the checkout', () => {
+  const base = tempRoot();
+  const root = path.join(base, 'runs');
+  const request = path.join(base, 'request.txt');
+  const file = path.join(base, 'layers.json');
+  writeFileSync(request, 'do it');
+  writeFileSync(file, JSON.stringify([{ task: 'Find the cause', source: '#1', tier: 'S', tierReason: 'small', outcome: 'report' }, { task: 'Fix it', source: '#1', tier: 'M', tierReason: 'fix', dependsOn: [1] }, { task: 'Docs', source: '#2', tier: 'S', tierReason: 'text' }]));
+  const dry = (...extra) => cli(root, 'init', '--dry-run', '--kind', 'tasks', '--title', 'Undo timeline', '--checkout', CHECKOUT, '--request-file', request, '--layers-file', file, ...extra);
+  const out = dry();
+  assert.equal(out.code, 0, out.stderr);
+  const plan = JSON.parse(out.stdout);
+  assert.equal(plan.dryRun, true);
+  assert.match(plan.id, /^\d{4}-\d{2}-\d{2}-undo-timeline$/);
+  assert.deepEqual([plan.kind, plan.checkout, plan.activeRun, plan.pausedRuns], ['tasks', CHECKOUT, null, []]);
+  assert.deepEqual(plan.layers, [
+    { id: 'l1', task: 'Find the cause', outcome: 'report', tier: 'S', dependsOn: [], tokens: null },
+    { id: 'l2', task: 'Fix it', outcome: 'pr', tier: 'M', dependsOn: ['l1'], tokens: null },
+    { id: 'l3', task: 'Docs', outcome: 'pr', tier: 'S', dependsOn: [], tokens: null },
+  ]);
+  assert.deepEqual(plan.estimate, { tokens: null, history: {} });
+  // Nothing was written: not the root, and no run.
+  assert.equal(existsSync(root), false);
+
+  // An active run for the checkout blocks a real init. A dry run reports it and continues. With a
+  // root that has runs, the dry run changes no file in it.
+  const real = cli(root, 'init', '--kind', 'tasks', '--title', 'Undo timeline', '--checkout', CHECKOUT, '--request-file', request, '--layers-file', file);
+  const realId = JSON.parse(real.stdout).id;
+  const before = treeSnapshot(root);
+  const blocked = dry('--kind', 'stack');
+  assert.equal(blocked.code, 0, blocked.stderr);
+  assert.deepEqual(treeSnapshot(root), before);
+  const second = JSON.parse(blocked.stdout);
+  assert.equal(second.activeRun, realId);
+  // The id is the one that a real init gives now: that folder exists, so it gets a number.
+  assert.equal(second.id, `${realId}-2`);
+  cli(root, 'run', '--run', realId, '--set', 'state=paused');
+  const afterPause = JSON.parse(dry().stdout);
+  assert.deepEqual([afterPause.activeRun, afterPause.pausedRuns], [null, [realId]]);
+  assert.equal(JSON.parse(cli(root, 'init', '--kind', 'tasks', '--title', 'Undo timeline', '--checkout', CHECKOUT, '--request-file', request, '--layers-file', file).stdout).id, second.id);
+});
+
+test('D2. [review] a dry run and a real init refuse the same input; --dry-run is refused by every other command', () => {
+  const base = tempRoot();
+  const request = path.join(base, 'request.txt');
+  const file = path.join(base, 'layers.json');
+  writeFileSync(request, 'do it');
+  const entry = (extra = {}) => ({ task: 'A', source: 's', tier: 'S', tierReason: 'r', ...extra });
+  const cases = [
+    [[entry(), entry({ dependsOn: [1] })], 'tasks', /in a tasks run, dependsOn may name only report tasks/],
+    [[entry({ tier: 'XL' })], 'stack', /tier/],
+    [[entry({ task: '  ' })], 'stack', /task is required/],
+    [[entry({ dependsOn: [2] }), entry()], 'stack', /dependsOn may name only earlier layers/],
+    [[entry({ outcome: 'issue' })], 'tasks', /outcome/],
+    [[], 'stack', /non-empty JSON array/],
+  ];
+  for (const [layerList, kind, message] of cases) {
+    writeFileSync(file, JSON.stringify(layerList));
+    for (const flags of [[], ['--dry-run']]) {
+      const root = path.join(tempRoot(), 'runs');
+      const out = cli(root, 'init', ...flags, '--kind', kind, '--title', 'T', '--checkout', CHECKOUT, '--request-file', request, '--layers-file', file);
+      assert.equal(out.code, 1, `${JSON.stringify(layerList)} ${flags}`);
+      assert.match(out.stderr, message);
+      assert.equal(existsSync(root), false);
+    }
+  }
+  // A root that cannot be made fails the dry run too, with an input error.
+  writeFileSync(file, JSON.stringify([entry()]));
+  const blocker = path.join(base, 'a-file');
+  writeFileSync(blocker, '');
+  const noRoot = cli(path.join(blocker, 'runs'), 'init', '--dry-run', '--title', 'T', '--checkout', CHECKOUT, '--request-file', request, '--layers-file', file);
+  assert.equal(noRoot.code, 1);
+  assert.match(noRoot.stderr, /the runs folder .* cannot be made/);
+
+  // A flag that promises no write is never ignored by a command that writes.
+  const root = tempRoot();
+  const id = newRun(root);
+  const before = readFileSync(path.join(root, id, 'run.json'), 'utf8');
+  for (const args of [['run', '--run', id, '--set', 'nextStep=HELLO'], ['ask', '--run', id, '--question', 'A?'], ['decision', '--run', id, '--question', 'q', '--answer', 'a'], ['show', '--run', id]]) {
+    const out = cli(root, ...args, '--dry-run');
+    assert.equal(out.code, 1, args.join(' '));
+    assert.match(out.stderr, /--dry-run applies to init only/);
+  }
+  assert.equal(readFileSync(path.join(root, id, 'run.json'), 'utf8'), before);
+  assert.equal(readRun(root, id).questions.length, 0);
+});
+
+test('D3. the dry run estimates the tokens from the complete tasks of earlier runs, for each tier and outcome', async () => {
+  const { tierHistory } = await import('../lib/task-manager-core.mjs');
+  const { symlinkSync } = fsForSnapshot;
+  const root = tempRoot();
+  const first = initRun(root, { title: 'First', checkout: CHECKOUT, request: 'r', kind: 'tasks', date: '2026-11-01', layers: [{ task: 'a', source: 's', tier: 'S', tierReason: 'r', outcome: 'report' }, { task: 'b', source: 's', tier: 'M', tierReason: 'r' }, { task: 'c', source: 's', tier: 'M', tierReason: 'r' }, { task: 'd', source: 's', tier: 'M', tierReason: 'r' }, { task: 'e', source: 's', tier: 'L', tierReason: 'r' }] }).id;
+  for (const [layer, role, tokens] of [['l1', 'implementer', '1000'], ['l1', 'reviewer', '500'], ['l2', 'implementer', '4000'], ['l3', 'implementer', '6000'], ['l4', 'implementer', '100']]) {
+    assert.equal(cli(root, 'usage', '--run', first, '--layer', layer, '--role', role, '--tokens', tokens).code, 0);
+  }
+  assert.equal(cli(root, 'usage', '--run', first, '--role', 'restacker', '--tokens', '9999').code, 0);
+  // Complete: l1 (delivered), l2 and l3 (PR open). l4 still works, so its usage is a part only.
+  writeFileSync(path.join(root, first, 'reports', 'report-a.md'), 'x');
+  const file = path.join(root, first, 'run.json');
+  const run = JSON.parse(readFileSync(file, 'utf8'));
+  for (const [index, phase] of [[0, 'delivered'], [1, 'pr_open'], [2, 'merged'], [3, 'review']]) run.layers[index].phase = phase;
+  writeFileSync(file, JSON.stringify(run));
+  // Things in the root that are not a run of their own: a settings file, a broken run, a link to the run.
+  writeFileSync(path.join(root, 'config.json'), '{}');
+  mkdirSync(path.join(root, '2026-11-02-broken'));
+  writeFileSync(path.join(root, '2026-11-02-broken', 'usage.jsonl'), '{"layer":"l1","tokens":5}\n');
+  symlinkSync(path.join(root, first), path.join(root, '2026-11-03-link'));
+  appendFileSync(path.join(root, first, 'usage.jsonl'), 'null\n{"layer":"l9","tokens":7}\n{"layer":"l2","tokens":"many"}\n');
+
+  // l5 (tier L) has no record, l4 is not complete, and the restacker has no layer: none counts.
+  assert.deepEqual(tierHistory(root), { 'S/report': { layers: 1, tokensPerLayer: 1500 }, 'M/pr': { layers: 2, tokensPerLayer: 5000 } });
+
+  const plan = (entries) => initRun(root, { title: 'Next', checkout: '/other/clone', request: 'r', kind: 'tasks', dryRun: true, layers: entries.map(([tier, outcome]) => ({ task: tier, source: 's', tier, tierReason: 'r', outcome })) });
+  const known = plan([['S', 'report'], ['M', 'pr'], ['M', 'pr']]);
+  assert.equal(known.estimate.tokens, 11500);
+  assert.deepEqual(known.layers.map((l) => l.tokens), [1500, 5000, 5000]);
+  // The history of a report task is not the history of a pr task of the same tier.
+  const partial = plan([['S', 'pr'], ['M', 'pr'], ['L', 'pr']]);
+  assert.equal(partial.estimate.tokens, null);
+  assert.deepEqual(partial.layers.map((l) => l.tokens), [null, 5000, null]);
 });
