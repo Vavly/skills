@@ -28,7 +28,9 @@ import { Buffer } from 'node:buffer';
 import { homedir } from 'node:os';
 import * as path from 'node:path';
 import process from 'node:process';
-import { notify, notifyNow } from './task-manager-notify.mjs';
+import { fileURLToPath } from 'node:url';
+import { spawn, spawnSync } from 'node:child_process';
+import { configPath, notify, notifyNow } from './task-manager-notify.mjs';
 
 export const SCHEMA = 1;
 
@@ -1186,6 +1188,181 @@ export function showLayer(root, runId, layerId) {
   return lines.join('\n');
 }
 
+// ── Sessions of a run ────────────────────────────────────────────────────────────────────────────
+//
+// Two small files in the run folder tell who works on a run. Neither is run state. Each one holds
+// the start time of its process, and a reader compares it with the process that has the PID now.
+// So a file that a killed process left has no effect, also after the system gives its PID to
+// another process.
+//   watchers/<pid>   a `wait` command of a session runs: that session will get an answer.
+//   session.json     a session that `start-session` started: { pid, lstart, started, log }.
+
+/** The folder of the skill: `core.md` and the briefs, two levels above this file. */
+const SKILL_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+/** An active run with no event for this long has no session that works on it. */
+const IDLE_MS = 60 * 60 * 1000;
+
+const watchersDir = (dir) => path.join(dir, 'watchers');
+const sessionFile = (dir) => path.join(dir, 'session.json');
+
+function readJsonOrNull(file) {
+  try {
+    return JSON.parse(readFileSync(file, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The start time of a process, as `ps` prints it: a text that is the same on each call. `null`
+ * when no such process runs, also for a process that ended and that nobody collected (a zombie).
+ * `undefined` when this system has no usable `ps`: the caller then trusts the PID alone.
+ */
+export function processStart(pid) {
+  const out = spawnSync('ps', ['-o', 'stat=,lstart=', '-p', String(pid)], { encoding: 'utf8' });
+  if (out.error) return undefined;
+  const line = (out.stdout ?? '').trim();
+  if (out.status !== 0 || line === '') return null;
+  const [stat, ...rest] = line.split(/\s+/);
+  return stat.startsWith('Z') ? null : rest.join(' ');
+}
+
+/** True when the process that wrote a marker still runs: the same PID with the same start time. */
+export function processAlive(pid, lstart) {
+  if (!Number.isInteger(pid) || pid <= 0 || !processRuns(pid)) return false;
+  const start = processStart(pid);
+  if (start === null) return false;
+  return start === undefined || typeof lstart !== 'string' || start === lstart;
+}
+
+/** Who works on the run now: the PIDs of the live watchers, and the live started session or null. */
+export function sessionsOf(dir, alive = processAlive) {
+  const watchers = [];
+  if (existsSync(watchersDir(dir))) {
+    for (const name of readdirSync(watchersDir(dir))) {
+      const pid = Number(name);
+      if (alive(pid, readJsonOrNull(path.join(watchersDir(dir), name))?.lstart)) watchers.push(pid);
+    }
+  }
+  const started = readJsonOrNull(sessionFile(dir));
+  return { watchers, started: started && alive(started.pid, started.lstart) ? started : null };
+}
+
+/** Remove the markers of processes that ended. Only `start-session` calls it, under the run lock. */
+function removeDeadMarkers(dir, alive = processAlive) {
+  if (!existsSync(watchersDir(dir))) return;
+  for (const name of readdirSync(watchersDir(dir))) {
+    const file = path.join(watchersDir(dir), name);
+    if (!alive(Number(name), readJsonOrNull(file)?.lstart)) rmSync(file, { force: true });
+  }
+}
+
+/** The `resume` settings of this user: `{ enabled, command, args, checkouts }`, or a failure. */
+export function readResumeConfig(root) {
+  const file = configPath(root);
+  const given = existsSync(file) ? readJsonOrNull(file) : {};
+  if (given === null || typeof given !== 'object' || Array.isArray(given)) fail(`${file} is not a JSON object`);
+  const resume = given.resume ?? {};
+  if (typeof resume !== 'object' || Array.isArray(resume)) fail(`"resume" in ${file} must be an object`);
+  const command = resume.command ?? 'claude';
+  const args = resume.args ?? [];
+  const checkouts = resume.checkouts ?? null;
+  if (typeof command !== 'string' || command.trim() === '') fail(`"resume.command" in ${file} must be the name of a program`);
+  if (!Array.isArray(args) || !args.every((a) => typeof a === 'string')) fail(`"resume.args" in ${file} must be a list of texts`);
+  if (checkouts !== null && !(Array.isArray(checkouts) && checkouts.every((c) => typeof c === 'string' && path.isAbsolute(c)))) {
+    fail(`"resume.checkouts" in ${file} must be a list of absolute paths`);
+  }
+  return { enabled: resume.enabled === true, command, args, checkouts };
+}
+
+/**
+ * The permissions of a started session, as a settings text for the program. With no terminal the
+ * session cannot ask, so it gets exactly what the run needs outside its checkout: it reads the
+ * skill files and its own run folder, and it writes plans and reports. It must never edit the
+ * skill (the ledger runs from there with no permission check) or the settings file of the runs
+ * root (a command in it runs in a shell). The deny rules hold also when the user's arguments
+ * permit more.
+ */
+export function sessionSettings(root, runId) {
+  const at = (...parts) => `/${path.join(...parts).split(path.sep).join('/')}`;
+  const run = at(root, runId);
+  return JSON.stringify({
+    permissions: {
+      allow: [`Read(${at(SKILL_DIR)}/**)`, `Read(${run}/**)`, `Edit(${run}/plans/**)`, `Edit(${run}/reports/**)`],
+      deny: [`Edit(${at(SKILL_DIR)}/**)`, `Edit(${at(root, 'config.json')})`, `Edit(${run}/run.json)`, `Edit(${run}/*.jsonl)`, `Edit(${run}/session.json)`],
+    },
+  });
+}
+
+/** Variables that tie a process to the Claude session that started the admin server. */
+const SESSION_ENV = /^(CLAUDECODE|CLAUDE_PID|CLAUDE_CODE_CHILD_SESSION|CLAUDE_CODE_SESSION_ID|CLAUDE_CODE_ENTRYPOINT|CLAUDE_CODE_MESSAGING_.*)$/;
+
+/** The environment of a started session: this one, without the identity of another session. */
+export function sessionEnv(root, env = process.env) {
+  const kept = Object.fromEntries(Object.entries(env).filter(([key]) => !SESSION_ENV.test(key)));
+  return { ...kept, TASK_MANAGER_RUNS: root, TASK_MANAGER_NO_TERMINAL: '1' };
+}
+
+function lastEventTime(dir) {
+  const times = readJsonl(path.join(dir, 'events.jsonl')).map((e) => Date.parse(e.ts)).filter(Number.isFinite);
+  return times.length ? Math.max(...times) : 0;
+}
+
+/**
+ * Start a session that resumes the run, in the run's checkout, with no terminal. The admin page
+ * asks for it when no session works on the run. It needs the user's explicit setting
+ * (`resume.enabled` in config.json), because it starts a process that changes the checkout.
+ * The run id is the only run value in the command line, and its form is checked. The program
+ * starts with no shell.
+ */
+function startSessionUnlocked(root, runId, { spawnFn = spawn, alive = processAlive, at = Date.now() } = {}) {
+  const { dir, run } = load(root, runId);
+  const config = readResumeConfig(root);
+  if (!config.enabled) fail(`starting a session is off; set "resume": { "enabled": true } in ${configPath(root)}`);
+  let isDirectory = false;
+  try {
+    isDirectory = path.isAbsolute(run.checkout) && statSync(run.checkout).isDirectory();
+  } catch {
+    // No such path.
+  }
+  if (!isDirectory) fail(`the checkout ${run.checkout} of this run does not exist, or is not a folder`);
+  if (config.checkouts && !config.checkouts.some((c) => path.resolve(c) === path.resolve(run.checkout))) {
+    fail(`the checkout ${run.checkout} is not in "resume.checkouts" of ${configPath(root)}`);
+  }
+  // An active run belongs to the session that works on it. Only a long silence shows that the
+  // session is gone.
+  if (run.state === 'active' && at - lastEventTime(dir) < IDLE_MS) {
+    fail(`run ${run.id} is active: a session works on it. Start a session only for a paused run, or after ${IDLE_MS / 60_000} minutes with no event`);
+  }
+  removeDeadMarkers(dir, alive);
+  const sessions = sessionsOf(dir, alive);
+  if (sessions.watchers.length) fail(`a session watches run ${run.id} (process ${sessions.watchers.join(', ')}); it gets the answer itself`);
+  if (sessions.started) fail(`a started session works on run ${run.id} (process ${sessions.started.pid})`);
+  const log = path.join(dir, 'session.log');
+  const out = openSync(log, 'a');
+  let child;
+  try {
+    child = spawnFn(config.command, ['--settings', sessionSettings(root, run.id), ...config.args, '-p', `/task-manager resume ${run.id}`], {
+      cwd: run.checkout,
+      detached: true,
+      stdio: ['ignore', out, out],
+      env: sessionEnv(root),
+    });
+    child.on?.('error', () => {});
+  } catch (error) {
+    fail(`cannot start ${JSON.stringify(config.command)} in ${run.checkout}: ${error.message}`);
+  } finally {
+    closeSync(out);
+  }
+  if (!child.pid) fail(`cannot start ${JSON.stringify(config.command)} in ${run.checkout}; is the program installed and on the PATH?`);
+  child.unref?.();
+  const started = { pid: child.pid, lstart: processStart(child.pid) ?? null, started: now(), log };
+  writeAtomic(sessionFile(dir), `${JSON.stringify(started)}\n`);
+  addEvent(dir, { type: 'note', summary: `a session was started from the admin page (process ${child.pid})` });
+  return started;
+}
+export const startSession = locked(startSessionUnlocked);
+
 // ── Wait for an answer ───────────────────────────────────────────────────────────────────────────
 
 const isAnswered = (q) => q.answer !== null && q.answer !== undefined;
@@ -1203,13 +1380,36 @@ const isAnswered = (q) => q.answer !== null && q.answer !== undefined;
  * writes, so two waits on one run never give the same admin-page answer. It also ends when the run
  * is finished, when no question is open, or after `timeoutMs`.
  */
-export async function waitForAnswer(root, runId, { timeoutMs = 0, pollMs = 2000 } = {}) {
+export async function waitForAnswer(root, runId, { timeoutMs = 0, pollMs = 2000, handleSignals = false } = {}) {
   const dir = runDir(root, runId);
   const file = path.join(dir, 'questions.jsonl');
   readRunJson(dir);
   const watched = new Set();
   const started = Date.now();
   const fromPage = (q) => q.via === 'dashboard';
+  // Tell the admin page that a session will get the answer, while this wait runs.
+  const marker = path.join(watchersDir(dir), String(process.pid));
+  try {
+    mkdirSync(watchersDir(dir), { recursive: true });
+    writeFileSync(marker, JSON.stringify({ lstart: processStart(process.pid) ?? null }));
+  } catch {
+    // The marker is a hint for the page. The wait works without it.
+  }
+  // A closed session ends its background commands with a signal, and `finally` does not run then.
+  const onSignal = (signal) => {
+    rmSync(marker, { force: true });
+    process.exit(128 + (signal === 'SIGINT' ? 2 : signal === 'SIGHUP' ? 1 : 15));
+  };
+  const signals = handleSignals ? ['SIGTERM', 'SIGINT', 'SIGHUP'] : [];
+  for (const signal of signals) process.once(signal, onSignal);
+  try {
+    return await poll();
+  } finally {
+    for (const signal of signals) process.off(signal, onSignal);
+    rmSync(marker, { force: true });
+  }
+
+  async function poll() {
   for (;;) {
     const questions = foldLatest(readJsonl(file));
     // A session answer is news only for a wait that saw the question open. An admin-page answer
@@ -1241,5 +1441,6 @@ export async function waitForAnswer(root, runId, { timeoutMs = 0, pollMs = 2000 
     if (readRunJson(dir).state === 'finished') return { answered: [], reason: 'run_finished' };
     if (timeoutMs > 0 && Date.now() - started >= timeoutMs) return { answered: [], reason: 'timeout' };
     await new Promise((done) => setTimeout(done, pollMs));
+  }
   }
 }

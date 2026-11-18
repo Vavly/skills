@@ -139,9 +139,39 @@ field is always there. The page records the answer in the ledger. The session ha
 gets the answer at the next `/task-manager resume`. Some questions take an answer in the session only: a merge, an unstack, a dropped commit, a
 force-push, and an outward action of a report task (a deploy, a write to a database, a comment).
 
-The page never writes a run file. It asks for three changes, and each one runs the ledger script
-in the project's checkout: "Mark as finished", an answer to a question, and the record of a PR
-that GitHub says is merged. The
+**Start a session from the page.** A run shows who works on it: "a session watches" while a
+session waits for answers, and "no session" when an answer would wait for a resume. With your
+setting, the run page then has a "Start a session" button. It starts
+`claude -p "/task-manager resume <run-id>"` in the clone of the run, with no terminal, so an
+answer that you give on the page moves the work with no open session. The setting is in
+`config.json` in the runs folder, and it is off by default:
+
+```json
+{ "resume": { "enabled": true, "args": ["--allowedTools", "Bash(git *) Bash(node *)"], "checkouts": ["/path/to/a/clone"] } }
+```
+
+| Key | Meaning |
+|---|---|
+| `enabled` | `true` permits the button. Only you set it: the page and the sessions cannot. |
+| `args` | Arguments for the program, before the prompt. A session with no terminal cannot ask for a permission, so give it here the allow rules that your work needs. |
+| `checkouts` | Optional. Only a run in one of these clones can start a session. |
+| `command` | Optional. The program, in place of `claude`. |
+
+The ledger starts the session, and it refuses a run that a session works on: an active run with
+an event in the last hour, a run that a session watches, and a run with a started session that
+still runs. The session gets these permissions from the ledger, and no more: it reads the skill
+files and its own run folder, and it writes plans and reports there. It cannot edit the skill
+files or `config.json`, also when your `args` permit more. It does not get the identity of the
+session that started the dashboard.
+
+Its output goes to `session.log` in the run folder. It cannot take a session-only answer. It uses
+the settings of the clone (`.claude/` in it) with no trust question, so turn this on only for
+clones that you know, and in which you do not work at the same time. A permission that you give
+in `args` is a permission for a session that nobody watches: give the smallest one that works.
+
+The page never writes a run file. It asks for four changes, and each one runs the ledger script
+in the project's checkout: "Mark as finished", an answer to a question, "Start a session", and the
+record of a PR that GitHub says is merged. The
 server binds to 127.0.0.1, answers only its own Host name, and accepts a write only with its own
 Origin and the `X-Task-Manager-Admin` header.
 

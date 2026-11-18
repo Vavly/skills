@@ -36,6 +36,7 @@ import {
   setRun,
   show,
   showLayer,
+  startSession,
   unpark,
   waitForAnswer,
 } from './lib/task-manager-core.mjs';
@@ -161,6 +162,7 @@ const COMMANDS = {
   'followup-filed': (v, root) => followupFiled(root, need(v, 'run'), need(v, 'id'), need(v, 'issue')),
   list: (v, root) => listRuns(root, { checkout: v.checkout, states: v.state ? v.state.split(',') : undefined }),
   'notify-test': (v, root) => notifyTest(root),
+  'start-session': (v, root) => startSession(root, need(v, 'run')),
   show: (v, root) => (v.layer ? showLayer(root, need(v, 'run'), v.layer) : show(root, need(v, 'run'))),
 };
 
@@ -187,7 +189,7 @@ export async function waitCommand(rest, env = process.env) {
     const { values } = parseArgs({ args: rest, options: OPTIONS, strict: true, allowPositionals: false });
     const seconds = values.timeout === undefined ? 0 : Number(values.timeout);
     if (!Number.isFinite(seconds) || seconds < 0) throw new LedgerError(`--timeout must be a number of seconds; got ${JSON.stringify(values.timeout)}`);
-    const result = await waitForAnswer(resolveRoot(env), need(values, 'run'), { timeoutMs: seconds * 1000 });
+    const result = await waitForAnswer(resolveRoot(env), need(values, 'run'), { timeoutMs: seconds * 1000, handleSignals: true });
     return { code: 0, stdout: JSON.stringify(result) };
   } catch (error) {
     if (error instanceof LedgerError || error?.code?.startsWith?.('ERR_PARSE_ARGS')) return { code: 1, stderr: `error: ${error.message}` };

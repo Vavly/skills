@@ -944,3 +944,7 @@ tr.row-merged td {
   color: var(--panel);
   font-weight: 600;
 }
+
+.badge.session {
+  border-color: currentColor;
+}
