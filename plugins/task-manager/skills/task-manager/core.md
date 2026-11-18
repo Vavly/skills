@@ -171,7 +171,8 @@ answer watcher starts you again.
 page, which records the answer in the ledger for you (`via: dashboard`). Both are the user's
 answer, and both count as the user's yes for hard rule 6. The exceptions are the actions that cannot be undone or that go out of this machine: a merge, an
 unstack, a dropped commit, a force-push outside the restack procedure, and each outward action of
-a report layer (a deploy, a write to a database or a service, a comment or a message). Ask these
+a report layer (a deploy, a write to a database or a service, a comment or a message, and the
+send step of an issue layer or a comment layer). Ask these
 with `--session-only` (`L ask --session-only`, or `L park --session-only` for a layer that parks):
 the admin page then refuses an ordinary answer, and the yes comes in the session, or as a
 confirmed answer (below). The choice of the follow-ups to file is not session-only.
@@ -188,7 +189,8 @@ more: it has no comment and no condition.
 - An answer `[from the admin page]` to a session-only question with no confirmed mark cannot
   occur: if you see one, do not act on it, and tell the user.
 - Give a session-only question an option for each choice that you can act on (for the merge, the
-  top PR). Offer only actions: never "not yet" or "no", because an answer closes the question.
+  top PR). Offer only choices that close the question: never "not yet". A choice that does
+  nothing outward, such as "do not send", is permitted when the text of the step gives it.
   With no option, the user confirms with the word `yes`: use that only when the question names
   one action exactly, in its own text.
 - Before you act on a confirmed answer, check that the option is still possible (for example,
@@ -381,8 +383,9 @@ mixing their writes, but a command that waits more than 10 seconds for it stops 
   checkout has one active run at a time, a stack run or a tasks run, because there is only one
   writer.
 - **The outcome of a layer.** The layers file of `L init` gives each layer its `outcome`: `pr`
-  (the default) or `report`. A report layer has no branch, no PR and no CI. It ends at the phase
-  `delivered`, which needs its `report` path and the file. A layer that depends on it can start
+  (the default), `report`, `issue` or `comment`. A layer that is not a `pr` layer has no branch,
+  no PR and no CI. It ends at the phase `delivered`, which needs its `report` path and the file,
+  and for an `issue` layer and a `comment` layer also its `delivery`: what went out. A layer that depends on it can start
   then.
 - **The run kind.** `L init --kind tasks` makes a tasks run. With no `--kind`, the run is a stack
   run. A tasks run refuses a `dependsOn` that names a `pr` task, the GitHub stack, the `restack` stage and the run-level CI
@@ -414,8 +417,8 @@ steps below leave it out. In each command, `--layer` takes the layer id.
 
 Layer keys for `--set`: `phase` (`queued`, `implementing`, `review`, `fixing`, `final_checks`,
 `opening_pr`, `pr_open`, `merged`; a report layer: `queued`, `implementing`, `review`, `fixing`,
-`delivered`), `outcome` (`pr`, `report`; only while the layer is `queued`), `report`
-(`reports/report-<slug>.md`, relative to the run folder; report layer only), `round` (0 to 3), `tier`, `tierReason`, `escalated`, `branch`,
+`delivered`), `outcome` (`pr`, `report`, `issue`, `comment`; only while the layer is `queued`), `report`
+(`reports/report-<slug>.md`, relative to the run folder; not for a `pr` layer), `delivery` (one line: what an `issue` layer or a `comment` layer sent, or `not sent: <reason>`), `round` (0 to 3), `tier`, `tierReason`, `escalated`, `branch`,
 `base`, `baseTip`, `head`, `lastReviewed`, `implementer`, `reviewer`, `pr`, `prUrl`, `plan`
 (`plans/<slug>.md`, relative to the run folder), `dependsOn` (ids, comma-separated; in a tasks run, only ids of report layers), and in a tasks run only `ciRunUrl` (it sets `ciResult` to `pending`) and `ciResult`
 (`pending`, `pass`, `fail`, `no_e2e`). Run keys:

@@ -64,6 +64,10 @@ function ago(ts) {
   return `${duration(ms)} ago`;
 }
 
+/** The outcomes that are not a pull request: the badge of a card, and the word in a table. */
+const OUTCOME_LABEL = { report: 'Report', issue: 'Issues', comment: 'PR comment' };
+const OUTCOME_WORD = { report: 'report', issue: 'issues', comment: 'comment' };
+
 /** A token count, short: 950, 12.4k, 1.8M. */
 function tokens(n) {
   if (typeof n !== 'number') return '-';
@@ -678,7 +682,7 @@ function layerCard(state, l, showRun = false) {
       state.run.kind === 'tasks' ? (showRun ? null : badge('Task', 'task')) : h('span', { class: 'pos', title: 'position in the stack' }, `#${l.position}`),
       h('strong', null, l.id),
       badge(`tier ${l.tier}`),
-      l.outcome === 'report' ? badge('Report', 'task') : null,
+      l.outcome !== 'pr' ? badge(OUTCOME_LABEL[l.outcome] ?? l.outcome, 'task') : null,
       l.escalated ? badge('escalated', 'warn') : null,
       state.next === l.id ? badge('next', 'next') : null,
     ),
@@ -997,7 +1001,7 @@ function layerDetail(state, l) {
       badge(l.phase.replace('_', ' ')),
       l.round ? badge(`round ${l.round}/3`) : null,
       badge(`tier ${l.tier}`),
-      l.outcome === 'report' ? badge('Report', 'task') : null,
+      l.outcome !== 'pr' ? badge(OUTCOME_LABEL[l.outcome] ?? l.outcome, 'task') : null,
       l.escalated ? badge('escalated', 'warn') : null,
       state.next === l.id ? badge('next', 'next') : null,
       l.pr ? (l.pr.url ? extLink(l.pr.url, `PR #${l.pr.number}`) : h('span', null, `PR #${l.pr.number}`)) : null,
@@ -1022,7 +1026,9 @@ function layerDetail(state, l) {
       // Runs from before the skill's `plan` field have no link from a layer to its plan.
       field('Plan', l.plan ? h('a', { href: planHref(l.plan.replace(/^plans\//, '')) }, l.plan.replace(/^plans\//, '')) : '-'),
       field('Usage', usageText(state.usage?.layers?.[l.id])),
-      field('Outcome', l.outcome === 'report' ? (l.report && state.plans.includes(l.report.replace(/^reports\//, '')) ? h('a', { href: planHref(l.report.replace(/^reports\//, '')) }, l.report.replace(/^reports\//, '')) : 'report, not delivered yet') : 'pull request'),
+      // Text from a run is never a link: it shows as text.
+      l.outcome === 'issue' || l.outcome === 'comment' ? field('Delivery', l.delivery ?? (l.phase === 'delivered' ? '-' : 'nothing went out yet: it needs your yes')) : null,
+      field('Outcome', l.outcome !== 'pr' ? (l.report && state.plans.includes(l.report.replace(/^reports\//, '')) ? h('a', { href: planHref(l.report.replace(/^reports\//, '')) }, l.report.replace(/^reports\//, '')) : `${OUTCOME_LABEL[l.outcome] ?? l.outcome}, not delivered yet`) : 'pull request'),
     ),
     l.parked ? h('div', { class: 'parked' }, h('strong', null, `Parked at ${l.parked.phase}, round ${l.parked.round}, on ${l.parked.question}`)) : null,
     questions.length
@@ -1283,7 +1289,7 @@ function renderTasks({ runs, broken }) {
       h('td', null, l.tier, l.escalated ? [' ', badge('escalated', 'warn')] : null),
       h('td', null, l.phase.replace('_', ' '), question ? h('div', { class: 'small warn-text' }, question.question) : null),
       h('td', { class: 'nowrap' }, l.round ? `${l.round}/3` : '-'),
-      h('td', { class: 'nowrap' }, l.outcome === 'report' ? (l.report && state.plans.includes(l.report.replace(/^reports\//, '')) ? h('a', { href: `${layerHref(state, l)}/plan/${enc(l.report.replace(/^reports\//, ''))}` }, 'report') : 'report') : l.pr ? (l.pr.url ? extLink(l.pr.url, `#${l.pr.number}`) : `#${l.pr.number}`) : '-'),
+      h('td', { class: 'nowrap', title: l.delivery ?? null }, l.outcome !== 'pr' ? (l.report && state.plans.includes(l.report.replace(/^reports\//, '')) ? h('a', { href: `${layerHref(state, l)}/plan/${enc(l.report.replace(/^reports\//, ''))}` }, OUTCOME_WORD[l.outcome] ?? l.outcome) : (OUTCOME_WORD[l.outcome] ?? l.outcome)) : l.pr ? (l.pr.url ? extLink(l.pr.url, `#${l.pr.number}`) : `#${l.pr.number}`) : '-'),
       h('td', { class: 'nowrap', title: usageText(state.usage?.layers?.[l.id]) }, tokens(state.usage?.layers?.[l.id]?.tokens)),
       h('td', { class: 'nowrap' }, l.ci ? (l.ci.runUrl ? [ciBadge(l.ci), ' ', extLink(l.ci.runUrl, 'run')] : ciBadge(l.ci)) : '-'),
       l.lastEvent ? agoEl('td', { title: time(l.lastEvent), class: 'nowrap' }, l.lastEvent) : h('td', null, '-'),

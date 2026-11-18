@@ -24,6 +24,25 @@ tells you to read first. Run every command as its "Commands" section says.
   the same thing.
 - Never launch an agent.
 
+## An issue task and a comment task
+
+The orchestrator can say that your task is an **issue task** or a **comment task**. Then text
+goes out later: issues to file, or one review comment on a pull request. The orchestrator gives
+you the target repository, and the paths of the **out files**. Every rule of this brief still
+applies, and you send nothing. Do not run `gh issue create`, `gh pr review`, `gh pr comment`, or
+`gh api` with a field: no command that writes to GitHub. Read with `gh issue list`, `gh pr view`
+and `gh pr diff`, each with `-R <the target repository>`. Do not check out the branch of a pull
+request.
+
+- **Worker:** write the report as this brief says. Write the text that goes out into the out
+  files only: a title file is one line, and a body file is the exact text for its reader on
+  GitHub. Put no notes, no "Not verified" section and no command log into an out file: those
+  belong to the report.
+- **Reviewer:** read each out file as the text that goes out. A claim in it that you cannot
+  confirm, a duplicate of an existing issue, and a line that is not for the reader on GitHub are
+  findings. For a comment task, run `gh pr view <N> -R <repository> --json headRefOid`, check the
+  findings against that head, and give that SHA in your output.
+
 ## Worker
 
 1. **Plan.** Write a short plan to the plan path: the question in your own words, how you will

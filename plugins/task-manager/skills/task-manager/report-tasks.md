@@ -15,7 +15,7 @@ approves it. The agent that does the task is the **worker**. The ledger records 
 | Hard rule 2 (the base) | Does not apply: a report layer has no branch. It is never a base. |
 | Hard rule 3 (no PR before APPROVE) | Becomes: **no delivery before APPROVE**. The exceptions are the same: the round limit, and findings that you all closed with `L rule`. |
 | Hard rules 4, 6, 7, 9 | Apply. |
-| Hard rule 5 (attribution) | Applies only if the worker files something, which needs the user's yes. |
+| Hard rule 5 (attribution) | Applies to the out files of an issue layer and of a comment layer: their text goes to GitHub. |
 | Hard rule 8 (one reviewer) | Applies. The reviewer runs no review skill. It follows its brief. |
 | Tiers | Apply, with the signals below. |
 | Record the usage of each agent | Applies. The worker of a report layer has `--role implementer`. |
@@ -131,6 +131,102 @@ final report, a report layer shows the path of its report in place of a PR. A ta
 every task is `delivered` has nothing that waits for a merge. After the final report, set it to
 `paused` while the follow-up question is open. When that question has its answer and its action, or when you asked no
 follow-up question, run `L run --set stage=finish --set state=finished --set nextStep=null`.
+
+## Issue tasks and comment tasks
+
+An **issue layer** (outcome `issue`) and a **comment layer** (outcome `comment`) are report layers
+with one more step: after the review, and only with the user's yes, you send text to GitHub.
+Nothing goes out before that. Rule 2 applies to the worker and to the reviewer with no change.
+
+**The target.** Before R-A, find the repository, and for a comment layer the pull request. Use
+the source of the task when it gives a URL. Otherwise run `gh repo view --json nameWithOwner`.
+Record it: `L event --layer <layer> --type note --summary "target: <owner/repo>[ PR #<N>]"`. Give
+the target to the worker and to the reviewer. Every `gh` command of this section names it: a
+clone of a fork can resolve to another repository.
+
+**The out files.** The text that goes out is not the report. The worker writes the report as
+every worker does (`reports/report-<slug>.md`: what it did, the evidence, the gaps). It also
+writes, in the same folder, the exact text to send:
+
+- *Issue layer:* for issue number `<k>`, `reports/out-<slug>-<k>.title.txt` (one line) and
+  `reports/out-<slug>-<k>.body.md`. The body says what is wrong, the evidence with `file:line`,
+  how to reproduce it, and what done means. Before it writes an issue, the worker reads the open
+  and the closed issues (`gh issue list -R <owner/repo> --state all --search "<words>"`). It
+  writes no out file for an issue that exists already, or for a defect that it did not confirm:
+  those go into the report.
+- *Comment layer:* one file, `reports/out-<slug>-1.body.md`: the findings, most severe first, each
+  with `file:line` of the diff, the defect, and the fix that the worker expects. The worker reads
+  the pull request with `gh pr view <N> -R <owner/repo>` and `gh pr diff <N> -R <owner/repo>`. It
+  does not check out the branch. The text gives no verdict: it does not approve, and it does not
+  request changes.
+
+Tell the worker these names in the R-A prompt, as absolute paths. An out file holds only text
+for its reader on GitHub: no notes of the worker, and no section of the report.
+
+**The review.** The reviewer checks the report (R-C), and each out file as the text that goes
+out: each issue is real, is one piece of work, and is not a duplicate; each finding of a comment
+is true, and the text is fair to its author. For a comment layer, the reviewer gives the head
+that it checked (`gh pr view <N> -R <owner/repo> --json headRefOid`). Record that head in the
+summary of the `review` event: `"APPROVE, PR head <SHA>"`.
+
+**At the round limit.** An out file with an open finding does not go out. Name each such item in
+the question as "not included", and do not send it.
+
+**R-F for these layers: ask, send, record.** After APPROVE, do the checks of R-F. Then:
+
+1. **Ask.** Park the layer on a session-only question that names the one action exactly:
+   `L park --layer <layer> --session-only --question "<File <n> issues in <owner/repo>: <the
+   titles> | Post one review comment on PR #<N> of <owner/repo>>? The text is in <the folder of
+   the out files>." --option "send" --option "do not send" --tip <HEAD SHA>`. This is an outward
+   action (hard rule 6). The answer is a message in the session, or a confirmed answer from the
+   admin page. "do not send" sends nothing, so it is a permitted option.
+2. **Close the question first.** When the answer comes, at a stop point: record a session answer
+   with `L answer`, and run `L unpark` as "Park and resume" says. Do this before any other step,
+   for every answer. The ledger refuses `delivered` for a parked layer.
+3. **"do not send".** Run `L layer --layer <layer> --set delivery="not sent: <the user's
+   reason>" --set phase=delivered`. The out files stay in the run folder.
+4. **The user wants changes.** Send them to the worker (R-D). The reviewer checks the changed out
+   files. This check is not a review round. Then ask again, with a new question (step 1): a yes
+   is for the text that the user saw.
+5. **"send".** First check that the action is still possible. For a comment: the pull request is
+   open, and its head is the head of the `review` event. If the head moved, do not send. Ask the
+   reviewer to check the out file against the new head. This check is not a review round. If
+   the text must change, go to step 4. If the reviewer confirms the text as it is, record the
+   new head in a `review` event, and continue.
+6. **Send one item at a time, and record each one.** For each out file, in order:
+   - run `L run --set nextStep="send <layer>: item <k> of <n>"`, and
+     `L event --layer <layer> --type note --summary "sending <k>/<n>"`;
+   - send it. An issue: `gh api repos/<owner/repo>/issues -F title=@<title file> -F body=@<body
+     file> --jq .html_url`. A comment: `gh api repos/<owner/repo>/pulls/<N>/reviews -f
+     event=COMMENT -F body=@<body file> --jq .html_url`. Each command prints the URL of what it
+     made. Give the files as they are: do not type a title or a body again. Never send
+     `event=APPROVE` or `event=REQUEST_CHANGES`;
+   - record it: `L layer --layer <layer> --set delivery="<every URL up to now>"`.
+7. **Deliver.** When every item has its record, run
+   `L layer --layer <layer> --set phase=delivered`.
+8. **A command that fails.** Try that item one more time. If it fails again, do not send the
+   items after it. Run `L layer --layer <layer> --set delivery="<the URLs that went out>; not
+   sent: items <k> to <n>: <the error>" --set phase=delivered`, and tell the user.
+
+**A resume during the send.** The layer is not parked, its question has an answer "send", and it
+is not `delivered`. The `delivery` field of `L show --layer` gives the items that went out, and
+the last "sending <k>/<n>" note gives the item that was in progress. That item can be on GitHub
+with no record. Look before you send it: for an issue, `gh api
+"repos/<owner/repo>/issues?state=all&sort=created&direction=desc&per_page=30" --jq '.[] | .title
++ " " + .html_url'`, and compare with the title file; for a comment, `gh api
+repos/<owner/repo>/pulls/<N>/reviews --jq '.[] | .html_url + " " + (.body | length | tostring)'`.
+If it is there, record its URL, and continue with the next item. Never send an item that has a
+record.
+
+**More changes on a delivered issue layer or comment layer.** "More changes on a delivered
+report" applies, with this rule: what went out stays out. The worker writes new out files with
+the next numbers. After the review, the question says "<n> more issues" or "a second review
+comment". Send only the new files, and add their URLs to `delivery`.
+
+**A session with no terminal** does all of these steps. It needs the confirmed answer "send" or
+"do not send" from the admin page.
+
+In the final report, such a layer shows its delivery in place of a PR.
 
 ## Park and resume
 

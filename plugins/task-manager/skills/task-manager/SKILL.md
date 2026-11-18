@@ -33,17 +33,24 @@ The arguments select the mode. Read only the files of your mode, each one in ful
 
 ## Outcomes
 
-The outcome depends on the task. Give each task one of two outcomes.
+The outcome depends on the task. Give each task one of four outcomes.
 
 | Outcome | The task | It ends as | Its loop |
 |---|---|---|---|
 | `pr` | Changes files of the repository: code, tests, configuration, or a document that must be in the repository | A reviewed pull request | Phase 1 of `core.md` |
 | `report` | Gives an answer or knowledge, and changes nothing in the repository: an investigation, the cause of a defect, a plan or a design proposal, a code execution or a measurement with its result, a search for information | A reviewed report file in the run folder | [report-tasks.md](report-tasks.md) |
+| `issue` | Finds work for later and records it: a triage, an audit, a list of defects or of follow-ups | GitHub issues, filed from a reviewed draft after the user's yes | [report-tasks.md](report-tasks.md), with "Issue tasks and comment tasks" |
+| `comment` | Gives a review of a pull request that exists | One review comment on that pull request, posted from a reviewed draft after the user's yes | [report-tasks.md](report-tasks.md), with "Issue tasks and comment tasks" |
 
 - "Find the cause of X" is a report task. "Fix X" is a `pr` task.
 - "Find and fix X" is one `pr` task: its plan holds the diagnosis. If the user wants the cause
   before the fix, make two tasks: a report task, and a `pr` task that depends on it.
 - A plan that the user wants as a file of the repository is a `pr` task.
+- "Review PR 41" is a `comment` task when the user wants the review on the PR, and a report task
+  when the user wants to read it first and decide. "Find the defects in X and file them" is an
+  `issue` task. In these files, "a report layer" and "a report task" also mean an `issue` layer
+  and a `comment` layer: each rule for a report applies to them, unless the text says that they
+  differ. So a run with an `issue` task or a `comment` task reads `report-tasks.md` too.
 - When the request does not show the outcome of a task, ask the user with the intake decisions.
 
 ## Start a run
@@ -59,7 +66,8 @@ The outcome depends on the task. Give each task one of two outcomes.
 5. Tell the user, in one line for each task, its outcome, and the run kind. Then do Phase 0 of
    the kind file.
 
-A `pr` task needs a git repository with a GitHub remote and the `gh` CLI. A report task does not.
+A `pr` task, an `issue` task and a `comment` task need a git repository with a GitHub remote and
+the `gh` CLI. A task with the outcome `report` does not.
 If the working directory is not such a repository, the run can have report tasks only: tell the
 user this before Phase 0, and in Phase 0 skip the git steps and the GitHub steps.
 `report-tasks.md` ("With no git repository") gives the other steps to skip.
@@ -105,7 +113,7 @@ In this mode:
   - the questions that the run would ask. For a stack run, a paused run of this checkout
     (`pausedRuns` in the output) makes the run ask "resume it, or start a new run";
   - the blockers: a tree that is not clean, an active run (`activeRun`), a missing GitHub remote
-    for a `pr` task;
+    for a `pr` task, an `issue` task or a `comment` task;
   - the agents: one worker and one reviewer for each task, and for a stack run a restacker when a
     lower layer changes;
   - the token estimate, from `estimate` in the output. Say what it is: the mean of the complete

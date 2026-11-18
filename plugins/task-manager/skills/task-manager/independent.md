@@ -49,8 +49,8 @@ contain (for example step H, hard rule 6 or "Implementer tiers"), that step or s
 6. Make the run. Write two files in your session scratchpad: `request.txt` with the user's request
    word for word, and `layers.json`, a JSON array in work order with one object for each task:
    `{"task", "source", "outcome", "tier", "tierReason", "dependsOn": []}`. For a task with no
-   other source, write `the user's request` as its `source`. `outcome` is `pr` or
-   `report` ("Outcomes" in `SKILL.md`). `dependsOn` can name only earlier report tasks, by their
+   other source, write `the user's request` as its `source`. `outcome` is `pr`,
+   `report`, `issue` or `comment` ("Outcomes" in `SKILL.md`). `dependsOn` can name only earlier tasks that are not `pr` tasks, by their
    1-based index: a task that needs the result of a report waits for it. Then run:
    `L init --kind tasks --title "<short title>" --checkout <absolute path of this checkout>
    --request-file <request.txt> --layers-file <layers.json>`. It prints the run id. Then run
