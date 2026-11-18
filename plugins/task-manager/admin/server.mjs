@@ -211,11 +211,13 @@ export function canConfirmOnPage(root) {
  * every check again under the run lock: the setting, no live watcher, no session that the page
  * started earlier and that still runs.
  */
-async function startSession(root, id, helperFor) {
+async function startSession(root, id, body, helperFor) {
   if (!canStartSessions(root)) throw new HttpError(403, 'starting a session is off in the settings of this user (config.json, "resume.enabled")');
   const target = writableRun(root, id, helperFor);
   if (target.state.run.state === 'finished') throw new HttpError(409, `run ${id} is finished`);
-  const started = JSON.parse(await runHelper(root, target, ['start-session', '--run', id]));
+  // `evenIfActive` is the user's word, from the dialog, that no session of their own works on an active run.
+  const flags = body.evenIfActive === true ? ['--even-if-active'] : [];
+  const started = JSON.parse(await runHelper(root, target, ['start-session', '--run', id, ...flags]));
   return { id, pid: started.pid };
 }
 
@@ -485,7 +487,9 @@ export function createHandler(root, port, { helperFor = helperOf, sync = createP
           throw new HttpError(405, 'only POST is accepted here');
         }
         checkWrite(req, port(), 'session');
-        sendJson(res, 200, await startSession(root, decode(session[1]), helperFor));
+        // The body is optional: the page sends one only for an active run.
+        const body = Number(req.headers['content-length'] ?? 0) > 0 ? await readJsonBody(req) : {};
+        sendJson(res, 200, await startSession(root, decode(session[1]), body, helperFor));
         return;
       }
       const answer = /^\/api\/runs\/([^/]+)\/questions\/(q[1-9][0-9]*)\/answer$/.exec(pathname);

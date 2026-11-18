@@ -128,7 +128,8 @@ Then run `L layer --layer <layer> --set phase=delivered`. Give the user:
 If an answer to a parked layer came, resume that layer now ("Questions and parked layers" in
 `core.md`). Otherwise start the next layer that `L next` gives. A layer that depends on this one
 can start now.
-When `L next` gives `null` and no layer is parked, go to the finish of your kind file. In its
+When `L next` gives `null`, no layer is parked, and its `held` list is empty, go to the finish of
+your kind file. If a layer waits for an answer, the run waits: "Choose the next layer" in `core.md`. In its
 final report, a report layer shows the path of its report in place of a PR. A tasks run in which
 every task is `delivered` has nothing that waits for a merge. After the final report, set it to
 `paused` while the follow-up question is open. When that question has its answer and its action, or when you asked no

@@ -54,7 +54,8 @@ contain (for example step H, hard rule 6 or "Implementer tiers"), that step or s
    `report`, `issue` or `comment` ("Outcomes" in `SKILL.md`). `dependsOn` can name only earlier tasks that are not `pr` tasks, by their
    1-based index: a task that needs the result of a report waits for it. Then run:
    `L init --kind tasks --title "<short title>" --checkout <absolute path of this checkout>
-   --request-file <request.txt> --layers-file <layers.json>`. It prints the run id. Then run
+   --request-file <request.txt> --layers-file <layers.json>`. It prints `{"id", "dir"}`. `dir` is
+   the run folder: use it, word for word, for `<run folder>` in every step and prompt. Then run
    `L run --run <id> --set stage=layers --set nextStep="Phase 1 step A for l1"`. Then record the
    decisions of step 5, write a profile that you made to `<run folder>/profile.md`, and copy the
    plan documents ("Copy the plan documents" in `core.md`). If the profile permits report tasks
@@ -112,7 +113,8 @@ Follow "Run CI on a PR and check it" in `core.md` for the task's PR, with these 
 Go to Phase 2 only when all these conditions are true:
 
 - every `pr` task is `pr_open` or `merged`, and every report task is `delivered`;
-- no task is parked. While a task is parked and `L next` gives `null`, follow "Choose the next
+- no task is parked, and no task waits for an answer before its start (`held` of `L next` is
+  empty). While a task waits for an answer and `L next` gives `null`, follow "Choose the next
   layer" in `core.md`: tell the user that the run waits for the answer, and stop your turn;
 - every started CI run has a result.
 

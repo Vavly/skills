@@ -63,7 +63,8 @@ and two or more PRs are open:
    `report`, `issue` or `comment` ("Outcomes" in `SKILL.md`). `dependsOn` lists the 1-based indexes
    of earlier layers in this array. Then run:
    `L init --title "<short title>" --checkout <absolute path of this checkout>
-   --request-file <request.txt> --layers-file <layers.json>`. It prints the run id. Then run
+   --request-file <request.txt> --layers-file <layers.json>`. It prints `{"id", "dir"}`. `dir` is
+   the run folder: use it, word for word, for `<run folder>` in every step and prompt. Then run
    `L run --run <id> --set stage=layers --set nextStep="Phase 1 step A for <first layer>"`. The
    run folder is your memory after a context summary, and the only state that a new session can
    see. Then record the decisions of step 5, write a profile that you made to
@@ -75,6 +76,10 @@ and two or more PRs are open:
    run in a new session.
 
 ## Phase 2 — Finish
+
+Go to Phase 2 only when no layer is parked, and no layer waits for an answer before its start
+(`held` of `L next` is empty). Otherwise the run waits for the answer: "Choose the next layer" in
+`core.md`.
 
 1. Run `L run --set stage=finish --set nextStep="Phase 2 step 1: merge-order lines"`. Edit the
    first line of each PR body to show the full merge order, for example

@@ -397,12 +397,20 @@ export function waitsFor(run, layerId) {
   return waiting.sort(byLayerNumber);
 }
 
-/** The lowest-position `queued` layer whose dependencies all have an open or merged PR, or null. */
-export function nextLayer(run) {
-  for (const layer of byPosition(run.layers)) {
-    if (layer.phase === 'queued' && waitsFor(run, layer.id).length === 0) return layer.id;
-  }
-  return null;
+/**
+ * True for a layer that did not start and that waits for the user: a `queued` layer with an open
+ * question of its own. A layer cannot park before it starts, so the question is its only mark.
+ */
+export function heldByQuestion(layer, open = []) {
+  return layer.phase === 'queued' && open.some((q) => q.layer === layer.id);
+}
+
+/**
+ * The lowest-position `queued` layer that can start, or null: its dependencies all have their
+ * outcome, and no question of its own is open. `open` is the list of the open questions.
+ */
+export function nextLayer(run, open = []) {
+  return readyLayers(run, open)[0]?.id ?? null;
 }
 
 /** Phases in which an agent works on a layer. A parked layer in one of them waits: nobody works on it. */
@@ -416,8 +424,8 @@ export function workingLayers(run) {
 }
 
 /** Every `queued` layer whose dependencies are complete, in stack order: the layers that can start. */
-export function readyLayers(run) {
-  return byPosition(run.layers).filter((l) => l.phase === 'queued' && waitsFor(run, l.id).length === 0);
+export function readyLayers(run, open = []) {
+  return byPosition(run.layers).filter((l) => l.phase === 'queued' && waitsFor(run, l.id).length === 0 && !heldByQuestion(l, open));
 }
 
 /**
@@ -516,8 +524,9 @@ export function readRun(root, id) {
     openFindings: findings[layer.id].filter((f) => f.state === 'open' || f.state === 'not_fixed').length,
   }));
   // Only records: a line such as `null` is valid JSON, and it must not break `show`.
+  const ready = readyLayers(run, open);
   const usage = readJsonl(path.join(dir, 'usage.jsonl'), errors).filter((r) => r !== null && typeof r === 'object' && !Array.isArray(r));
-  return { run: { ...run, kind: kindOf(run), mainPlans: run.mainPlans ?? [] }, layers, events, questions, openQuestions: open, followups, findings, usage, next: nextLayer(run), ready: readyLayers(run).map((l) => ({ id: l.id, outcome: outcomeOf(l), alone: worksAlone(run, l) })), working: workingLayers(run).map((l) => ({ id: l.id, outcome: outcomeOf(l), phase: l.phase })), errors };
+  return { run: { ...run, kind: kindOf(run), mainPlans: run.mainPlans ?? [] }, layers, events, questions, openQuestions: open, followups, findings, usage, next: ready[0]?.id ?? null, held: byPosition(run.layers).filter((l) => heldByQuestion(l, open)).map((l) => l.id), ready: ready.map((l) => ({ id: l.id, outcome: outcomeOf(l), alone: worksAlone(run, l) })), working: workingLayers(run).map((l) => ({ id: l.id, outcome: outcomeOf(l), phase: l.phase })), errors };
 }
 
 // ── Writes ───────────────────────────────────────────────────────────────────────────────────────
@@ -799,7 +808,8 @@ export function initRun(root, { title, checkout, request, layers, kind = 'stack'
   saveRun(dir, run);
   const unit = kind === 'tasks' ? 'task' : 'layer';
   addEvent(dir, { type: 'run_created', summary: `${built.length} ${unit}${built.length === 1 ? '' : 's'}: ${title}` });
-  return { id };
+  // The folder of the run, for the agents that write plans and reports: nobody builds this path.
+  return { id, dir };
 }
 
 const LAYER_SETTERS = {
@@ -1405,6 +1415,7 @@ export function show(root, runId) {
   const lines = [];
   const tasks = run.kind === 'tasks';
   lines.push(`run ${run.id} [${run.kind}, ${run.state}${run.archived ? ', archived' : ''}, stage ${run.stage}] ${run.title}`);
+  lines.push(`run folder ${runDir(root, runId)}`);
   lines.push(`checkout ${run.checkout}`);
   lines.push(`request: ${run.request}`);
   for (const d of run.decisions) lines.push(`decision: ${d.question} -> ${d.answer}`);
@@ -1444,6 +1455,7 @@ export function show(root, runId) {
     lines.push(`in work: ${state.working.map((l) => `${l.id} (${l.phase})`).join(', ') || 'none'}; report layers at the same time: at most ${run.parallel ?? 1}`);
   }
   lines.push(`next ${tasks ? 'task' : 'layer'} that can move: ${state.next ?? 'none'}`);
+  if (state.held.length) lines.push(`not started, and waits for an answer: ${state.held.join(', ')}`);
   if (state.openQuestions.length) {
     lines.push('open questions:');
     for (const q of state.openQuestions) {
@@ -1637,7 +1649,7 @@ function lastEventTime(dir) {
  * The run id is the only run value in the command line, and its form is checked. The program
  * starts with no shell.
  */
-function startSessionUnlocked(root, runId, { spawnFn = spawn, alive = processAlive, at = Date.now() } = {}) {
+function startSessionUnlocked(root, runId, { spawnFn = spawn, alive = processAlive, at = Date.now(), evenIfActive = false } = {}) {
   const { dir, run } = load(root, runId);
   const config = readResumeConfig(root);
   if (!config.enabled) fail(`starting a session is off; set "resume": { "enabled": true } in ${configPath(root)}`);
@@ -1653,8 +1665,12 @@ function startSessionUnlocked(root, runId, { spawnFn = spawn, alive = processAli
   }
   // An active run belongs to the session that works on it. Only a long silence shows that the
   // session is gone.
-  if (run.state === 'active' && at - lastEventTime(dir) < IDLE_MS) {
-    fail(`run ${run.id} is active: a session works on it. Start a session only for a paused run, or after ${IDLE_MS / 60_000} minutes with no event`);
+  // A session can end and leave its run `active`. The ledger cannot see that, so the user can say
+  // it: `evenIfActive` is the user's word that no session of their own works on the run. A live
+  // watcher and a live started session are still refused below.
+  const inWork = run.state === 'active' && at - lastEventTime(dir) < IDLE_MS;
+  if (inWork && !evenIfActive) {
+    fail(`run ${run.id} is active: a session works on it. Start a session only for a paused run, or after ${IDLE_MS / 60_000} minutes with no event. If no session works on it, the user can start one with --even-if-active`);
   }
   removeDeadMarkers(dir, alive);
   const sessions = sessionsOf(dir, alive);
@@ -1680,7 +1696,7 @@ function startSessionUnlocked(root, runId, { spawnFn = spawn, alive = processAli
   child.unref?.();
   const started = { pid: child.pid, lstart: processStart(child.pid) ?? null, started: now(), log };
   writeAtomic(sessionFile(dir), `${JSON.stringify(started)}\n`);
-  addEvent(dir, { type: 'note', summary: `a session was started from the admin page (process ${child.pid})` });
+  addEvent(dir, { type: 'note', summary: `a session was started from the admin page (process ${child.pid})${inWork && evenIfActive ? '; the run was active, and the user said that no session works on it' : ''}` });
   return started;
 }
 export const startSession = locked(startSessionUnlocked);

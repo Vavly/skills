@@ -330,7 +330,7 @@ test('18. nextLayer skips blocked layers, takes the lowest free queued layer, an
   assert.equal(nextLayer(readRun(root, id).run), 'l2');
   phase(root, id, 'l2', 'pr_open');
   assert.equal(nextLayer(readRun(root, id).run), null, 'l3 and l4 depend on the parked l1');
-  assert.deepEqual(JSON.parse(cli(root, 'next', '--run', id).stdout), { next: null, ready: [], working: [], parallel: 1 });
+  assert.deepEqual(JSON.parse(cli(root, 'next', '--run', id).stdout), { next: null, ready: [], held: [], working: [], parallel: 1 });
 });
 
 test('19. unpark needs an answer, then places the layer above the highest PR layer and keeps its id', () => {
@@ -459,7 +459,9 @@ test('the CLI runs as a script, prints one JSON line, and exits 1 with an error 
   writeFileSync(requestFile, 'the request');
   const ok = spawnSync(process.execPath, [CLI, 'init', '--title', 'Script', '--checkout', CHECKOUT, '--request-file', requestFile, '--layers-file', layersFile], { env, encoding: 'utf8' });
   assert.equal(ok.status, 0, ok.stderr);
-  assert.deepEqual(JSON.parse(ok.stdout), { id: `${new Date().toISOString().slice(0, 10)}-script` });
+  const made = `${new Date().toISOString().slice(0, 10)}-script`;
+  // `dir` is the folder of the run: the agents write their plans and reports there.
+  assert.deepEqual(JSON.parse(ok.stdout), { id: made, dir: path.join(root, made) });
   const bad = spawnSync(process.execPath, [CLI, 'nope'], { env, encoding: 'utf8' });
   assert.equal(bad.status, 1);
   assert.match(bad.stderr, /^error: unknown command "nope"/);
@@ -2043,7 +2045,7 @@ test('W1. a layer starts only when no other layer is in work; a parked layer and
   assert.equal(set('l3', 'phase=implementing').code, 0);
   // More changes on l1 (pr_open to fixing) is not a start, and the ledger does not judge it.
   assert.equal(set('l1', 'phase=fixing').code, 0);
-  assert.deepEqual(JSON.parse(cli(root, 'next', '--run', id).stdout), { next: 'l4', ready: [{ id: 'l4', outcome: 'pr', alone: true }], working: [{ id: 'l1', outcome: 'pr', phase: 'fixing' }, { id: 'l3', outcome: 'pr', phase: 'implementing' }], parallel: 1 });
+  assert.deepEqual(JSON.parse(cli(root, 'next', '--run', id).stdout), { next: 'l4', ready: [{ id: 'l4', outcome: 'pr', alone: true }], held: [], working: [{ id: 'l1', outcome: 'pr', phase: 'fixing' }, { id: 'l3', outcome: 'pr', phase: 'implementing' }], parallel: 1 });
 });
 
 test('W2. report layers work at the same time up to the limit of the run, and never with a pr layer', () => {
@@ -2187,4 +2189,87 @@ test('H1. only a finished run can be archived; the mark is the one write that a 
   assert.equal(run('state=finished', 'archived=true').code, 0);
   const next = newRun(root, 1, {}, { title: 'Next' });
   assert.deepEqual(listRuns(root).runs.map((r) => [r.id, r.archived]).sort(), [[id, true], [next, false]].sort());
+});
+
+// ── Corrections from the first real runs ────────────────────────────────────────────────────────
+
+test('RR1. [real run] init and show give the folder of the run, also with a runs root that is not the default', () => {
+  const root = path.join(tempRoot(), 'other root');
+  const made = initRun(root, { title: 'Where', checkout: CHECKOUT, request: 'r', layers: layers(1), date: '2026-11-06' });
+  assert.deepEqual(made, { id: '2026-11-06-where', dir: path.join(root, '2026-11-06-where') });
+  assert.equal(existsSync(path.join(made.dir, 'run.json')), true);
+  assert.equal(cli(root, 'show', '--run', made.id).stdout.split('\n')[1], `run folder ${made.dir}`);
+});
+
+test('RR2. [real run] a queued layer with an open question of its own is not next and not ready, until the answer comes', () => {
+  const root = tempRoot();
+  const id = newRun(root, 3, {}, { kind: 'tasks' });
+  const next = () => JSON.parse(cli(root, 'next', '--run', id).stdout);
+  assert.deepEqual([next().next, next().ready.map((l) => l.id)], ['l1', ['l1', 'l2', 'l3']]);
+  // The decision for l1 is the user's, and l1 did not start: it cannot park, so the question is its mark.
+  assert.match(cli(root, 'park', '--run', id, '--layer', 'l1', '--question', 'A or B?', '--tip', 'a'.repeat(40)).stderr, /has not started; it waits, it is not parked/);
+  const q1 = JSON.parse(cli(root, 'ask', '--run', id, '--layer', 'l1', '--question', 'A or B?').stdout).id;
+  assert.deepEqual([next().next, next().ready.map((l) => l.id), next().held], ['l2', ['l2', 'l3'], ['l1']]);
+  assert.match(cli(root, 'show', '--run', id).stdout, /next task that can move: l2\nnot started, and waits for an answer: l1/);
+  // The functions with the names give the same rule as the command.
+  const state = readRun(root, id);
+  assert.equal(nextLayer(state.run, state.openQuestions), 'l2');
+  assert.equal(nextLayer(state.run), 'l1');
+  // A question of the run, with no layer, holds no layer back.
+  cli(root, 'ask', '--run', id, '--question', 'Which follow-ups?');
+  assert.equal(next().next, 'l2');
+  // With every other task done, nothing is next, and `held` still shows that the run is not at its end.
+  for (const layer of ['l2', 'l3']) {
+    cli(root, 'layer', '--run', id, '--layer', layer, '--set', 'phase=implementing');
+    cli(root, 'layer', '--run', id, '--layer', layer, '--set', 'phase=pr_open');
+  }
+  assert.deepEqual([next().next, next().held], [null, ['l1']]);
+  cli(root, 'answer', '--run', id, '--id', q1, '--answer', 'A');
+  assert.deepEqual([next().next, next().ready.map((l) => l.id), next().held], ['l1', ['l1'], []]);
+});
+
+test('RR4. [real run] a task that waits for a held task still waits, and a session-only question holds its task too', () => {
+  const root = tempRoot();
+  const entry = (task, outcome, extra = {}) => ({ task, source: 's', tier: 'S', tierReason: 'r', outcome, ...extra });
+  const id = initRun(root, { title: 'Held', checkout: CHECKOUT, request: 'r', kind: 'tasks', date: '2026-11-06', layers: [entry('a', 'report'), entry('b', 'pr', { dependsOn: [1] }), entry('c', 'report')] }).id;
+  const next = () => JSON.parse(cli(root, 'next', '--run', id).stdout);
+  const q1 = JSON.parse(cli(root, 'ask', '--run', id, '--layer', 'l1', '--session-only', '--question', 'Deploy first?').stdout).id;
+  // l2 depends on l1, so it is not ready and not held: it waits for l1.
+  assert.deepEqual([next().next, next().ready.map((l) => l.id), next().held], ['l3', ['l3'], ['l1']]);
+  cli(root, 'answer', '--run', id, '--id', q1, '--answer', 'yes');
+  assert.deepEqual([next().next, next().ready.map((l) => l.id), next().held], ['l1', ['l1', 'l3'], []]);
+});
+
+test('RR3. [real run] a run that a session left active takes a new session only with the user word; a live watcher is still refused', async () => {
+  const { waitForAnswer, startSession } = await import('../lib/task-manager-core.mjs');
+  const { root, id } = sessionRoot();
+  cli(root, 'run', '--run', id, '--set', 'state=active');
+  const refused = cli(root, 'start-session', '--run', id);
+  assert.equal(refused.code, 1);
+  assert.match(refused.stderr, /is active: a session works on it.*the user can start one with --even-if-active/);
+  const ok = cli(root, 'start-session', '--run', id, '--even-if-active');
+  assert.equal(ok.code, 0, ok.stderr);
+  const started = JSON.parse(ok.stdout);
+  try {
+    assert.match(readRun(root, id).events.at(-1).summary, /the run was active, and the user said that no session works on it/);
+    // An active run with no event for an hour needs no word of the user, and the event claims none.
+    const idle = sessionRoot();
+    cli(idle.root, 'run', '--run', idle.id, '--set', 'state=active');
+    const quiet = startSession(idle.root, idle.id, { at: Date.now() + 61 * 60 * 1000, spawnFn: () => ({ pid: process.pid, on() {}, unref() {} }), alive: () => false });
+    assert.equal(quiet.pid, process.pid);
+    assert.doesNotMatch(readRun(idle.root, idle.id).events.at(-1).summary, /the user said/);
+    // The word of the user does not start a second session next to one that runs.
+    assert.match(cli(root, 'start-session', '--run', id, '--even-if-active').stderr, /a started session works on run/);
+  } finally {
+    stopProcess(started.pid);
+  }
+  // Nor next to a session that watches.
+  const other = sessionRoot();
+  cli(other.root, 'run', '--run', other.id, '--set', 'state=active');
+  const q = JSON.parse(cli(other.root, 'ask', '--run', other.id, '--question', 'A or B?').stdout).id;
+  const waiting = waitForAnswer(other.root, other.id, { pollMs: 5, timeoutMs: 5000 });
+  await new Promise((done) => setTimeout(done, 30));
+  assert.throws(() => startSession(other.root, other.id, { evenIfActive: true }), /a session watches run/);
+  cli(other.root, 'answer', '--run', other.id, '--id', q, '--answer', 'A');
+  await waiting;
 });
