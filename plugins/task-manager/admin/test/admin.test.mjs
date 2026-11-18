@@ -4,7 +4,7 @@
  */
 import { strict as assert } from 'node:assert';
 import { spawn } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
@@ -854,4 +854,46 @@ test('P1. the page starts a session only with the user setting, through the real
     }
     s.close();
   }
+});
+
+// ── Usage ────────────────────────────────────────────────────────────────────────────────────────
+
+test('U1. the reader adds the usage for each layer, each role and each tier, and the board carries the layer sums', async () => {
+  const core = await import('../../skills/task-manager/scripts/lib/task-manager-core.mjs');
+  const { usageOf, sumUsage } = await import('../reader.mjs');
+  const own = mkdtempSync(path.join(tmpdir(), 'task-manager-admin-usage-'));
+  const ownRoot = path.join(own, 'runs');
+  const entry = (task, tier) => ({ task, source: 'request', tier, tierReason: 'r', dependsOn: [] });
+  const { id } = core.initRun(ownRoot, { title: 'Usage', checkout: own, request: 'do it', layers: [entry('a', 'S'), entry('b', 'M'), entry('c', 'M'), entry('d', 'L')] });
+  const use = (fields) => core.addUsage(ownRoot, id, fields);
+  use({ layer: 'l1', role: 'implementer', tokens: '1000', toolUses: '4', durationMs: '60000' });
+  use({ layer: 'l1', role: 'reviewer', tokens: '500' });
+  use({ layer: 'l1', role: 'implementer', tokens: '200' });
+  use({ layer: 'l2', role: 'implementer', tokens: '3000' });
+  use({ layer: 'l3', role: 'implementer', tokens: '5000', cost: '1.5' });
+  use({ role: 'restacker', tokens: '700' });
+  use({ role: 'verifier', tokens: '50' });
+  use({ role: 'restacker', tokens: '300' });
+
+  const { usage } = readRun(ownRoot, id);
+  assert.deepEqual(usage.total, { agents: 8, tokens: 10750, toolUses: 4, durationMs: 60000, cost: 1.5 });
+  assert.deepEqual(Object.keys(usage.layers), ['l1', 'l2', 'l3']);
+  assert.deepEqual({ ...usage.layers.l1, roles: null }, { agents: 3, tokens: 1700, toolUses: 4, durationMs: 60000, cost: null, roles: null });
+  assert.equal(usage.layers.l1.roles.implementer.tokens, 1200);
+  assert.equal(usage.layers.l1.roles.reviewer.agents, 1);
+  // The tier means count only the layers that have a record: l4 (tier L) has none.
+  assert.deepEqual(Object.keys(usage.tiers).sort(), ['M', 'S']);
+  assert.deepEqual([usage.tiers.M.layers, usage.tiers.M.tokens, usage.tiers.M.tokensPerLayer, usage.tiers.M.cost], [2, 8000, 4000, 1.5]);
+  // The records with no layer show under their own role, not as a layer and not in a tier.
+  assert.deepEqual(Object.keys(usage.runLevel).sort(), ['restacker', 'verifier']);
+  assert.deepEqual([usage.runLevel.restacker.agents, usage.runLevel.restacker.tokens, usage.runLevel.verifier.tokens], [2, 1000, 50]);
+  // A line that is valid JSON but not a record does not break the page.
+  appendFileSync(path.join(ownRoot, id, 'usage.jsonl'), 'null\n[1]\n"x"\n');
+  assert.equal(readRun(ownRoot, id).usage.total.agents, 8);
+  assert.equal(readBoard(ownRoot).broken.length, 0);
+  const board = readBoard(ownRoot).runs[0];
+  assert.deepEqual(board.usage, { total: usage.total, layers: usage.layers });
+  // A run from before this file has no usage, and nothing fails.
+  assert.deepEqual(usageOf({ layers: [{ id: 'l1', tier: 'S' }] }, []), { total: sumUsage([]), layers: {}, tiers: {}, runLevel: {} });
+  assert.equal(readRun(root, IDS.main, { at: end }).usage.total.agents, 0);
 });

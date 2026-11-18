@@ -382,6 +382,7 @@ steps below leave it out. In each command, `--layer` takes the layer id.
 | A run field changes: state, stage, next step, CI | `L run --set key=value ...` |
 | A question to the user, and its answer | `L ask [--layer] [--session-only] --question --option ...`, `L answer --id --answer`. `--session-only` is for the questions that "The user can answer in two places" lists: the admin page cannot answer it. |
 | Start a session with no terminal, for the admin page | `L start-session --run <id>`. Only the admin page runs it, and only with the user's setting. Do not run it yourself. |
+| What one agent used, when it returns | `L usage [--layer <layer>] --role --agent --model --tokens --tool-uses --duration-ms [--cost]`. `--layer` is required for an implementer and a reviewer. With no `--layer`, the record is for the run: a restacker or a verifier. A finished run accepts it. |
 | Test the user's notification settings | `L notify-test`. It sends one test notification in place, and prints what each sender did. `L` sends the real notifications itself, after `ask`, `park` and a change to `paused` or `finished`: you run no command for them. |
 | Wait for an answer, in the background | `L wait --run <id> [--timeout <seconds>]`. It prints `{"answered": [{id, layer, answer, via}], "reason"}` and ends. `reason` is `answered`, `no_open_question`, `run_finished` or `timeout`. |
 | Park a layer, and resume it | `L park --layer (--question --option ... [--session-only] \| --id) --tip`, `L unpark --layer --base --base-tip --head [--last-reviewed]` |
@@ -524,6 +525,16 @@ Record the report: `L event --layer <layer> --type report --summary "<one line>"
 list each skill that the profile requires for an implementer. If one is missing, send the task
 back to the implementer: it must load the skill and check its change against it before the
 review starts.
+
+**Record the usage of each agent.** When an agent returns, or ends its turn after a message, the
+harness gives its tokens, its tool uses and its time. Record them, for every agent of the run and
+in every step: `L usage --layer <layer> --role implementer|reviewer --agent <agent id> --model
+<model> --tokens <n> --tool-uses <n> --duration-ms <n>`. A restacker and a stack verifier work on
+several layers: record them with `--role restacker` or `--role verifier` and no `--layer`. Give
+only the numbers that you got, and never estimate one: leave out an option that has no number.
+Record nothing for yourself: the harness gives no numbers for the orchestrator. Give `--cost <dollars>` only when a source gives the cost. A
+record is for one return: an agent that you message three times gets three records. The admin
+page adds them for each layer, each role and each tier.
 
 **C. Reviewer.** Launch a new `general-purpose` agent in the background, with `model: "opus"` and
 `effort: "high"` for every tier. Its prompt contains:

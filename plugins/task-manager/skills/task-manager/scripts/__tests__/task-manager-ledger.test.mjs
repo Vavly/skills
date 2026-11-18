@@ -1645,3 +1645,61 @@ test('X6. [review] an active run is not started unless it had no event for an ho
   stopProcess(JSON.parse(ok.stdout).pid);
   assert.equal(typeof checkout, 'string');
 });
+
+// ── Usage ────────────────────────────────────────────────────────────────────────────────────────
+
+test('U1. usage records what an agent used; show adds it up; bad numbers and an empty record are refused', async () => {
+  const { sumUsage } = await import('../lib/task-manager-core.mjs');
+  const root = tempRoot();
+  const id = newRun(root);
+  const before = eventCount(root, id);
+  const use = (...args) => cli(root, 'usage', '--run', id, ...args);
+  assert.equal(use('--layer', 'l1', '--role', 'implementer', '--agent', 'a1', '--model', 'sonnet', '--tokens', '84204', '--tool-uses', '23', '--duration-ms', '171799').code, 0);
+  assert.equal(use('--layer', 'l1', '--role', 'reviewer', '--tokens', '20000', '--cost', '0.35').code, 0);
+  // A restacker works on several layers, so its record has no layer.
+  assert.equal(use('--role', 'restacker', '--duration-ms', '60000').code, 0);
+  // A measurement is not an event of the run.
+  assert.equal(eventCount(root, id), before);
+  const state = readRun(root, id);
+  assert.equal(state.usage.length, 3);
+  assert.deepEqual({ ...state.usage[0], ts: null }, { ts: null, layer: 'l1', role: 'implementer', agent: 'a1', model: 'sonnet', tokens: 84204, toolUses: 23, durationMs: 171799, cost: null });
+  assert.deepEqual(sumUsage(state.usage), { agents: 3, tokens: 104204, toolUses: 23, durationMs: 231799, cost: 0.35 });
+  assert.equal(sumUsage(state.usage.slice(0, 1)).cost, null);
+  assert.match(cli(root, 'show', '--run', id).stdout, /usage: 3 agents, 104204 tokens, 23 tool uses, 4 min of agent time, \$0\.35/);
+
+  for (const [args, message] of [
+    [['--layer', 'l1', '--role', 'implementer'], /give at least one of --tokens/],
+    [['--role', 'boss', '--tokens', '1'], /role must be one of/],
+    [['--role', 'orchestrator', '--tokens', '1'], /role must be one of/],
+    [['--role', 'implementer', '--tokens', '1'], /--layer is required for the role implementer/],
+    [['--role', 'reviewer', '--tokens', '1'], /--layer is required for the role reviewer/],
+    // An empty value is not a 0 that the harness gave.
+    [['--layer', 'l1', '--role', 'reviewer', '--tokens', ''], /tokens must be a whole number/],
+    [['--layer', 'l1', '--role', 'reviewer', '--tool-uses', ' '], /tool-uses must be a whole number/],
+    [['--layer', 'l1', '--role', 'reviewer', '--duration-ms', '1e3'], /duration-ms must be a whole number/],
+    [['--layer', 'l1', '--role', 'reviewer', '--tokens', '0x10'], /tokens must be a whole number/],
+    [['--layer', 'l1', '--role', 'reviewer', '--cost', ''], /cost must be a number of dollars/],
+    [['--layer', 'l1', '--role', 'reviewer', '--cost', '1e3'], /cost must be a number of dollars/],
+    [['--tokens', '1'], /--role is required/],
+    [['--layer', 'l1', '--role', 'reviewer', '--tokens=-1'], /tokens must be a whole number/],
+    [['--layer', 'l1', '--role', 'reviewer', '--tokens', '1.5'], /tokens must be a whole number/],
+    [['--layer', 'l1', '--role', 'reviewer', '--cost', 'cheap'], /cost must be a number of dollars/],
+    [['--layer', 'l1', '--role', 'reviewer', '--cost=-1'], /cost must be a number of dollars/],
+    [['--layer', 'l9', '--role', 'reviewer', '--tokens', '1'], /l9/],
+  ]) {
+    const out = use(...args);
+    assert.equal(out.code, 1, JSON.stringify(args));
+    assert.match(out.stderr, message);
+  }
+  assert.equal(readRun(root, id).usage.length, 3);
+  // A finished run still accepts the usage of its last agent.
+  cli(root, 'run', '--run', id, '--set', 'state=finished');
+  assert.equal(use('--layer', 'l2', '--role', 'reviewer', '--tokens', '5').code, 0);
+  // A line that is valid JSON but not a record does not break `show`.
+  appendFileSync(path.join(root, id, 'usage.jsonl'), 'null\n[1]\n"x"\n');
+  assert.equal(cli(root, 'show', '--run', id).code, 0);
+  assert.equal(readRun(root, id).usage.length, 4);
+  // A run with no record prints no usage line.
+  const other = tempRoot();
+  assert.doesNotMatch(cli(other, 'show', '--run', newRun(other)).stdout, /usage:/);
+});

@@ -64,6 +64,52 @@ function ago(ts) {
   return `${duration(ms)} ago`;
 }
 
+/** A token count, short: 950, 12.4k, 1.8M. */
+function tokens(n) {
+  if (typeof n !== 'number') return '-';
+  if (n < 1000) return String(n);
+  // The limits are where the rounded value reaches the next unit: 99.95k shows as 100k, not 100.0k.
+  if (n < 99_950) return `${(n / 1000).toFixed(1)}k`;
+  if (n < 999_500) return `${Math.round(n / 1000)}k`;
+  return `${(n / 1_000_000).toFixed(1)}M`;
+}
+
+/** One line for what a layer, a tier or a run used. `u` is a sum from the server, or nothing. */
+function usageText(u) {
+  if (!u || !u.agents) return 'no usage recorded';
+  const parts = [`${tokens(u.tokens)} tokens`, `${u.toolUses} tool uses`, `${duration(u.durationMs)} of agent time`, `${u.agents} agent${u.agents === 1 ? '' : 's'}`];
+  if (typeof u.cost === 'number') parts.push(`$${u.cost.toFixed(2)}`);
+  return parts.join(' · ');
+}
+
+/** The usage of each layer, by role, and the mean for each tier: are the tiers set correctly? */
+function usageTable(state) {
+  const usage = state.usage;
+  const rows = state.layers.filter((l) => usage?.layers?.[l.id]);
+  if (!rows.length) return h('p', { class: 'muted' }, 'No usage recorded yet. The orchestrator records it when an agent returns.');
+  const roles = ['implementer', 'reviewer', 'restacker', 'verifier'].filter((role) => rows.some((l) => usage.layers[l.id].roles[role]));
+  const tiers = Object.keys(usage.tiers ?? {}).sort();
+  return h(
+    'div',
+    null,
+    h(
+      'table',
+      { class: 'phases' },
+      h('thead', null, h('tr', null, ['Layer', 'Tier', ...roles.map((r) => `${r} tokens`), 'Total tokens', 'Tool uses', 'Agent time'].map((t) => h('th', null, t)))),
+      h(
+        'tbody',
+        null,
+        rows.map((l) => {
+          const u = usage.layers[l.id];
+          return h('tr', null, h('td', null, h('a', { href: layerHref(state, l) }, l.id), h('span', { class: 'muted small' }, ` ${l.task}`)), h('td', null, l.tier), roles.map((r) => h('td', null, tokens(u.roles[r]?.tokens))), h('td', null, tokens(u.tokens)), h('td', null, String(u.toolUses)), h('td', null, duration(u.durationMs)));
+        }),
+      ),
+    ),
+    tiers.length ? h('p', { class: 'muted small' }, 'Mean for a layer of each tier: ', tiers.map((t) => `${t}: ${tokens(usage.tiers[t].tokensPerLayer)} tokens (${usage.tiers[t].layers})`).join(' · ')) : null,
+    Object.keys(usage.runLevel ?? {}).map((role) => h('p', { class: 'muted small' }, `For the run, ${role}: ${usageText(usage.runLevel[role])}`)),
+  );
+}
+
 function duration(ms) {
   const min = Math.round(ms / 60_000);
   if (min < 1) return '< 1 min';
@@ -417,6 +463,7 @@ function runHeader(state, tab) {
       h('span', null, 'clone ', h('code', { title: run.checkout }, clone(run.checkout))),
       h('span', { class: 'muted' }, run.id),
       state.lastEvent ? agoEl('span', { class: 'muted', title: time(state.lastEvent) }, state.lastEvent, 'last event ') : null,
+      state.usage?.total?.agents ? h('span', { class: 'muted', title: usageText(state.usage.total) }, `${tokens(state.usage.total.tokens)} tokens`) : null,
     ),
     run.nextStep ? h('p', { class: 'next-step' }, h('strong', null, 'Next step: '), run.nextStep) : null,
     run.ci ? h('p', null, h('strong', null, 'CI: '), `PR #${run.ci.pr} `, badge(run.ci.result, `ci-${run.ci.result}`), run.ci.runUrl ? [' ', extLink(run.ci.runUrl, 'run')] : null) : null,
@@ -875,7 +922,7 @@ function phaseTable(state) {
 }
 
 function renderTimeline(state) {
-  return h('div', null, h('h2', null, 'Time in each phase'), phaseTable(state), h('h2', null, `Events (${state.events.length}, newest first)`), eventTable(state.events));
+  return h('div', null, h('h2', null, 'Time in each phase'), phaseTable(state), h('h2', null, 'Usage of the agents'), usageTable(state), h('h2', null, `Events (${state.events.length}, newest first)`), eventTable(state.events));
 }
 
 /** The issue URL of a filed follow-up, from the repository of a PR link in the run. */
@@ -961,6 +1008,7 @@ function layerDetail(state, l) {
       field('Tier reason', l.tierReason),
       // Runs from before the skill's `plan` field have no link from a layer to its plan.
       field('Plan', l.plan ? h('a', { href: planHref(l.plan.replace(/^plans\//, '')) }, l.plan.replace(/^plans\//, '')) : '-'),
+      field('Usage', usageText(state.usage?.layers?.[l.id])),
       field('Outcome', l.outcome === 'report' ? (l.report && state.plans.includes(l.report.replace(/^reports\//, '')) ? h('a', { href: planHref(l.report.replace(/^reports\//, '')) }, l.report.replace(/^reports\//, '')) : 'report, not delivered yet') : 'pull request'),
     ),
     l.parked ? h('div', { class: 'parked' }, h('strong', null, `Parked at ${l.parked.phase}, round ${l.parked.round}, on ${l.parked.question}`)) : null,
@@ -1223,6 +1271,7 @@ function renderTasks({ runs, broken }) {
       h('td', null, l.phase.replace('_', ' '), question ? h('div', { class: 'small warn-text' }, question.question) : null),
       h('td', { class: 'nowrap' }, l.round ? `${l.round}/3` : '-'),
       h('td', { class: 'nowrap' }, l.outcome === 'report' ? (l.report && state.plans.includes(l.report.replace(/^reports\//, '')) ? h('a', { href: `${layerHref(state, l)}/plan/${enc(l.report.replace(/^reports\//, ''))}` }, 'report') : 'report') : l.pr ? (l.pr.url ? extLink(l.pr.url, `#${l.pr.number}`) : `#${l.pr.number}`) : '-'),
+      h('td', { class: 'nowrap', title: usageText(state.usage?.layers?.[l.id]) }, tokens(state.usage?.layers?.[l.id]?.tokens)),
       h('td', { class: 'nowrap' }, l.ci ? (l.ci.runUrl ? [ciBadge(l.ci), ' ', extLink(l.ci.runUrl, 'run')] : ciBadge(l.ci)) : '-'),
       l.lastEvent ? agoEl('td', { title: time(l.lastEvent), class: 'nowrap' }, l.lastEvent) : h('td', null, '-'),
     );
@@ -1243,7 +1292,7 @@ function renderTasks({ runs, broken }) {
         h(
           'table',
           { class: 'runs tasks' },
-          h('thead', null, h('tr', null, ['State', 'Task', 'Clone', 'Tier', 'Phase', 'Round', 'Outcome', 'CI', 'Updated'].map((t) => h('th', null, t)))),
+          h('thead', null, h('tr', null, ['State', 'Task', 'Clone', 'Tier', 'Phase', 'Round', 'Outcome', 'Tokens', 'CI', 'Updated'].map((t) => h('th', null, t)))),
           h('tbody', null, rows.map(row)),
         ),
       )
@@ -1262,6 +1311,8 @@ function scopeToLayer(state, l) {
     events: state.events.filter((e) => e.layer === l.id),
     followups: state.followups.filter((f) => f.layer === l.id),
     phaseTimes: state.phaseTimes[l.id] ? { [l.id]: state.phaseTimes[l.id] } : {},
+    // The tier means and the run-level records are about the run, not about this task.
+    usage: state.usage ? { ...state.usage, tiers: {}, runLevel: {} } : state.usage,
   };
 }
 
@@ -1322,7 +1373,7 @@ async function renderTask(state, route) {
     h('nav', { class: 'tabs' }, tabs.map(([key, label, href]) => h('a', { href, class: key === tab ? 'active' : null }, label))),
   );
   let body;
-  if (tab === 'timeline') body = h('div', null, h('h2', null, 'Time in each phase'), phaseTable(scoped), h('h2', null, `Events (${scoped.events.length}, newest first)`), eventTable(scoped.events));
+  if (tab === 'timeline') body = h('div', null, h('h2', null, 'Time in each phase'), phaseTable(scoped), h('h2', null, 'Usage of the agents'), usageTable(scoped),h('h2', null, `Events (${scoped.events.length}, newest first)`), eventTable(scoped.events));
   else if (tab === 'plan') body = await renderPlans(state, route.plan, { hrefFor: (p) => `${base}/plan/${enc(p)}`, plans });
   else if (tab === 'pr') body = renderPrs(scoped);
   else if (tab === 'ci') body = renderCi(scoped, l);

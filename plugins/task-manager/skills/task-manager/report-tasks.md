@@ -18,6 +18,7 @@ approves it. The agent that does the task is the **worker**. The ledger records 
 | Hard rule 5 (attribution) | Applies only if the worker files something, which needs the user's yes. |
 | Hard rule 8 (one reviewer) | Applies. The reviewer runs no review skill. It follows its brief. |
 | Tiers | Apply, with the signals below. |
+| Record the usage of each agent | Applies. The worker of a report layer has `--role implementer`. |
 | Questions and parked layers, the ledger, the resume, the events | Apply. "Park and resume" below gives the commands. |
 | Steps F, G and H, CI, the restack | Do not apply. |
 

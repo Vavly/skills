@@ -122,6 +122,13 @@ node plugins/task-manager/admin/server.mjs --open [--port <n>] [--root <dir>]
 The page is at http://127.0.0.1:4747/. Without `--open`, the server only prints the URL. If the
 port is in use, `--open` opens the page of the server that runs already.
 
+**Usage for each task.** The orchestrator records what each agent used when it returns: tokens,
+tool uses and time. It records nothing for itself: the harness gives no numbers for it. The page
+adds the records for each task, each role and each tier, on the task page,
+in the Tasks list and in the timeline of a run. The mean for each tier shows if the tiers are set
+correctly. The harness gives tokens, not dollars, so the page shows a cost only when a record has
+one.
+
 To stop the server: `/task-manager admin stop`, or `node plugins/task-manager/admin/server.mjs
 --stop [--port <n>]`. It stops only a task-manager admin server, never another program on the
 port.
