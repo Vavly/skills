@@ -101,8 +101,11 @@ function readRunJson(dir) {
 
 export const kindOf = (run) => run.kind ?? 'stack';
 
+/** No answer, and not withdrawn by an archive. */
+export const isOpenQuestion = (q) => (q.answer === null || q.answer === undefined) && !q.withdrawn;
+
 export function openQuestions(questions) {
-  return questions.filter((q) => q.answer === null || q.answer === undefined);
+  return questions.filter(isOpenQuestion);
 }
 
 export function columnOf(layer, open) {
@@ -418,7 +421,7 @@ export function readBoard(root, { at = Date.now() } = {}) {
     // The Tasks view shows the tokens of each task.
     usage: { total: usage.total, layers: usage.layers },
     // Only the questions that a card shows: the open ones and the question of each parked layer.
-    questions: questions.filter((q) => q.answer === null || q.answer === undefined || layers.some((l) => l.parked?.question === q.id)),
+    questions: questions.filter((q) => isOpenQuestion(q) || layers.some((l) => l.parked?.question === q.id)),
     openQuestions: open,
     next,
     lastEvent,

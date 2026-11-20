@@ -1,6 +1,6 @@
 {
   "name": "task-manager",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "An orchestrator for tasks that subagents do, each with a separate reviewer. Code changes end as reviewed pull requests, stacked or on the default branch. Investigations, plans, debug sessions and code executions end as reviewed reports. A ledger outside the repo makes every run resumable, and a local dashboard shows all runs.",
   "author": {
     "name": "Ernesto Rodriguez"

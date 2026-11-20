@@ -342,8 +342,16 @@ function stackOnly(run, what) {
   if (kindOf(run) === 'tasks') fail(`run ${run.id} is a tasks run: ${what} applies to a stack run only`);
 }
 
+/**
+ * True when a question has no answer and the run still waits for one. An archive withdraws the
+ * open questions of its run: a withdrawn question has no answer, but nothing waits for it.
+ */
+export function isOpenQuestion(q) {
+  return (q.answer === null || q.answer === undefined) && !q.withdrawn;
+}
+
 export function openQuestions(questions) {
-  return questions.filter((q) => q.answer === null || q.answer === undefined);
+  return questions.filter(isOpenQuestion);
 }
 
 export function columnOf(layer, open) {
@@ -997,9 +1005,14 @@ function setRunUnlocked(root, runId, pairs, summary) {
   // The mark is for a finished run only, also the value `false`.
   if (setsArchive && run.state !== 'finished') fail(`only a finished run can be archived; run ${run.id} is ${run.state}`);
   if (setsArchive && run.archived) {
-    // An archived run is out of view, so nothing of it must wait for the user.
-    const open = openQuestions(foldLatest(readJsonl(path.join(dir, 'questions.jsonl'))));
-    if (open.length) fail(`run ${run.id} has an open question (${open.map((q) => q.id).join(', ')}): answer it before you archive the run`);
+    // An archived run is out of view, so nothing of it must wait for the user. A finished run has
+    // no session, and the page cannot answer a session-only question, so a refusal here can block
+    // the archive for good. The archive withdraws each open question instead. This is the last
+    // check that can fail: the records below are written only for an archive that is saved.
+    const questionsFile = path.join(dir, 'questions.jsonl');
+    const open = openQuestions(foldLatest(readJsonl(questionsFile)));
+    for (const q of open) appendLine(questionsFile, { ts: now(), id: q.id, withdrawn: true });
+    if (open.length) changes.push(`withdrew ${open.map((q) => q.id).join(', ')} (no answer)`);
   }
   if (run.archived && run.state !== 'finished') {
     // A reopen brings the run back into view.
@@ -1128,6 +1141,7 @@ function answerUnlocked(root, runId, questionId, answerText, via = 'session', co
   const current = foldLatest(readJsonl(file)).find((q) => q.id === questionId);
   if (!current) fail(`no question ${questionId}`);
   if (current.answer !== null && current.answer !== undefined) fail(`question ${questionId} is already answered`);
+  if (current.withdrawn) fail(`question ${questionId} was withdrawn when run ${run.id} was archived; it takes no answer`);
   const confirmed = Boolean(current.sessionOnly) && via !== 'session';
   if (confirmed) checkConfirmed(root, current, text('answer', answerText), confirm);
   appendLine(file, { ts: now(), id: questionId, answer: text('answer', answerText), via, ...(confirmed ? { confirmed: true } : {}) });
@@ -1467,6 +1481,11 @@ export function show(root, runId) {
     lines.push('answered questions (last 5):');
     for (const q of recentAnswers) lines.push(`  ${q.id}${q.layer ? ` (${q.layer})` : ' (run)'}: ${q.question} -> ${q.answer}${answerMark(q)}`);
   }
+  const withdrawn = state.questions.filter((q) => q.withdrawn && (q.answer === null || q.answer === undefined));
+  if (withdrawn.length) {
+    lines.push('withdrawn questions (the archive closed them with no answer; they take none):');
+    for (const q of withdrawn) lines.push(`  ${q.id}${q.layer ? ` (${q.layer})` : ' (run)'}: ${q.question}`);
+  }
   const openFollowups = state.followups.filter((f) => f.issue === null || f.issue === undefined);
   if (openFollowups.length) {
     lines.push('follow-ups not filed (data loss first):');
@@ -1516,7 +1535,7 @@ export function showLayer(root, runId, layerId) {
   const questions = state.questions.filter((q) => q.layer === l.id);
   if (questions.length) {
     lines.push('questions:');
-    for (const q of questions) lines.push(`  ${q.id}${q.sessionOnly ? ' [session only]' : ''}: ${q.question} -> ${q.answer ?? '(no answer yet)'}${answerMark(q)}`);
+    for (const q of questions) lines.push(`  ${q.id}${q.sessionOnly ? ' [session only]' : ''}: ${q.question} -> ${q.answer ?? (q.withdrawn ? '(withdrawn by the archive, no answer)' : '(no answer yet)')}${answerMark(q)}`);
   }
   for (const error of state.errors) lines.push(`warning: ${error}`);
   return lines.join('\n');
@@ -1797,7 +1816,7 @@ export async function waitForAnswer(root, runId, { timeoutMs = 0, pollMs = 2000,
     if (give.length) {
       return { answered: give.map((q) => ({ id: q.id, layer: q.layer ?? null, answer: q.answer, via: q.via ?? 'session', ...(q.confirmed ? { confirmed: true } : {}) })), reason: 'answered' };
     }
-    const open = questions.filter((q) => !isAnswered(q));
+    const open = openQuestions(questions);
     for (const q of open) watched.add(q.id);
     if (open.length === 0) return { answered: [], reason: 'no_open_question' };
     if (readRunJson(dir).state === 'finished') return { answered: [], reason: 'run_finished' };

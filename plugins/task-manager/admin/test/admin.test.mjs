@@ -1020,13 +1020,23 @@ test('H1. the page archives a finished project through the real helper and bring
     assert.equal(gone.status, 200, gone.body);
     assert.deepEqual(await marks(), [true, true, true]);
 
-    // A tasks run with an open question: the question must not go out of view.
+    // A finished run with an open session-only question: the page cannot answer it and no session
+    // runs, so the archive withdraws it. Nothing of the archived run waits for the user then.
     const tasks = core.initRun(ownRoot, { title: 'Tasks', checkout: own, request: 'r', kind: 'tasks', layers: [{ task: 'a', source: 's', tier: 'S', tierReason: 'r' }] }).id;
-    core.ask(ownRoot, tasks, { question: 'A or B?' });
+    const { id: q } = core.ask(ownRoot, tasks, { question: 'Merge?', sessionOnly: true });
     core.setRun(ownRoot, tasks, [['state', 'finished']]);
-    const blocked = await post(s, `/api/runs/${tasks}/archive`, { archived: true }, ok);
-    assert.equal(blocked.status, 409);
-    assert.match(json(blocked).error, /has an open question/);
+    const waiting = async () => json(await request(s, '/api/runs')).runs.find((r) => r.id === tasks).openQuestions;
+    assert.equal(await waiting(), 1);
+    const archived = await post(s, `/api/runs/${tasks}/archive`, { archived: true }, ok);
+    assert.equal(archived.status, 200, archived.body);
+    assert.equal(await waiting(), 0);
+    const board = json(await request(s, '/api/board')).runs.find((e) => e.run.id === tasks);
+    assert.deepEqual([board.openQuestions, board.questions], [[], []]);
+    const detail = json(await request(s, `/api/runs/${tasks}`));
+    assert.deepEqual([detail.openQuestions, detail.questions.find((x) => x.id === q).withdrawn], [[], true]);
+    // A withdrawn question takes no answer from the page.
+    const late = await post(s, `/api/runs/${tasks}/questions/${q}/answer`, { answer: 'yes' }, { origin, 'x-task-manager-admin': 'answer' });
+    assert.notEqual(late.status, 200);
   } finally {
     s.close();
   }
