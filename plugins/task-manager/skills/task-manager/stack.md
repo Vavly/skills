@@ -286,6 +286,46 @@ tasks-run procedure of `independent.md`: it has no restack.
    An `active` run blocks a new run in this checkout. The merge question stays open: do not ask
    it again.
 
+## Add tasks to a stack run
+
+`/task-manager add <run-id> <tasks>`, or the user gives more tasks in the session that works on
+the run. The new layers go on the top of the stack: do not start a second run for them.
+
+1. Run `L show --run <id>`. Then check the run:
+   - If it is `finished`, tell the user and ask: reopen it, or start a new run. To reopen it, run
+     `L run --set state=paused`. `L add` refuses a finished run.
+   - If it is `active`, and this session is not the session that works on it, stop. Tell the user
+     to give the new tasks in that session, or to stop that session first. Two sessions on one
+     run are two writers.
+   - If this session works on the run, wait for a stop point ("Questions and parked layers" in
+     `core.md`).
+2. Do Phase 0 steps 2 to 4 for the new tasks only: the profile, the source of record of each
+   new task, the stack order of the new tasks (step 3), and the tier of each new task. Give each new task its outcome
+   ("Outcomes" in `SKILL.md`). Show the user the new tasks with their outcome and tier, and wait
+   for a yes. A decision for the new tasks goes in the ledger with `L decision`.
+   `L add` puts a new layer only on the top. If a new task changes code that an existing layer
+   uses, it must go below that layer, and `L add` cannot do that. Tell the user, and recommend a
+   new run for that task after the merge of this stack.
+3. Write `layers.json` in your session scratchpad, with one object for each new layer, in the
+   format of Phase 0 step 6. `dependsOn` gives positions in the full run: the existing layers keep
+   `1` to `n`, and the first new layer is `n + 1`. Run
+   `L add --run <id> --layers-file <layers.json>`. It prints `{"added", "stage", "withdrawn"}`.
+   Then record the user's words: `L event --type note --summary "add: <the user's request>"`.
+   `L add` refuses an active run at the stage `finish`, because a merge can be in work. Finish
+   the merge first.
+4. What `L add` changed:
+   - A run at the stage `ci` or `finish` is at the stage `layers` again. The CI record is cleared,
+     because CI ran on the old top. Phase 2 runs CI again on the new top.
+   - At the stage `finish`, `withdrawn` gives the merge question. It named the old top PR. Phase 2
+     asks it again with the new top PR. An open follow-up question stays open.
+5. Continue the run. If it is `paused`, run `L run --set state=active`. If `L` refuses because
+   another run is active for this checkout, tell the user, and stop. Run
+   `L run --set nextStep="Phase 1 step A for <first new layer>"`, and continue Phase 1. The base
+   of a new layer comes from "Stack from the start": the highest layer below it with an open PR,
+   or `origin/<default>`.
+6. Tell the user the ids of the new layers, their tier, and, if `withdrawn` is not empty, that
+   the merge question comes again at the finish.
+
 ## The user merged a PR of the stack
 
 `/task-manager merged <run-id> <layer>`, or the user says it in the session. Do not follow

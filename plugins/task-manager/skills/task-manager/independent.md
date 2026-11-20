@@ -202,6 +202,34 @@ The user can then do one of these three actions, for each task, at any time:
    `L run --set state=finished --set nextStep=null`. Otherwise keep the run as it is.
 10. Tell the user what you deleted, what you kept, and what waits, one line each.
 
+## Add tasks to a run
+
+`/task-manager add <run-id> <tasks>`, or the user gives more tasks in the session that works on
+the run. The new tasks join the run: do not start a second run for them.
+
+1. Run `L show --run <id>`. Then check the run:
+   - If it is `finished`, tell the user and ask: reopen it, or start a new run. To reopen it, run
+     `L run --set state=paused`. `L add` refuses a finished run.
+   - If it is `active`, and this session is not the session that works on it, stop. Tell the user
+     to give the new tasks in that session, or to stop that session first. Two sessions on one
+     run are two writers.
+   - If this session works on the run, wait for a stop point ("Questions and parked layers" in
+     `core.md`).
+2. Do Phase 0 steps 2 to 4 for the new tasks only: the profile, the source of record of each
+   new task, the shared-code check (step 3) between the new tasks and the tasks of the run that are not `merged`, and the tier of each new task. Give each new task its outcome
+   ("Outcomes" in `SKILL.md`). Show the user the new tasks with their outcome and tier, and wait
+   for a yes. A decision for the new tasks goes in the ledger with `L decision`.
+3. Write `layers.json` in your session scratchpad, with one object for each new task, in the
+   format of Phase 0 step 6. `dependsOn` gives positions in the full run: the existing tasks keep
+   `1` to `n`, and the first new task is `n + 1`. It can name only a report task, existing or new.
+   Run `L add --run <id> --layers-file <layers.json>`. It prints `{"added", "stage", "withdrawn"}`.
+   Then record the user's words: `L event --type note --summary "add: <the user's request>"`.
+4. Continue the run. If it is `paused`, run `L run --set state=active`. If `L` refuses because
+   another run is active for this checkout, tell the user, and stop. Run
+   `L run --set nextStep="Phase 1 step A for <first new task>"`, and continue Phase 1 with the task
+   that `L next` gives. The open PRs of the run stay as they are.
+5. Tell the user the ids of the new tasks, their tier, and the result of the shared-code check.
+
 ## Resume
 
 `/task-manager resume [<run-id>]` follows "Resume" in `core.md`. With no run id, the list gives

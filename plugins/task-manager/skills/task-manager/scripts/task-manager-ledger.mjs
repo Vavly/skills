@@ -17,6 +17,7 @@ import { parseArgs } from 'node:util';
 import {
   LedgerError,
   addDecision,
+  addLayers,
   addEventCommand,
   addFinding,
   addMainPlan,
@@ -133,6 +134,7 @@ const COMMANDS = {
       kind: v.kind,
       dryRun: v['dry-run'],
     }),
+  add: (v, root) => addLayers(root, need(v, 'run'), readJsonFile(need(v, 'layers-file'), 'layers')),
   layer: (v, root) => setLayer(root, need(v, 'run'), need(v, 'layer'), pairs(v), v.summary),
   run: (v, root) => setRun(root, need(v, 'run'), pairs(v), v.summary),
   decision: (v, root) => addDecision(root, need(v, 'run'), need(v, 'question'), need(v, 'answer')),

@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import {
   PHASES,
   addFinding,
+  addLayers,
   answer,
   ask,
   blockedBy,
@@ -77,7 +78,10 @@ test('1. init makes <date>-<slug>, and a second run with the same title the same
 
 test('2. every command rejects a run id with a slash, .., capitals or spaces', () => {
   const root = tempRoot();
+  const addFile = path.join(root, 'add.json');
+  writeFileSync(addFile, JSON.stringify(layers(1)));
   const commands = [
+    ['add', '--layers-file', addFile],
     ['layer', '--layer', 'l1', '--set', 'round=1'],
     ['run', '--set', 'state=paused'],
     ['decision', '--question', 'q', '--answer', 'a'],
@@ -2190,10 +2194,10 @@ test('H1. only a finished run can be archived; the mark is the one write that a 
   assert.match(readRun(root, id).events.at(-1).summary, new RegExp(`archived=true, withdrew ${q1}, ${q2} \\(no answer\\)`));
   // An answered question keeps its answer, and a withdrawn one takes no answer, also after "Bring back".
   assert.equal(readRun(root, id).questions.find((q) => q.id === q3).answer, 'C');
-  assert.match(cli(root, 'show', '--run', id).stdout, new RegExp(`withdrawn questions .*\\n  ${q1} \\(run\\): A or B\\?\\n  ${q2} \\(run\\): Merge the stack\\?\\n`));
+  assert.match(cli(root, 'show', '--run', id).stdout, new RegExp(`withdrawn questions .*\\n  ${q1} \\(run\\): A or B\\? \\[withdrawn when the run was archived\\]\\n  ${q2} \\(run\\): Merge the stack\\? \\[withdrawn when the run was archived\\]\\n`));
   assert.equal(run('archived=false').code, 0);
   assert.deepEqual(readRun(root, id).openQuestions, []);
-  assert.match(cli(root, 'answer', '--run', id, '--id', q1, '--answer', 'A').stderr, new RegExp(`question ${q1} was withdrawn when run .* was archived`));
+  assert.match(cli(root, 'answer', '--run', id, '--id', q1, '--answer', 'A').stderr, new RegExp(`question ${q1} of run .* was withdrawn when the run was archived`));
   assert.equal(run('archived=true').code, 0);
   assert.match(readRun(root, id).events.at(-1).summary, /^archived=true$/);
   assert.equal(cli(root, 'usage', '--run', id, '--layer', 'l1', '--role', 'reviewer', '--tokens', '5').code, 0);
@@ -2207,6 +2211,93 @@ test('H1. only a finished run can be archived; the mark is the one write that a 
   assert.equal(run('state=finished', 'archived=true').code, 0);
   const next = newRun(root, 1, {}, { title: 'Next' });
   assert.deepEqual(listRuns(root).runs.map((r) => [r.id, r.archived]).sort(), [[id, true], [next, false]].sort());
+});
+
+// ── Add tasks to a run ───────────────────────────────────────────────────────────────────────────
+
+test('AD1. add puts new layers after the existing ones; dependsOn names positions in the full run', () => {
+  const root = tempRoot();
+  const id = newRun(root);
+  const file = path.join(root, 'more.json');
+  writeFileSync(file, JSON.stringify([
+    { task: 'task 4', source: '#200', tier: 'S', tierReason: 'small', dependsOn: [3] },
+    { task: 'task 5', source: '#201', tier: 'L', tierReason: 'big', outcome: 'report', dependsOn: [1, 4] },
+  ]));
+  const result = cli(root, 'add', '--run', id, '--layers-file', file);
+  assert.equal(result.code, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), { run: id, added: ['l4', 'l5'], stage: 'intake', withdrawn: [] });
+  const { run, events } = readRun(root, id);
+  assert.deepEqual(run.layers.map((l) => [l.id, l.position, l.phase, l.outcome, l.dependsOn]), [
+    ['l1', 1, 'queued', 'pr', []],
+    ['l2', 2, 'queued', 'pr', []],
+    ['l3', 3, 'queued', 'pr', []],
+    ['l4', 4, 'queued', 'pr', ['l3']],
+    ['l5', 5, 'queued', 'report', ['l1', 'l4']],
+  ]);
+  assert.equal(events.at(-1).type, 'run_update');
+  assert.equal(events.at(-1).summary, 'added l4 (task 4), l5 (task 5)');
+  // The checks of init apply, with the positions of the full run. A refusal writes nothing.
+  const before = eventCount(root, id);
+  assert.match(addFails(root, id, [{ ...layers(1)[0], dependsOn: [6] }]), /layer 6: dependsOn may name only earlier layers by 1-based index; got 6/);
+  assert.match(addFails(root, id, [{ ...layers(1)[0], tier: 'XL' }]), /layer 6 tier must be one of/);
+  assert.match(addFails(root, id, []), /the layers file must be a non-empty JSON array/);
+  assert.equal(readRun(root, id).run.layers.length, 5);
+  assert.equal(eventCount(root, id), before);
+  // A finished run is closed: reopen it first.
+  setRun(root, id, [['state', 'finished']]);
+  assert.match(addFails(root, id, layers(1)), /is finished; reopen it first/);
+  setRun(root, id, [['state', 'paused']]);
+  assert.deepEqual(addLayers(root, id, layers(1)).added, ['l6']);
+});
+
+/** The error message of an `add` that must fail. */
+function addFails(root, id, entries) {
+  try {
+    addLayers(root, id, entries);
+  } catch (error) {
+    return error.message;
+  }
+  return assert.fail('add accepted the layers');
+}
+
+test('AD2. add on a stack run at the finish goes back to the layers stage, clears CI and withdraws the merge question', () => {
+  const root = tempRoot();
+  const id = newRun(root, 2);
+  setRun(root, id, [['stage', 'ci'], ['ciPr', '12'], ['ciResult', 'pass']]);
+  setRun(root, id, [['stage', 'finish'], ['state', 'paused']]);
+  const merge = ask(root, id, { question: 'Merge the stack? Which PR is the top?', options: ['#12'], sessionOnly: true }).id;
+  const followups = ask(root, id, { question: 'Which follow-ups to file?', options: ['fu1', 'none'] }).id;
+  const layerQuestion = ask(root, id, { layer: 'l2', question: 'Keep the old name?', sessionOnly: true }).id;
+  const result = addLayers(root, id, layers(1));
+  assert.deepEqual(result, { run: id, added: ['l3'], stage: 'layers', withdrawn: [merge] });
+  const state = readRun(root, id);
+  assert.equal(state.run.ci, null);
+  assert.equal(state.run.state, 'paused');
+  // The follow-up question and a question of a layer stay open: the new layer does not change them.
+  assert.deepEqual(state.openQuestions.map((q) => q.id), [followups, layerQuestion]);
+  assert.equal(state.events.at(-1).summary, `added l3 (task 1), stage=layers, CI record cleared, withdrew ${merge} (no answer)`);
+  assert.match(cli(root, 'answer', '--run', id, '--id', merge, '--answer', '#12').stderr, new RegExp(`question ${merge} of run .* was withdrawn when new tasks were added to the run; it takes no answer`));
+  assert.match(cli(root, 'show', '--run', id).stdout, new RegExp(`  ${merge} \\(run\\): Merge the stack\\? Which PR is the top\\? \\[withdrawn when new tasks were added to the run\\]`));
+  // An active stack run at the finish can be in a merge: add waits for it.
+  setRun(root, id, [['stage', 'finish'], ['state', 'active']]);
+  assert.match(addFails(root, id, layers(1)), /is active at the stage finish, and a merge of its stack can be in work/);
+  // At the layers stage, an active run takes new layers, and the stage stays.
+  setRun(root, id, [['stage', 'layers']]);
+  assert.deepEqual(addLayers(root, id, layers(1)), { run: id, added: ['l4'], stage: 'layers', withdrawn: [] });
+});
+
+test('AD3. add on a tasks run keeps its rules: a task waits only for a report task', () => {
+  const root = tempRoot();
+  const entries = [{ ...layers(1)[0], outcome: 'report' }, layers(2)[1]];
+  const id = initRun(root, { title: 'Tasks', checkout: CHECKOUT, request: 'r', kind: 'tasks', layers: entries, date: '2026-11-06' }).id;
+  assert.match(addFails(root, id, [{ ...layers(1)[0], dependsOn: [2] }]), /task 3: in a tasks run, dependsOn may name only report tasks/);
+  assert.match(addFails(root, id, [layers(1)[0], { ...layers(1)[0], dependsOn: [3] }]), /task 4: in a tasks run, dependsOn may name only report tasks/);
+  // A tasks run has no merge question and no run CI. Its stop is active or paused at the finish.
+  setRun(root, id, [['stage', 'finish']]);
+  const followups = ask(root, id, { question: 'Which follow-ups to file?', sessionOnly: true }).id;
+  assert.deepEqual(addLayers(root, id, [{ ...layers(1)[0], dependsOn: [1] }]), { run: id, added: ['l3'], stage: 'layers', withdrawn: [] });
+  assert.deepEqual(readRun(root, id).openQuestions.map((q) => q.id), [followups]);
+  assert.deepEqual(readRun(root, id).run.layers.at(-1).dependsOn, ['l1']);
 });
 
 // ── Corrections from the first real runs ────────────────────────────────────────────────────────

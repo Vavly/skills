@@ -409,6 +409,10 @@ another folder.
   (`L run --set state=paused`), a merge record of a layer whose PR is open
   (`L layer --set phase=merged` and `L event --type merge`), a filed follow-up
   (`L followup-filed`), and an answer to a question that was still open (`L answer`).
+- **More tasks for a run.** `L add` adds layers to a run that is not finished. The kind file
+  gives the procedure: "Add tasks to a run" in `independent.md`, "Add tasks to a stack run" in
+  `stack.md`. `L init` is still the only start of a run, and `L add` never changes an existing
+  layer.
 - **A run belongs to one checkout.** Commits that are not pushed exist only in that checkout. One
   checkout has one active run at a time, a stack run or a tasks run, because there is only one
   writer.
@@ -431,6 +435,7 @@ steps below leave it out. In each command, `--layer` takes the layer id.
 | Start a run (the intake of your kind file) | `L init [--kind tasks] --title --checkout --request-file --layers-file` |
 | Check the plan of a run, and write nothing (`/task-manager preview`) | `L init --dry-run` with the same options. It prints the run that `init` would make, `activeRun` and `pausedRuns` for the checkout, and a token estimate from earlier runs. Only `init` takes `--dry-run`. |
 | A decision of the user at intake | `L decision --question --answer` |
+| Add tasks to a run that is not finished (`/task-manager add`) | `L add --run <id> --layers-file <file>`. The file has the format of the layers file of `init`. The new layers get the next ids and positions, and `dependsOn` gives positions in the full run. It prints `{"added", "stage", "withdrawn"}`. A run at the stage `ci` or `finish` goes back to `layers`. In a stack run, it also clears the CI record, and at the stage `finish` it withdraws the merge question (`withdrawn`). It refuses a finished run, and an active stack run at the stage `finish`. |
 | A layer field changes: phase, round, branch, SHAs, agent ids, tier, escalation, PR | `L layer --layer <layer> --set key=value ...` |
 | A run field changes: state, stage, next step, CI | `L run --set key=value ...` |
 | A question to the user, and its answer | `L ask [--layer] [--session-only] --question --option ...`, `L answer --id --answer`. `--session-only` is for the questions that "The user can answer in two places" lists: the admin page cannot answer it, or only with a typed confirmation when the user's setting permits that. |

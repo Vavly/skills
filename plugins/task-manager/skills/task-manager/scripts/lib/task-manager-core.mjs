@@ -354,6 +354,17 @@ export function openQuestions(questions) {
   return questions.filter(isOpenQuestion);
 }
 
+/** Why a question was withdrawn, for a message. A record of 0.1.2 has no `by`: an archive wrote it. */
+export function withdrawalCause(q) {
+  return q.by === 'add' ? 'new tasks were added to the run' : 'the run was archived';
+}
+
+/** Withdraw questions: each one then has no answer, and nothing waits for it. Gives their ids. */
+function withdrawQuestions(file, questions, by) {
+  for (const q of questions) appendLine(file, { ts: now(), id: q.id, withdrawn: true, by });
+  return questions.map((q) => q.id);
+}
+
 export function columnOf(layer, open) {
   if (layer.parked || open.some((q) => q.layer === layer.id)) return 'needs_input';
   if (layer.phase === 'queued') return 'todo';
@@ -702,28 +713,15 @@ function assertRootWritable(root) {
 }
 
 /**
- * Create a run. `layers` is an array of `{task, source, tier, tierReason, dependsOn}` in stack
- * order, where `dependsOn` holds 1-based indexes of earlier entries. A `tasks` run takes the same
- * array in work order, and a task of it can wait only for a report task.
- *
- * With `dryRun`, check the same input and write nothing. The result shows the run that `init`
- * would make, the runs of the checkout that a real start meets (`activeRun` blocks it, and a
- * paused run makes a stack run ask "resume it, or start a new run"), and an estimate of the
- * tokens from the earlier runs of this root.
+ * Build the layer records of a layers file. `existing` are the layers that the run has already:
+ * the new layers come after them, so the first new layer is `l<existing + 1>`. `dependsOn` holds
+ * 1-based positions in the full run, so an entry can name an existing layer or an earlier entry.
  */
-export function initRun(root, { title, checkout, request, layers, kind = 'stack', date = now().slice(0, 10), dryRun = false }) {
-  oneOf('kind', kind, KINDS);
-  text('title', title);
-  text('checkout', checkout);
-  if (!path.isAbsolute(checkout)) fail('checkout must be an absolute path');
-  checkout = path.resolve(checkout);
-  text('request', request);
-  if (!Array.isArray(layers) || layers.length === 0) fail('the layers file must be a non-empty JSON array');
-  const active = listRuns(root, { checkout, states: ['active'] }).runs;
-  if (active.length && !dryRun) fail(`run ${active[0].id} is active for this checkout; set it to paused or finished first`);
-
-  const built = layers.map((entry, index) => {
-    const number = index + 1;
+function buildLayers(entries, kind, existing = []) {
+  const offset = existing.length;
+  const outcomeAt = (position) => (position <= offset ? outcomeOf(existing.find((l) => l.position === position)) : (entries[position - offset - 1].outcome ?? 'pr'));
+  return entries.map((entry, index) => {
+    const number = offset + index + 1;
     const deps = entry.dependsOn ?? [];
     if (!Array.isArray(deps)) fail(`layer ${number}: dependsOn must be an array of indexes`);
     const outcome = entry.outcome === undefined ? 'pr' : oneOf(`layer ${number} outcome`, entry.outcome, OUTCOMES);
@@ -733,7 +731,7 @@ export function initRun(root, { title, checkout, request, layers, kind = 'stack'
       }
     }
     // In a tasks run, no PR is on another PR. A task can wait only for a report.
-    if (kind === 'tasks' && deps.some((dep) => (layers[dep - 1].outcome ?? 'pr') === 'pr')) {
+    if (kind === 'tasks' && deps.some((dep) => outcomeAt(dep) === 'pr')) {
       fail(`task ${number}: in a tasks run, dependsOn may name only report tasks; use a stack run for a task that uses the code of another task`);
     }
     return {
@@ -761,6 +759,30 @@ export function initRun(root, { title, checkout, request, layers, kind = 'stack'
       plan: null,
     };
   });
+}
+
+/**
+ * Create a run. `layers` is an array of `{task, source, tier, tierReason, dependsOn}` in stack
+ * order, where `dependsOn` holds 1-based indexes of earlier entries. A `tasks` run takes the same
+ * array in work order, and a task of it can wait only for a report task.
+ *
+ * With `dryRun`, check the same input and write nothing. The result shows the run that `init`
+ * would make, the runs of the checkout that a real start meets (`activeRun` blocks it, and a
+ * paused run makes a stack run ask "resume it, or start a new run"), and an estimate of the
+ * tokens from the earlier runs of this root.
+ */
+export function initRun(root, { title, checkout, request, layers, kind = 'stack', date = now().slice(0, 10), dryRun = false }) {
+  oneOf('kind', kind, KINDS);
+  text('title', title);
+  text('checkout', checkout);
+  if (!path.isAbsolute(checkout)) fail('checkout must be an absolute path');
+  checkout = path.resolve(checkout);
+  text('request', request);
+  if (!Array.isArray(layers) || layers.length === 0) fail('the layers file must be a non-empty JSON array');
+  const active = listRuns(root, { checkout, states: ['active'] }).runs;
+  if (active.length && !dryRun) fail(`run ${active[0].id} is active for this checkout; set it to paused or finished first`);
+
+  const built = buildLayers(layers, kind);
 
   if (dryRun) {
     assertRootWritable(root);
@@ -1010,9 +1032,8 @@ function setRunUnlocked(root, runId, pairs, summary) {
     // the archive for good. The archive withdraws each open question instead. This is the last
     // check that can fail: the records below are written only for an archive that is saved.
     const questionsFile = path.join(dir, 'questions.jsonl');
-    const open = openQuestions(foldLatest(readJsonl(questionsFile)));
-    for (const q of open) appendLine(questionsFile, { ts: now(), id: q.id, withdrawn: true });
-    if (open.length) changes.push(`withdrew ${open.map((q) => q.id).join(', ')} (no answer)`);
+    const withdrawn = withdrawQuestions(questionsFile, openQuestions(foldLatest(readJsonl(questionsFile))), 'archive');
+    if (withdrawn.length) changes.push(`withdrew ${withdrawn.join(', ')} (no answer)`);
   }
   if (run.archived && run.state !== 'finished') {
     // A reopen brings the run back into view.
@@ -1029,6 +1050,46 @@ function setRunUnlocked(root, runId, pairs, summary) {
     notify(root, { type: run.state, run: run.id, title: run.title, layer: null, text: run.nextStep ?? null });
   }
   return { run: run.id, state: run.state, stage: run.stage };
+}
+
+/**
+ * Add layers to a run that is not finished. `layers` has the format of the layers file of `init`.
+ * The new layers come after the existing ones: in a stack run they go on the top of the stack.
+ * When the run is at the `ci` or `finish` stage, it goes back to `layers`, because the new layers
+ * are still to do. In a stack run, the CI result of the old top is then out of date, and an open
+ * merge question names the old top PR: the CI record is cleared, and the stage `finish` withdraws
+ * each open run-level question that only the session can answer (the merge yes).
+ */
+function addLayersUnlocked(root, runId, layers) {
+  const { dir, run } = load(root, runId);
+  if (!Array.isArray(layers) || layers.length === 0) fail('the layers file must be a non-empty JSON array');
+  const kind = kindOf(run);
+  // An active stack run at the stage `finish` can be in a merge: GitHub then moves the PRs.
+  if (kind === 'stack' && run.state === 'active' && run.stage === 'finish') {
+    fail(`run ${run.id} is active at the stage finish, and a merge of its stack can be in work; add the tasks after the merge, or when the run is paused`);
+  }
+  const added = buildLayers(layers, kind, run.layers);
+  run.layers.push(...added);
+  const changes = [`added ${added.map((l) => `${l.id} (${l.task})`).join(', ')}`];
+  const stageBefore = run.stage;
+  let withdrawn = [];
+  if (stageBefore === 'ci' || stageBefore === 'finish') {
+    run.stage = 'layers';
+    changes.push('stage=layers');
+    if (kind === 'stack' && run.ci) {
+      run.ci = null;
+      changes.push('CI record cleared');
+    }
+    if (kind === 'stack' && stageBefore === 'finish') {
+      const file = path.join(dir, 'questions.jsonl');
+      const merge = openQuestions(foldLatest(readJsonl(file))).filter((q) => !q.layer && q.sessionOnly);
+      withdrawn = withdrawQuestions(file, merge, 'add');
+      if (withdrawn.length) changes.push(`withdrew ${withdrawn.join(', ')} (no answer)`);
+    }
+  }
+  saveRun(dir, run);
+  addEvent(dir, { type: 'run_update', summary: changes.join(', ') });
+  return { run: run.id, added: added.map((l) => l.id), stage: run.stage, withdrawn };
 }
 
 function addDecisionUnlocked(root, runId, question, answer) {
@@ -1141,7 +1202,7 @@ function answerUnlocked(root, runId, questionId, answerText, via = 'session', co
   const current = foldLatest(readJsonl(file)).find((q) => q.id === questionId);
   if (!current) fail(`no question ${questionId}`);
   if (current.answer !== null && current.answer !== undefined) fail(`question ${questionId} is already answered`);
-  if (current.withdrawn) fail(`question ${questionId} was withdrawn when run ${run.id} was archived; it takes no answer`);
+  if (current.withdrawn) fail(`question ${questionId} of run ${run.id} was withdrawn when ${withdrawalCause(current)}; it takes no answer`);
   const confirmed = Boolean(current.sessionOnly) && via !== 'session';
   if (confirmed) checkConfirmed(root, current, text('answer', answerText), confirm);
   appendLine(file, { ts: now(), id: questionId, answer: text('answer', answerText), via, ...(confirmed ? { confirmed: true } : {}) });
@@ -1407,6 +1468,7 @@ function followupFiledUnlocked(root, runId, followupId, issue) {
 
 export const setLayer = locked(setLayerUnlocked);
 export const setRun = locked(setRunUnlocked);
+export const addLayers = locked(addLayersUnlocked);
 export const addDecision = locked(addDecisionUnlocked);
 export const addEventCommand = locked(addEventCommandUnlocked);
 export const ask = locked(askUnlocked);
@@ -1483,8 +1545,8 @@ export function show(root, runId) {
   }
   const withdrawn = state.questions.filter((q) => q.withdrawn && (q.answer === null || q.answer === undefined));
   if (withdrawn.length) {
-    lines.push('withdrawn questions (the archive closed them with no answer; they take none):');
-    for (const q of withdrawn) lines.push(`  ${q.id}${q.layer ? ` (${q.layer})` : ' (run)'}: ${q.question}`);
+    lines.push('withdrawn questions (closed with no answer; they take none):');
+    for (const q of withdrawn) lines.push(`  ${q.id}${q.layer ? ` (${q.layer})` : ' (run)'}: ${q.question} [withdrawn when ${withdrawalCause(q)}]`);
   }
   const openFollowups = state.followups.filter((f) => f.issue === null || f.issue === undefined);
   if (openFollowups.length) {
@@ -1535,7 +1597,7 @@ export function showLayer(root, runId, layerId) {
   const questions = state.questions.filter((q) => q.layer === l.id);
   if (questions.length) {
     lines.push('questions:');
-    for (const q of questions) lines.push(`  ${q.id}${q.sessionOnly ? ' [session only]' : ''}: ${q.question} -> ${q.answer ?? (q.withdrawn ? '(withdrawn by the archive, no answer)' : '(no answer yet)')}${answerMark(q)}`);
+    for (const q of questions) lines.push(`  ${q.id}${q.sessionOnly ? ' [session only]' : ''}: ${q.question} -> ${q.answer ?? (q.withdrawn ? `(withdrawn when ${withdrawalCause(q)}, no answer)` : '(no answer yet)')}${answerMark(q)}`);
   }
   for (const error of state.errors) lines.push(`warning: ${error}`);
   return lines.join('\n');

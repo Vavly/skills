@@ -1044,6 +1044,30 @@ test('H1. the page archives a finished project through the real helper and bring
 
 // ── Corrections from the first real runs ────────────────────────────────────────────────────────
 
+test('AD1. the lists and the board show the layers that add puts on a run, and a merge question that add withdrew waits no more', async () => {
+  const core = await import('../../skills/task-manager/scripts/lib/task-manager-core.mjs');
+  const own = mkdtempSync(path.join(tmpdir(), 'task-manager-admin-add-'));
+  const ownRoot = path.join(own, 'runs');
+  const layer = (task) => ({ task, source: 's', tier: 'S', tierReason: 'r' });
+  const { id } = core.initRun(ownRoot, { title: 'Stack', checkout: own, request: 'r', layers: [layer('a'), layer('b')] });
+  core.setRun(ownRoot, id, [['stage', 'finish'], ['state', 'paused']]);
+  const { id: merge } = core.ask(ownRoot, id, { question: 'Merge the stack?', options: ['#2'], sessionOnly: true });
+  const s = await startAdminServer({ root: ownRoot, port: 0 });
+  try {
+    const listed = async () => json(await request(s, '/api/runs')).runs[0];
+    assert.deepEqual([(await listed()).layers, (await listed()).openQuestions], [2, 1]);
+    core.addLayers(ownRoot, id, [layer('c'), layer('d')]);
+    assert.deepEqual([(await listed()).layers, (await listed()).openQuestions], [4, 0]);
+    const board = json(await request(s, '/api/board')).runs[0];
+    assert.deepEqual(board.layers.map((l) => [l.id, l.task, l.column]), [['l1', 'a', 'todo'], ['l2', 'b', 'todo'], ['l3', 'c', 'todo'], ['l4', 'd', 'todo']]);
+    assert.deepEqual([board.run.stage, board.openQuestions], ['layers', []]);
+    const detail = json(await request(s, `/api/runs/${id}`));
+    assert.deepEqual(detail.questions.filter((q) => q.id === merge).map((q) => [q.withdrawn, q.by]), [[true, 'add']]);
+  } finally {
+    s.close();
+  }
+});
+
 test('RR1. [real run] the page starts a session for an active run only with the user word in the body; a queued task with a question is not next', async () => {
   const core = await import('../../skills/task-manager/scripts/lib/task-manager-core.mjs');
   const own = mkdtempSync(path.join(tmpdir(), 'task-manager-admin-realrun-'));

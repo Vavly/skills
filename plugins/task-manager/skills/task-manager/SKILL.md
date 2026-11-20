@@ -1,8 +1,8 @@
 ---
 name: task-manager
-description: Use only when the user gives one or more tasks and asks for subagents to do them under an orchestrator, each task with a separate reviewer — code changes end as reviewed pull requests (stacked, or each on the default branch), and investigations, plans, debug sessions, code executions and information searches end as reviewed reports. Also resumes a run, takes more changes on a task, cleans up after a merge, writes the project profile (setup) and starts the local dashboard of all runs (admin).
+description: Use only when the user gives one or more tasks and asks for subagents to do them under an orchestrator, each task with a separate reviewer — code changes end as reviewed pull requests (stacked, or each on the default branch), and investigations, plans, debug sessions, code executions and information searches end as reviewed reports. Also resumes a run, adds tasks to a run, takes more changes on a task, cleans up after a merge, writes the project profile (setup) and starts the local dashboard of all runs (admin).
 disable-model-invocation: true
-argument-hint: <tasks> | from-issues <filter> | preview <tasks> | resume [<run-id>] | changes <run-id> <task> <what> | merged <run-id> <task> | setup [update] | admin [stop] [--port <n>] [--root <dir>]
+argument-hint: <tasks> | from-issues <filter> | preview <tasks> | resume [<run-id>] | add <run-id> <tasks> | changes <run-id> <task> <what> | merged <run-id> <task> | setup [update] | admin [stop] [--port <n>] [--root <dir>]
 ---
 
 # Task manager
@@ -27,6 +27,7 @@ The arguments select the mode. Read only the files of your mode, each one in ful
 | `from-issues <filter>` | Start a run whose tasks are GitHub issues | [core.md](core.md), then "Tasks from issues" below, then "Start a run" |
 | `preview <tasks>` | Show what a run would do, and start nothing | [core.md](core.md), then "Preview a run" below. For `preview from-issues <filter>`, read "Tasks from issues" too. |
 | `resume [<run-id>]` | Continue a run in a new session | [core.md](core.md) ("Resume"), then the kind file of the run, and [report-tasks.md](report-tasks.md) if the run has a report layer |
+| `add <run-id> <tasks>` | Add tasks to a run that is not finished | [core.md](core.md). Then, by the run: a tasks run: [independent.md](independent.md), "Add tasks to a run". A stack run: [stack.md](stack.md), "Add tasks to a stack run". Also [report-tasks.md](report-tasks.md) if a new task is a report task. |
 | `changes <run-id> <task> <what>` | More changes on a task that has its outcome | [core.md](core.md). Then, by the task: a report task: [report-tasks.md](report-tasks.md), "More changes on a delivered report". A `pr` task of a tasks run: [independent.md](independent.md), "More changes on an open PR". A `pr` layer of a stack run: [stack.md](stack.md), "More changes on a layer of the stack". |
 | `merged <run-id> <task>` | The user merged a PR | [core.md](core.md). A tasks run: [independent.md](independent.md), "Cleanup after a merge". A stack run: [stack.md](stack.md), "The user merged a PR of the stack". |
 | `setup [update]` | Write the profile of this repository | [setup.md](setup.md) only |
