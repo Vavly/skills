@@ -2173,14 +2173,29 @@ test('H1. only a finished run can be archived; the mark is the one write that a 
   assert.equal(readRun(root, id).run.archived, true);
   assert.equal(run('archived=false').code, 0);
   assert.equal(readRun(root, id).run.archived, false);
-  // An open question must not go out of view with its run.
-  const q1 = JSON.parse(cli(root, 'run', '--run', id, '--set', 'state=paused').code === 0 ? cli(root, 'ask', '--run', id, '--question', 'A or B?').stdout : '{}').id;
+  // Nothing of an archived run waits for the user: the archive withdraws each open question.
+  // A session-only question is the case that matters: a finished run has no session, and the page
+  // cannot answer it, so a refusal would block the archive for good.
+  assert.equal(run('state=paused').code, 0);
+  const q1 = JSON.parse(cli(root, 'ask', '--run', id, '--question', 'A or B?').stdout).id;
+  const q2 = JSON.parse(cli(root, 'ask', '--run', id, '--question', 'Merge the stack?', '--session-only').stdout).id;
+  const q3 = JSON.parse(cli(root, 'ask', '--run', id, '--question', 'C or D?').stdout).id;
+  assert.equal(cli(root, 'answer', '--run', id, '--id', q3, '--answer', 'C').code, 0);
   assert.equal(run('state=finished').code, 0);
-  assert.match(run('archived=true').stderr, new RegExp(`has an open question \\(${q1}\\): answer it before you archive`));
-  assert.equal(readRun(root, id).run.archived, false);
-  assert.equal(cli(root, 'answer', '--run', id, '--id', q1, '--answer', 'A').code, 0);
+  assert.equal(readRun(root, id).openQuestions.length, 2);
   // The writes that a finished run still takes do not remove the mark.
   assert.equal(run('archived=true').code, 0);
+  assert.equal(readRun(root, id).run.archived, true);
+  assert.deepEqual(readRun(root, id).openQuestions, []);
+  assert.match(readRun(root, id).events.at(-1).summary, new RegExp(`archived=true, withdrew ${q1}, ${q2} \\(no answer\\)`));
+  // An answered question keeps its answer, and a withdrawn one takes no answer, also after "Bring back".
+  assert.equal(readRun(root, id).questions.find((q) => q.id === q3).answer, 'C');
+  assert.match(cli(root, 'show', '--run', id).stdout, new RegExp(`withdrawn questions .*\\n  ${q1} \\(run\\): A or B\\?\\n  ${q2} \\(run\\): Merge the stack\\?\\n`));
+  assert.equal(run('archived=false').code, 0);
+  assert.deepEqual(readRun(root, id).openQuestions, []);
+  assert.match(cli(root, 'answer', '--run', id, '--id', q1, '--answer', 'A').stderr, new RegExp(`question ${q1} was withdrawn when run .* was archived`));
+  assert.equal(run('archived=true').code, 0);
+  assert.match(readRun(root, id).events.at(-1).summary, /^archived=true$/);
   assert.equal(cli(root, 'usage', '--run', id, '--layer', 'l1', '--role', 'reviewer', '--tokens', '5').code, 0);
   assert.equal(readRun(root, id).run.archived, true);
   // A reopen brings an archived run back into view, and the event says so.

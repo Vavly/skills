@@ -663,7 +663,12 @@ function archiveControl(state) {
           url: `/api/runs/${enc(run.id)}/archive`,
           action: 'archive',
           getBody: () => ({ archived: next }),
-          content: h('p', null, next ? `The page hides an archived ${tasks ? 'run, with every task of it' : 'project'}. Its run folder stays as it is, and "Show archived" brings it back into the list.` : 'It shows in the lists again.'),
+          content: [
+            h('p', null, next ? `The page hides an archived ${tasks ? 'run, with every task of it' : 'project'}. Its run folder stays as it is, and "Show archived" brings it back into the list.` : 'It shows in the lists again.'),
+            next && state.openQuestions.length
+              ? h('p', { class: 'warn-text' }, `${plural(state.openQuestions.length, 'open question')} (${state.openQuestions.map((q) => q.id).join(', ')}) will be withdrawn with no answer. A withdrawn question takes no answer, also after "Bring back".`)
+              : null,
+          ],
         }),
     },
     next ? (tasks ? 'Archive run' : 'Archive') : 'Bring back',
@@ -782,6 +787,7 @@ function openAnswer(state, q) {
 /** The way to answer an open question: a button, or a note for a question that only the session takes. */
 function answerControl(state, q) {
   if (q.answer !== null && q.answer !== undefined) return null;
+  if (q.withdrawn) return h('p', { class: 'muted small' }, 'Withdrawn by the archive of the project: it takes no answer.');
   if (q.sessionOnly && !settings.confirmOnPage) return h('p', { class: 'muted small' }, 'Answer this question in the session of clone ', h('code', null, clone(state.run.checkout)), '. The page cannot answer it.');
   const button = h('button', { type: 'button', class: 'btn answer' }, q.sessionOnly ? 'Answer with a confirmation' : 'Answer');
   button.addEventListener('click', (event) => {
@@ -1175,7 +1181,7 @@ function layerDetail(state, l) {
     ),
     l.parked ? h('div', { class: 'parked' }, h('strong', null, `Parked at ${l.parked.phase}, round ${l.parked.round}, on ${l.parked.question}`)) : null,
     questions.length
-      ? [h('h2', null, 'Questions'), h('ul', { class: 'questions' }, questions.map((q) => h('li', null, h('span', { class: 'muted small' }, `${q.id} `), q.question, ' → ', q.answer ? [h('strong', null, q.answer), q.via === 'dashboard' ? h('span', { class: 'muted small' }, ' (from this page)') : null] : [badge('no answer yet', 'needs'), answerControl(state, q)])))]
+      ? [h('h2', null, 'Questions'), h('ul', { class: 'questions' }, questions.map((q) => h('li', null, h('span', { class: 'muted small' }, `${q.id} `), q.question, ' → ', q.answer ? [h('strong', null, q.answer), q.via === 'dashboard' ? h('span', { class: 'muted small' }, ' (from this page)') : null] : q.withdrawn ? badge('withdrawn, no answer') : [badge('no answer yet', 'needs'), answerControl(state, q)])))]
       : null,
     h('h2', null, `Findings (${findings.length})`),
     findings.length

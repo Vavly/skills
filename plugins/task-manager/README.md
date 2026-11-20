@@ -254,9 +254,11 @@ in `args` is a permission for a session that nobody watches: give the smallest o
 **Search and archive.** The runs folder is for the full machine, so the lists grow. The Projects
 view and the Tasks view have a search box (title, id, clone, and for a task its text) and a
 filter for each clone. A finished project has an "Archive" button: the page then hides it from
-the board and from the lists, until you turn on "Show archived". A project with an open question
-cannot be archived, and a project whose clone is gone can. Nothing is deleted: the run
-folder stays as it is, "Bring back" removes the mark, and a reopen of the run removes it too.
+the board and from the lists, until you turn on "Show archived". The archive withdraws each open
+question of the project, so nothing of it stays in "Waiting for you". A withdrawn question takes
+no answer, also after "Bring back". A project whose clone is gone can be archived. Nothing is
+deleted: the run folder stays as it is, "Bring back" removes the mark, and a reopen of the run
+removes it too.
 
 The page never writes a run file. It asks for five changes, and each one runs the ledger script
 in the project's checkout: "Mark as finished", "Archive", an answer to a question, "Start a session", and the

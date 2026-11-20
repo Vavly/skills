@@ -177,7 +177,8 @@ async function archiveRun(root, id, body, helperFor) {
   const state = runState(root, id);
   if (state.broken) throw new HttpError(409, `run ${id} cannot be read: ${state.broken}`);
   if (state.run.state !== 'finished') throw new HttpError(409, `run ${id} is ${state.run.state}: only a finished project can be archived`);
-  if (body.archived && state.openQuestions.length) throw new HttpError(409, `run ${id} has an open question: answer it before you archive the project`);
+  // An open question does not block the archive: the helper withdraws it, so nothing of an
+  // archived run waits for the user.
   // An old project is the main reason to archive, and its clone can be gone. The mark needs no
   // clone: the helper runs in the runs root then.
   const { checkout } = state.run;

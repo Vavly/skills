@@ -401,8 +401,10 @@ another folder.
   with `L decision`), a dirty tree at intake, "resume it, or start a new run", and which run to
   resume.
 - **An archived run.** The user can archive a finished run on the admin page. The page then
-  hides it. The mark changes nothing for you: `L list` and `L show` still give the run, and a
-  reopen removes the mark. Do not set it yourself.
+  hides it. `L list` and `L show` still give the run, and a reopen removes the mark. Do not set
+  it yourself. The archive withdraws each open question of the run: `L show` lists it under
+  "withdrawn questions", and `L answer` refuses it. After a reopen, ask again if you still need
+  the answer.
 - **A finished run is closed.** `L` refuses its writes, except the archive mark, a reopen
   (`L run --set state=paused`), a merge record of a layer whose PR is open
   (`L layer --set phase=merged` and `L event --type merge`), a filed follow-up
