@@ -202,6 +202,49 @@ The user can then do one of these three actions, for each task, at any time:
    `L run --set state=finished --set nextStep=null`. Otherwise keep the run as it is.
 10. Tell the user what you deleted, what you kept, and what waits, one line each.
 
+## Add tasks to a run
+
+`/task-manager add <run-id> <tasks>`, or the user gives more tasks in the session that works on
+the run. The new tasks join the run: do not start a second run for them.
+
+1. Run `L show --run <id>`, and `L list --checkout <the checkout of the run> --state active`.
+   Then check the run, before you write anything:
+   - If it is `finished`, tell the user and ask: reopen it, or start a new run. To reopen it, run
+     `L run --set state=paused`. `L add` refuses a finished run.
+   - If another run is `active` for this checkout, tell the user, and stop. The run cannot
+     continue after the add.
+   - If the run is `active`, and this session is not the session that works on it, stop. Tell the
+     user to give the new tasks in that session, or to stop that session first. Two sessions on one
+     run are two writers.
+   - If this session does not work on the run yet, do steps 2 to 6 of "Resume" in `core.md` first:
+     the checkout, the real state, new agents for a layer in work, and the answers that still need
+     their action. At the end of step 6, wait for a stop point, then come back to step 2 below, in
+     place of the loop.
+   - If this session works on the run, wait for a stop point ("Questions and parked layers" in
+     `core.md`).
+2. Do Phase 0 steps 2 to 4 for the new tasks only: the profile, the source of record of each
+   new task, the shared-code check (step 3) between the new tasks and the tasks of the run that
+   are not `merged`, and the tier of each new task. Give each new task its outcome ("Outcomes" in
+   `SKILL.md`). Then ask the user for a yes, in text, with the new tasks, their
+   outcome and their tier. The run exists, so this is a run-level question: record it with
+   `L ask --question "Add these tasks? <the tasks>"`, and the answer with `L answer` ("Questions
+   and parked layers" in `core.md`). Record any other decision about the new tasks in the same way.
+3. Write `layers.json` in your session scratchpad, with one object for each new task, in the
+   format of Phase 0 step 6. `dependsOn` gives the numbers of layer ids: `3` names `l3`. The existing
+   layers keep their ids `l1` to `ln` (`L show`), and the first new task gets `n + 1`. Never use a
+   position: `L show` prints positions too, and a position changes when a layer starts. It can
+   name only a report task, existing or new.
+   Run `L add --run <id> --layers-file <layers.json>`. It prints `{"added", "stage", "withdrawn"}`.
+   Then record the action on the yes of step 2, with the user's words:
+   `L event --type note --summary "acted on <id of the yes>: added <new ids>: <the user's request>"`.
+   Without that note, a later resume finds an answered run-level question with no action, and
+   adds the tasks a second time.
+4. Continue the run. If it is `paused`, run `L run --set state=active`. If no task is in work
+   (`working` of `L next` is empty), run
+   `L run --set nextStep="Phase 1 step A for <first new task>"`. Otherwise keep the next step of
+   the task in work. Continue Phase 1 with the task that `L next` gives. The open PRs of the run stay as they are.
+5. Tell the user the ids of the new tasks, their tier, and the result of the shared-code check.
+
 ## Resume
 
 `/task-manager resume [<run-id>]` follows "Resume" in `core.md`. With no run id, the list gives

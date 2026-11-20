@@ -46,6 +46,7 @@ There is one skill, `task-manager`. It starts only when you invoke it
 /task-manager from-issues label:ready
 /task-manager compare the three sync libraries and recommend one
 /task-manager resume
+/task-manager add <run-id> "also add a CSV export"
 /task-manager changes <run-id> l2 "also cover the empty state"
 /task-manager merged <run-id> l2
 /task-manager setup
@@ -60,6 +61,13 @@ At the start of a run, the orchestrator gives each task its outcome and chooses 
   after a change, and merges only after your yes;
 - a **tasks run** in all other cases: each `pr` task has its PR on the default branch, with CI,
   and the run stops at the open PRs. It never merges.
+
+To give a run more tasks, use `/task-manager add <run-id> <tasks>`, or say it in the session
+that works on the run. The new tasks join the same run: in a stack run they go on the top of the
+stack. A run at its finish goes back to work. In a stack run, the CI result of the old top is
+cleared, and an open merge question is withdrawn and asked again at the new finish. A finished
+run must be reopened first. A stack run takes new tasks only when it is stable: no restack in
+work, no merge in work, and no other open question that only the session can answer.
 
 One checkout has one writer, and the ledger enforces it at the start of each task. Report tasks
 change nothing in the checkout, so up to 4 of them can work at the same time when the profile

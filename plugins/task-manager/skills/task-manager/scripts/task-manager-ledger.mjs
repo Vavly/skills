@@ -17,6 +17,7 @@ import { parseArgs } from 'node:util';
 import {
   LedgerError,
   addDecision,
+  addLayers,
   addEventCommand,
   addFinding,
   addMainPlan,
@@ -78,6 +79,8 @@ const OPTIONS = {
   body: { type: 'string' },
   'data-loss': { type: 'boolean' },
   'session-only': { type: 'boolean' },
+  merge: { type: 'boolean' },
+  withdraw: { type: 'string', multiple: true },
   'dry-run': { type: 'boolean' },
   'even-if-active': { type: 'boolean' },
   via: { type: 'string' },
@@ -133,6 +136,7 @@ const COMMANDS = {
       kind: v.kind,
       dryRun: v['dry-run'],
     }),
+  add: (v, root) => addLayers(root, need(v, 'run'), readJsonFile(need(v, 'layers-file'), 'layers'), { withdraw: v.withdraw ?? [] }),
   layer: (v, root) => setLayer(root, need(v, 'run'), need(v, 'layer'), pairs(v), v.summary),
   run: (v, root) => setRun(root, need(v, 'run'), pairs(v), v.summary),
   decision: (v, root) => addDecision(root, need(v, 'run'), need(v, 'question'), need(v, 'answer')),
@@ -146,7 +150,7 @@ const COMMANDS = {
       pr: v.pr,
       url: v.url,
     }),
-  ask: (v, root, env) => ({ ...ask(root, need(v, 'run'), { layer: v.layer, question: need(v, 'question'), options: v.option, sessionOnly: v['session-only'] }), ...watchHint(root, v.run, env) }),
+  ask: (v, root, env) => ({ ...ask(root, need(v, 'run'), { layer: v.layer, question: need(v, 'question'), options: v.option, sessionOnly: v['session-only'], merge: v.merge }), ...watchHint(root, v.run, env) }),
   answer: (v, root) => answer(root, need(v, 'run'), need(v, 'id'), need(v, 'answer'), v.via, v.confirm),
   park: (v, root, env) => ({
     ...park(root, need(v, 'run'), need(v, 'layer'), { question: v.question, questionId: v.id, options: v.option, tip: need(v, 'tip'), sessionOnly: v['session-only'] }),

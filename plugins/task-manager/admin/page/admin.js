@@ -787,7 +787,7 @@ function openAnswer(state, q) {
 /** The way to answer an open question: a button, or a note for a question that only the session takes. */
 function answerControl(state, q) {
   if (q.answer !== null && q.answer !== undefined) return null;
-  if (q.withdrawn) return h('p', { class: 'muted small' }, 'Withdrawn by the archive of the project: it takes no answer.');
+  if (q.withdrawn) return h('p', { class: 'muted small' }, q.by === 'add' ? 'Withdrawn when new tasks were added to the project: it takes no answer.' : 'Withdrawn by the archive of the project: it takes no answer.');
   if (q.sessionOnly && !settings.confirmOnPage) return h('p', { class: 'muted small' }, 'Answer this question in the session of clone ', h('code', null, clone(state.run.checkout)), '. The page cannot answer it.');
   const button = h('button', { type: 'button', class: 'btn answer' }, q.sessionOnly ? 'Answer with a confirmation' : 'Answer');
   button.addEventListener('click', (event) => {

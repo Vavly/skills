@@ -115,7 +115,8 @@ Go to Phase 2 only when no layer is parked, and no layer waits for an answer bef
    question open, run `L run --set state=paused --set stage=finish --set nextStep="waits for the
    follow-up answer"`, and finish the run after the answer. With merges still to come, run `L run --set state=paused --set stage=finish
    --set nextStep="<the next step>"`, and record the merge question that waits:
-   `L ask --session-only --question "Merge the stack? Which PR is the top?" --option "<top PR>"`.
+   `L ask --session-only --merge --question "Merge the stack? Which PR is the top?" --option "<top PR>"`.
+   `--merge` marks the merge yes: `L add` withdraws it when new layers change the top.
    The merge yes comes in the session, or as a confirmed answer from the admin page ("A confirmed
    answer" in `core.md`). It stays open
    until the user says yes, so the board shows that the run waits for the user. "Not yet" is not
@@ -141,7 +142,9 @@ Go to Phase 2 only when no layer is parked, and no layer waits for an answer bef
    at a time, from the bottom: the merge procedure ("GitHub stack") on that PR alone, its records
    (above), then a restack of the layers above it ("Restack"), then the next PR.
 
-   When every merge is recorded, end the run: `L run --set state=finished --set nextStep=null`.
+   When every merge is recorded, record the action on the merge yes:
+   `L event --type note --summary "acted on <id of the merge question>"`. `L add` refuses a merge
+   yes with no such note while a PR is open. Then end the run: `L run --set state=finished --set nextStep=null`.
    If the follow-up question is still open, set `state=paused` in its place, and finish the run
    after that answer.
 
@@ -285,6 +288,68 @@ tasks-run procedure of `independent.md`: it has no restack.
 
    An `active` run blocks a new run in this checkout. The merge question stays open: do not ask
    it again.
+
+## Add tasks to a stack run
+
+`/task-manager add <run-id> <tasks>`, or the user gives more tasks in the session that works on
+the run. The new layers go on the top of the stack: do not start a second run for them.
+
+1. Run `L show --run <id>`, and `L list --checkout <the checkout of the run> --state active`.
+   Then check the run, before you write anything:
+   - If it is `finished`, tell the user and ask: reopen it, or start a new run. To reopen it, run
+     `L run --set state=paused`. `L add` refuses a finished run.
+   - If another run is `active` for this checkout, tell the user, and stop. The run cannot
+     continue after the add.
+   - If the run is `active`, and this session is not the session that works on it, stop. Tell the
+     user to give the new tasks in that session, or to stop that session first. Two sessions on one
+     run are two writers.
+   - If this session does not work on the run yet, do steps 2 to 6 of "Resume" in `core.md` first:
+     the checkout, the real state, new agents for a layer in work, and the answers that still need
+     their action. At the end of step 6, wait for a stop point, then come back to step 2 below, in
+     place of the loop.
+   - If this session works on the run, wait for a stop point ("Questions and parked layers" in
+     `core.md`).
+   - `L add` refuses a run that is not stable for a new top. Do these first: finish a restack
+     (stage `restack`); finish a merge whose yes has no "acted on" note while a PR is open, then
+     record the note; answer an open run-level question that only the session can answer, other
+     than the merge yes (for example the unstack after a closed PR). A merge yes with no `--merge`
+     mark also blocks `L add`. Never answer it to get past the refusal: give
+     `--withdraw <question id>` to `L add` in step 3, and `L add` withdraws it.
+2. Do Phase 0 steps 2 to 4 for the new tasks only: the profile, the source of record of each
+   new task, the stack order of the new tasks (step 3), and the tier of each new task. Give each
+   new task its outcome ("Outcomes" in `SKILL.md`). Then ask the user for a yes, in text, with the new tasks, their
+   outcome and their tier. The run exists, so this is a run-level question: record it with
+   `L ask --question "Add these tasks? <the tasks>"`, and the answer with `L answer` ("Questions
+   and parked layers" in `core.md`). Record any other decision about the new tasks in the same way.
+   `L add` puts a new layer only on the top. If a new task changes code that an existing layer
+   uses, it must go below that layer, and `L add` cannot do that. Tell the user, and recommend a
+   new run for that task after the merge of this stack.
+3. Write `layers.json` in your session scratchpad, with one object for each new layer, in the
+   format of Phase 0 step 6. `dependsOn` gives the numbers of layer ids: `3` names `l3`. The existing
+   layers keep their ids `l1` to `ln` (`L show`), and the first new layer gets `n + 1`. Never use a
+   position: `L show` prints positions too, and a position changes when a layer starts. Run
+   `L add --run <id> --layers-file <layers.json> [--withdraw <question id>]`. It prints `{"added", "stage", "withdrawn"}`.
+   Then record the action on the yes of step 2, with the user's words:
+   `L event --type note --summary "acted on <id of the yes>: added <new ids>: <the user's request>"`.
+   Without that note, a later resume finds an answered run-level question with no action, and
+   adds the tasks a second time.
+4. What `L add` changed:
+   - A run at the stage `ci` or `finish` is at the stage `layers` again. The CI record is cleared,
+     because CI ran on the old top. Phase 2 runs CI again on the new top. If a CI watch of the old
+     top runs in the background, stop it: its result is for the old top, and `L run --set
+     ciResult` refuses it now.
+   - If no PR of the run is open, the GitHub stack number is cleared (`stack=null`): that stack is
+     gone. A new stack is made when two PRs of the run are open ("GitHub stack").
+   - `withdrawn` gives the open merge question. It named the old top PR. Phase 2 asks it again
+     with the new top PR. An open follow-up question stays open.
+5. Continue the run. If it is `paused`, run `L run --set state=active`. If no layer is in work
+   (`working` of `L next` is empty), run
+   `L run --set nextStep="Phase 1 step A for <first new layer>"`. Otherwise keep the next step of
+   the layer in work. Continue Phase 1. The base
+   of a new layer comes from "Stack from the start": the highest layer below it with an open PR,
+   or `origin/<default>`.
+6. Tell the user the ids of the new layers, their tier, and, if `withdrawn` is not empty, that
+   the merge question comes again at the finish.
 
 ## The user merged a PR of the stack
 
