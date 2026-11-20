@@ -66,7 +66,8 @@ To give a run more tasks, use `/task-manager add <run-id> <tasks>`, or say it in
 that works on the run. The new tasks join the same run: in a stack run they go on the top of the
 stack. A run at its finish goes back to work. In a stack run, the CI result of the old top is
 cleared, and an open merge question is withdrawn and asked again at the new finish. A finished
-run must be reopened first.
+run must be reopened first. A stack run takes new tasks only when it is stable: no restack in
+work, no merge in work, and no other open question that only the session can answer.
 
 One checkout has one writer, and the ledger enforces it at the start of each task. Report tasks
 change nothing in the checkout, so up to 4 of them can work at the same time when the profile

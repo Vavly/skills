@@ -1051,7 +1051,7 @@ test('AD1. the lists and the board show the layers that add puts on a run, and a
   const layer = (task) => ({ task, source: 's', tier: 'S', tierReason: 'r' });
   const { id } = core.initRun(ownRoot, { title: 'Stack', checkout: own, request: 'r', layers: [layer('a'), layer('b')] });
   core.setRun(ownRoot, id, [['stage', 'finish'], ['state', 'paused']]);
-  const { id: merge } = core.ask(ownRoot, id, { question: 'Merge the stack?', options: ['#2'], sessionOnly: true });
+  const { id: merge } = core.ask(ownRoot, id, { question: 'Merge the stack?', options: ['#2'], sessionOnly: true, merge: true });
   const s = await startAdminServer({ root: ownRoot, port: 0 });
   try {
     const listed = async () => json(await request(s, '/api/runs')).runs[0];

@@ -354,6 +354,20 @@ export function openQuestions(questions) {
   return questions.filter(isOpenQuestion);
 }
 
+/**
+ * True for the merge yes of a stack run. `L ask --merge` marks it. A question of 0.1.2 or earlier
+ * has no `merge` key: then the text that `stack.md` gives for the merge question marks it.
+ */
+export function isMergeQuestion(q) {
+  if (q.merge !== undefined) return q.merge === true;
+  return !q.layer && Boolean(q.sessionOnly) && /^Merge the stack\?/.test(q.question ?? '');
+}
+
+/** True when the events have the note "acted on <id>" for a run-level answer. */
+function actedOn(events, id) {
+  return events.some((e) => e.type === 'note' && new RegExp(`^acted on ${id}\\b`).test(e.summary ?? ''));
+}
+
 /** Why a question was withdrawn, for a message. A record of 0.1.2 has no `by`: an archive wrote it. */
 export function withdrawalCause(q) {
   return q.by === 'add' ? 'new tasks were added to the run' : 'the run was archived';
@@ -715,19 +729,20 @@ function assertRootWritable(root) {
 /**
  * Build the layer records of a layers file. `existing` are the layers that the run has already:
  * the new layers come after them, so the first new layer is `l<existing + 1>`. `dependsOn` holds
- * 1-based positions in the full run, so an entry can name an existing layer or an earlier entry.
+ * the numbers of layer ids (3 names `l3`), so an entry can name an existing layer or an earlier
+ * entry. It is never a position: a position changes when a layer starts, and an id never changes.
  */
 function buildLayers(entries, kind, existing = []) {
   const offset = existing.length;
-  const outcomeAt = (position) => (position <= offset ? outcomeOf(existing.find((l) => l.position === position)) : (entries[position - offset - 1].outcome ?? 'pr'));
+  const outcomeAt = (number) => (number <= offset ? outcomeOf(existing.find((l) => l.id === `l${number}`)) : (entries[number - offset - 1].outcome ?? 'pr'));
   return entries.map((entry, index) => {
     const number = offset + index + 1;
     const deps = entry.dependsOn ?? [];
-    if (!Array.isArray(deps)) fail(`layer ${number}: dependsOn must be an array of indexes`);
+    if (!Array.isArray(deps)) fail(`layer ${number}: dependsOn must be an array of layer id numbers`);
     const outcome = entry.outcome === undefined ? 'pr' : oneOf(`layer ${number} outcome`, entry.outcome, OUTCOMES);
     for (const dep of deps) {
       if (!Number.isInteger(dep) || dep < 1 || dep >= number) {
-        fail(`layer ${number}: dependsOn may name only earlier layers by 1-based index; got ${JSON.stringify(dep)}`);
+        fail(`layer ${number}: dependsOn may name only earlier layers, by the number of their id (3 for l3); got ${JSON.stringify(dep)}`);
       }
     }
     // In a tasks run, no PR is on another PR. A task can wait only for a report.
@@ -1056,37 +1071,63 @@ function setRunUnlocked(root, runId, pairs, summary) {
  * Add layers to a run that is not finished. `layers` has the format of the layers file of `init`.
  * The new layers come after the existing ones: in a stack run they go on the top of the stack.
  * When the run is at the `ci` or `finish` stage, it goes back to `layers`, because the new layers
- * are still to do. In a stack run, the CI result of the old top is then out of date, and an open
- * merge question names the old top PR: the CI record is cleared, and the stage `finish` withdraws
- * each open run-level question that only the session can answer (the merge yes).
+ * are still to do. A stack run also gets these changes, because its top PR changes:
+ * - the CI record is cleared: CI ran on the old top;
+ * - an open merge question is withdrawn: it names the old top PR;
+ * - the GitHub stack number is cleared when no PR of the run is open: that stack is gone.
+ * It refuses a run in a restack, and a stack run that is not stable for a new top: a merge yes
+ * that is not done yet, or another open run-level question that only the session can answer
+ * (for example the unstack after a closed PR). `withdraw` names a merge yes with no `--merge` mark
+ * (an agent forgot it, or the text of an old run differs): `add` then withdraws it like a marked
+ * one. Every check comes before the first write.
  */
-function addLayersUnlocked(root, runId, layers) {
+function addLayersUnlocked(root, runId, layers, { withdraw = [] } = {}) {
   const { dir, run } = load(root, runId);
   if (!Array.isArray(layers) || layers.length === 0) fail('the layers file must be a non-empty JSON array');
+  if (run.stage === 'restack') fail(`run ${run.id} is at the stage restack; add the tasks after the restack`);
   const kind = kindOf(run);
-  // An active stack run at the stage `finish` can be in a merge: GitHub then moves the PRs.
-  if (kind === 'stack' && run.state === 'active' && run.stage === 'finish') {
-    fail(`run ${run.id} is active at the stage finish, and a merge of its stack can be in work; add the tasks after the merge, or when the run is paused`);
+  const file = path.join(dir, 'questions.jsonl');
+  const questions = foldLatest(readJsonl(file));
+  const open = openQuestions(questions);
+  let merge = [];
+  if (withdraw.length) stackOnly(run, '--withdraw');
+  for (const qid of withdraw) {
+    const q = open.find((x) => x.id === qid);
+    if (!q || q.layer || !q.sessionOnly) fail(`--withdraw ${qid}: give an open run-level question that only the session can answer (the merge yes with no mark)`);
+  }
+  // A PR is open when its layer has a PR and is not merged: a layer in "More changes" is `fixing`.
+  const anyPrOpen = run.layers.some((l) => l.pr && l.phase !== 'merged');
+  if (kind === 'stack') {
+    const events = readJsonl(path.join(dir, 'events.jsonl'));
+    // An answered merge yes is done when its "acted on" note exists, or when no PR is open.
+    const pending = questions.filter((q) => isMergeQuestion(q) && !q.withdrawn && q.answer !== null && q.answer !== undefined && !actedOn(events, q.id) && anyPrOpen);
+    if (pending.length) {
+      fail(`run ${run.id} has a merge yes that is not done (${pending.map((q) => q.id).join(', ')}); finish the merge, record L event --type note --summary "acted on ${pending[0].id}", then add the tasks`);
+    }
+    const marked = (q) => isMergeQuestion(q) || withdraw.includes(q.id);
+    const other = open.filter((q) => !q.layer && q.sessionOnly && !marked(q));
+    if (other.length) {
+      fail(`run ${run.id} has an open question that only the session can answer (${other.map((q) => q.id).join(', ')}); answer it before you add tasks. Never answer a merge yes to get past this: if it is the merge yes with no --merge mark, give --withdraw <id>`);
+    }
+    merge = open.filter(marked);
   }
   const added = buildLayers(layers, kind, run.layers);
   run.layers.push(...added);
   const changes = [`added ${added.map((l) => `${l.id} (${l.task})`).join(', ')}`];
-  const stageBefore = run.stage;
-  let withdrawn = [];
-  if (stageBefore === 'ci' || stageBefore === 'finish') {
+  if (run.stage === 'ci' || run.stage === 'finish') {
     run.stage = 'layers';
     changes.push('stage=layers');
-    if (kind === 'stack' && run.ci) {
-      run.ci = null;
-      changes.push('CI record cleared');
-    }
-    if (kind === 'stack' && stageBefore === 'finish') {
-      const file = path.join(dir, 'questions.jsonl');
-      const merge = openQuestions(foldLatest(readJsonl(file))).filter((q) => !q.layer && q.sessionOnly);
-      withdrawn = withdrawQuestions(file, merge, 'add');
-      if (withdrawn.length) changes.push(`withdrew ${withdrawn.join(', ')} (no answer)`);
-    }
   }
+  if (kind === 'stack' && run.ci) {
+    run.ci = null;
+    changes.push('CI record cleared');
+  }
+  if (kind === 'stack' && run.stack !== null && run.stack !== undefined && !anyPrOpen) {
+    run.stack = null;
+    changes.push('stack=null (no PR open)');
+  }
+  const withdrawn = withdrawQuestions(file, merge, 'add');
+  if (withdrawn.length) changes.push(`withdrew ${withdrawn.join(', ')} (no answer)`);
   saveRun(dir, run);
   addEvent(dir, { type: 'run_update', summary: changes.join(', ') });
   return { run: run.id, added: added.map((l) => l.id), stage: run.stage, withdrawn };
@@ -1114,7 +1155,7 @@ function addEventCommandUnlocked(root, runId, { type, layer, summary, round, sha
   return { ok: true };
 }
 
-function writeQuestion(dir, run, { layer, question, options, sessionOnly = false }) {
+function writeQuestion(dir, run, { layer, question, options, sessionOnly = false, merge = false }) {
   if (layer) layerOf(run, layer);
   const questionsFile = path.join(dir, 'questions.jsonl');
   const id = nextId(foldLatest(readJsonl(questionsFile)), 'q');
@@ -1127,6 +1168,8 @@ function writeQuestion(dir, run, { layer, question, options, sessionOnly = false
     options: (options ?? []).map((option) => text('option', option).trim()),
     // A session-only question (for example the merge yes) takes no answer from the admin page.
     sessionOnly: Boolean(sessionOnly),
+    // The merge yes of a stack run. `L add` withdraws it, because it names the old top PR.
+    merge: Boolean(merge),
     answer: null,
   });
   return id;
@@ -1142,9 +1185,13 @@ export function notifyTest(root) {
   return notifyNow(root, { type: 'question', run: 'test', title: 'Test notification', layer: null, questionId: 'q0', text: 'The notifications of the task manager work.', sessionOnly: false });
 }
 
-function askUnlocked(root, runId, { layer, question, options, sessionOnly }) {
+function askUnlocked(root, runId, { layer, question, options, sessionOnly, merge }) {
   const { dir, run } = load(root, runId);
-  const id = writeQuestion(dir, run, { layer, question, options, sessionOnly });
+  if (merge) {
+    stackOnly(run, 'the merge question');
+    if (layer || !sessionOnly) fail('--merge marks the merge yes: a run-level question with --session-only and no --layer');
+  }
+  const id = writeQuestion(dir, run, { layer, question, options, sessionOnly, merge });
   saveRun(dir, run);
   addEvent(dir, { type: 'question', layer: layer ?? null, summary: `${id}: ${question}` });
   notify(root, questionEvent(run, { id, layer, question, sessionOnly }));
